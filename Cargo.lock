@@ -31,10 +31,12 @@ name = "alc-vein"
 version = "0.1.0"
 dependencies = [
  "alc-core-wasm",
+ "alc-worker-db",
  "async-trait",
  "axum",
  "base64",
  "chrono",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",
@@ -52,6 +54,7 @@ version = "0.1.0"
 dependencies = [
  "alc-core-wasm",
  "alc-vein",
+ "alc-worker-db",
  "async-trait",
  "axum",
  "chrono",
@@ -59,6 +62,20 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tower-service",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
+name = "alc-worker-db"
+version = "0.1.0"
+source = "git+https://github.com/ippoan/alc-worker-kit?rev=6e8b169846e068a93fa367f963a578b7422f5db8#6e8b169846e068a93fa367f963a578b7422f5db8"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "tokio-postgres",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

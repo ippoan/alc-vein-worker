@@ -15,22 +15,29 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
 [dependencies]
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
 alc-core-wasm = { workspace = true }
+# テナントの transaction の部品 (`PgClient`・`TenantTx`・`TxOutput`)。`pg` (repo の実装) が使う
+alc-worker-db = { workspace = true }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["json"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+# `pg` の Mutex と、`tenant_tx` の閉包が返す BoxFuture
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `pg` が流す型付きの文の型 (`Type`) と `Row`。接続は張らない (runtime の feature を付けない。
+# wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
+tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 vein-match = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.1" }
 vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.1" }
 
-# trait・型・matcher・routes だけを持ち、wasm32-unknown-unknown でビルドできる
-# (DB 実装は直下の worker が持つ、Refs ippoan/rust-alc-api#682)。
+# trait・型・matcher・routes と repo の実装 (`pg`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
+# (接続は持たない。張るのは直下の worker と tests/sql_db.rs、Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#723)。
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
-# tests/sql_db.rs (実 DB で repo::sql と RLS を確かめる) 用の native の接続。worker 本体の tokio-postgres
-# (直下の Cargo.toml、wasm 用の feature `js`) とは別で、dev-dependency なので wasm のビルドには入らない
+# tests/sql_db.rs (実 DB で repo::sql と RLS を確かめる) 用の native の接続 (runtime 付き)。
+# dev-dependency なので wasm のビルドには入らない
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 tower = { version = "0.5", features = ["util"] }

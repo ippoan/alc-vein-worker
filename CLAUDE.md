@@ -4,7 +4,7 @@
 backend (ippoan/rust-alc-api) から分けた repo (Refs ippoan/rust-alc-api#721)。構造は `.claude/skills/alc-vein-worker-map`、詳細は `README.md`。
 
 - 直下 = Worker 本体 (workers-rs + tokio-postgres、wasm32-unknown-unknown。workspace の root)
-- `crates/alc-vein/` = 口 4 本・照合・trait・SQL の定数 (DB 実装は持たない)
+- `crates/alc-vein/` = 口 4 本・照合・trait・SQL の定数・repo の実装 `pg` (tokio-postgres。接続は持たない — 張るのは worker とテスト)
 - `container/` = staging の DB の image。SQL は ippoan/alc-migrations から取る
 
 ## コマンド
@@ -39,9 +39,14 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   コード・コメント・commit・PR に書かない (`wrangler.toml` に既に在る binding 用の ID は別)。
 - **タグ `v*` = 本番。** main へのマージは staging に出るだけ。本番は Actions の Tag Release を手動で打つ
   (マージで自動のタグは付けない)。手で `v*` のタグを push しない。
-- DB 操作は `in_tenant_tx` を通す (1 メソッド = 1 トランザクション、戻り値は `TxOutput`)。SQL は `crates/alc-vein` の `repo::sql` の 1 か所。
+- DB 操作は共通 crate `alc-worker-db` (ippoan/alc-worker-kit) の `PgClient::tenant_tx` を通す (1 メソッド = 1 トランザクション、戻り値は `TxOutput`)。
+  SQL は `crates/alc-vein` の `repo::sql` の 1 か所、流すのは `crates/alc-vein/src/pg.rs` の 1 か所。
+  **名前付き prepared statement を呼ぶコード (`execute`・`query`・`query_one`・`query_opt`・`prepare`) を足さない** — 使うのは
+  `TenantTx` の `query_typed`・`query_typed_one`・`query_typed_opt`・`execute_typed` だけ (Hyperdrive 経由では名前付きの文で接続が切れる)。
+  生の `tokio_postgres::Client` を `src/db.rs` の外へ出さない。
 - **実 DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は接続先 (`VEIN_TEST_DATABASE_URL`) が無ければ失敗する作り
-  (skip にしない)。`repo::sql` の定数や `in_tenant_tx` の頭の文を変えたら、このテストを実 DB で通す。
+  (skip にしない)。`repo::sql` の定数・`pg.rs` の引数の型・`alc-worker-db` の rev を変えたら、このテストを実 DB で通す。
+  CI は本数を固定して回す (`ci.yml` の `5 passed`。テストを減らさない)。
   `coverage_100.toml` の 3 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`) は行カバレッジ 100% (登録を外さない)。
 - **staging の DB を動かしている機では、`127.0.0.1:6432` を常駐のコンテナが使っている** (README)。手元の検査の DB は別名・空きポート
   (`-p 127.0.0.1::6432`) で立て、常駐のコンテナには繋がない・止めない。
@@ -52,6 +57,9 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   `crates/alc-vein/Cargo.toml` や `[dependencies]` に git / path を書かない)、`cargo update -p alc-core-wasm` で `Cargo.lock` を一緒に更新する。
   その後 `cargo tree -i alc-core-wasm --target wasm32-unknown-unknown` で出どころが 1 つだけであることを確かめる
   (2 つになると、コンパイルは通るのに全リクエストが 500 になる)。
+- **`alc-worker-db`** (ippoan/alc-worker-kit): `alc-core-wasm` と同じ。直下の `Cargo.toml` の `[workspace.dependencies]` の `rev` の
+  1 か所だけを変え、`cargo update -p alc-worker-db` で `Cargo.lock` を一緒に更新し、`cargo tree -i alc-worker-db --target wasm32-unknown-unknown`
+  で出どころが 1 つだけであることを確かめる (`worker`・`tokio-postgres` も版が 1 つのままであること)。その後、実 DB の検査を通す。
 - **alc-migrations** (staging の DB の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
   rev は ippoan/rust-alc-api の `Cargo.toml` が固定している alc-migrations の rev と揃える。
   `bash scripts/fetch-migrations.sh` → `docker build` → 起動確認 (CI の「staging DB の Container image が起動する」と同じ命令) を手元で通す。

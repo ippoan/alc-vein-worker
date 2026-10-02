@@ -21,8 +21,9 @@
 //! `Socket` は `!Send` 相当 (JS の値) なので、この関数は handler (axum が Send を要求する側)
 //! の外 = fetch から呼ぶ。
 
+use alc_worker_db::PgClient;
 use tokio_postgres::config::SslMode;
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::{Config, NoTls};
 use wasm_bindgen::JsValue;
 use worker::js_sys::Reflect;
 use worker::postgres_tls::PassthroughTls;
@@ -68,7 +69,7 @@ fn other(what: &str) -> impl Fn(worker::Error) -> ConnectError + '_ {
     move |e| ConnectError::Other(format!("{what}: {e}"))
 }
 
-pub async fn connect(env: &Env) -> Result<Client, ConnectError> {
+pub async fn connect(env: &Env) -> Result<PgClient, ConnectError> {
     if let Ok(vpc) = env.get_binding::<TcpPort>(VEIN_DB_VPC_BINDING) {
         return connect_vpc(&vpc).await;
     }
@@ -124,7 +125,7 @@ async fn secrets_store_url(env: &Env) -> Result<Option<String>, ConnectError> {
 /// staging: DO への TCP をそのまま postgres のソケットとして使う (DO が Container の
 /// PgBouncer へバイトを中継する)。DO → Container は Cloudflare 内なので平文。
 /// PgBouncer は trust 認証で、RLS が効く `alc_api_app` で繋ぐ。
-async fn connect_container(ns: &worker::ObjectNamespace) -> Result<Client, ConnectError> {
+async fn connect_container(ns: &worker::ObjectNamespace) -> Result<PgClient, ConnectError> {
     let stub = ns
         .get_by_name(VEIN_DB_NAME)
         .map_err(other("vein-db stub"))?;
@@ -138,7 +139,7 @@ async fn connect_container(ns: &worker::ObjectNamespace) -> Result<Client, Conne
 /// VPC Service 型は宛先の host:port を Service 側で固定するので、`connect()` に渡すアドレスは
 /// 名目の値 (宛先は binding 側で固定され、この文字列は使われない。IP はコードに書かない)。Tunnel の区間は Cloudflare が暗号化し、ホスト内の
 /// PgBouncer までは平文・trust 認証 (Container 経路と同じ)。
-async fn connect_vpc(vpc: &TcpPort) -> Result<Client, ConnectError> {
+async fn connect_vpc(vpc: &TcpPort) -> Result<PgClient, ConnectError> {
     let raw = vpc
         .connect(&format!("{VEIN_DB_NAME}:{PGBOUNCER_PORT}"))
         .map_err(|e| ConnectError::Other(format!("vein-db vpc connect: {e:?}")))?;
@@ -166,7 +167,7 @@ async fn connect_url(
     url: &str,
     allow_insecure: bool,
     source: &str,
-) -> Result<Client, ConnectError> {
+) -> Result<PgClient, ConnectError> {
     let mut config: Config = url
         .parse()
         .map_err(|e| ConnectError::Other(format!("parse {source}: {e}")))?;
@@ -215,7 +216,7 @@ fn with_causes(e: &(dyn std::error::Error + 'static), config: &Config) -> String
     out
 }
 
-async fn handshake<T>(config: Config, socket: Socket, tls: T) -> Result<Client, ConnectError>
+async fn handshake<T>(config: Config, socket: Socket, tls: T) -> Result<PgClient, ConnectError>
 where
     T: tokio_postgres::tls::TlsConnect<Socket>,
     T::Stream: Send + 'static,
@@ -234,5 +235,6 @@ where
             console_error!("postgres connection: {e}");
         }
     });
-    Ok(client)
+    // 生の Client はこのファイルの外へ出さない (名前付き prepared statement を流せる口を渡さない)
+    Ok(PgClient::new(client))
 }

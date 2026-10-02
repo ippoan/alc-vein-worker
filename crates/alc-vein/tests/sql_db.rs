@@ -5,9 +5,10 @@
 //! 削除済みの乗務員の除外・RLS のテナント分離 — と、登録 → 照合で当たる → 学習後のテンプレートが
 //! 書き戻される、の一連を固定する (backend に在った `tests/vein_templates_test.rs` の 4 本と同じ事柄)。
 //!
-//! repo の実装 ([`PgRepo`]) は worker の `src/repo.rs` (wasm 専用でここからは使えない) と同じ形 —
-//! メソッド 1 回 = 1 トランザクション、`BEGIN` → [`SET_TENANT`] → `repo::sql` の定数 → `COMMIT` — を
-//! native の tokio-postgres で書いたもの。**SQL はここに写さず定数を使う。**
+//! repo は worker が使うものと同じ実装 ([`alc_vein::pg::PgVeinTemplates`]) — メソッド 1 回 = 1 トランザクション、
+//! `BEGIN` → `alc_worker_db::SET_TENANT` → `repo::sql` の定数 (型付きの名前なしの文) → `COMMIT`。
+//! 写しは持たない。接続だけ native の tokio-postgres でここが張る。準備・後始末と、RLS だけで止まることの検査は、
+//! テストが自分で張った別の接続 ([`Ctx::db`] など) で流す (Refs ippoan/rust-alc-api#723)。
 //!
 //! DB を使うテストは `#[ignore]` (通常の `cargo test -p alc-vein` には入らない)。回し方:
 //!
@@ -24,28 +25,25 @@
 
 use std::sync::Arc;
 
-use alc_core_wasm::{DbError, TenantId};
+use alc_core_wasm::TenantId;
 use alc_vein::matcher::{self, synth};
-use alc_vein::repo::{sql, VeinTemplateRow, VeinTemplatesRepository};
+use alc_vein::pg::{self, PgVeinTemplates};
+use alc_vein::repo::{sql, VeinTemplatesRepository};
 use alc_vein::routes::tenant_router;
 use alc_vein::VeinState;
-use async_trait::async_trait;
+use alc_worker_db::{PgClient, SET_TENANT};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
-use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, NoTls, Transaction};
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, NoTls};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const URL_ENV: &str = "VEIN_TEST_DATABASE_URL";
-
-/// worker の `in_tenant_tx` (`src/repo.rs`) がトランザクションの頭で打つ文。worker 本体は wasm 専用で
-/// 定数を共有できないので写しを持ち、`set_tenant_statement_matches_worker` が食い違いを落とす。
-const SET_TENANT: &str = "SELECT set_config('app.current_tenant_id', $1, true), set_config('search_path', 'alc_api', true)";
 
 async fn connect() -> Client {
     // 接続文字列は表示しない
@@ -59,129 +57,6 @@ async fn connect() -> Client {
     client
 }
 
-fn db_err(e: tokio_postgres::Error) -> DbError {
-    match e.as_db_error() {
-        Some(db) => DbError::Other(format!("{} ({})", db.message(), db.code().code())),
-        None => DbError::Other(e.to_string()),
-    }
-}
-
-/// worker の `WorkerVeinTemplatesRepository` と同じ形の repo。`guc` を持つと、引数の tenant_id ではなく
-/// `guc` を `app.current_tenant_id` に入れる (RLS だけで止まることを確かめる用)。
-///
-/// PgBouncer は transaction mode なので、`Row` (prepared statement を握る) は COMMIT より前に手放す
-/// (worker の `TxOutput` と同じ規律。破ると 42P05)。
-struct PgRepo {
-    client: Mutex<Client>,
-    guc: Option<Uuid>,
-}
-
-impl PgRepo {
-    fn new(client: Client, guc: Option<Uuid>) -> Arc<Self> {
-        Arc::new(Self {
-            client: Mutex::new(client),
-            guc,
-        })
-    }
-}
-
-async fn begin(client: &mut Client, tenant_id: Uuid) -> Result<Transaction<'_>, DbError> {
-    let tx = client.transaction().await.map_err(db_err)?;
-    tx.execute(SET_TENANT, &[&tenant_id.to_string()])
-        .await
-        .map_err(db_err)?;
-    Ok(tx)
-}
-
-#[async_trait]
-impl VeinTemplatesRepository for PgRepo {
-    async fn upsert(
-        &self,
-        tenant_id: Uuid,
-        employee_id: Uuid,
-        template: &str,
-    ) -> Result<Option<DateTime<Utc>>, DbError> {
-        let mut client = self.client.lock().await;
-        let tx = begin(&mut client, self.guc.unwrap_or(tenant_id)).await?;
-        let out = tx
-            .query_opt(sql::UPSERT, &[&tenant_id, &employee_id, &template])
-            .await
-            .map_err(db_err)?
-            .map(|r| r.get(0));
-        tx.commit().await.map_err(db_err)?;
-        Ok(out)
-    }
-
-    async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
-        let mut client = self.client.lock().await;
-        let tx = begin(&mut client, self.guc.unwrap_or(tenant_id)).await?;
-        let out = tx
-            .query(sql::LIST, &[&tenant_id])
-            .await
-            .map_err(db_err)?
-            .into_iter()
-            .map(|r| VeinTemplateRow {
-                id: r.get(0),
-                employee_id: r.get(1),
-                name: r.get(2),
-                template: r.get(3),
-                updated_at: r.get(4),
-            })
-            .collect();
-        tx.commit().await.map_err(db_err)?;
-        Ok(out)
-    }
-
-    async fn registration_count(
-        &self,
-        tenant_id: Uuid,
-        employee_id: Uuid,
-    ) -> Result<(i64, bool), DbError> {
-        let mut client = self.client.lock().await;
-        let tx = begin(&mut client, self.guc.unwrap_or(tenant_id)).await?;
-        let out = {
-            let row = tx
-                .query_one(sql::REGISTRATION_COUNT, &[&tenant_id, &employee_id])
-                .await
-                .map_err(db_err)?;
-            (row.get(0), row.get(1))
-        };
-        tx.commit().await.map_err(db_err)?;
-        Ok(out)
-    }
-
-    async fn update_learned(
-        &self,
-        tenant_id: Uuid,
-        id: Uuid,
-        template: &str,
-        read_updated_at: DateTime<Utc>,
-    ) -> Result<bool, DbError> {
-        let mut client = self.client.lock().await;
-        let tx = begin(&mut client, self.guc.unwrap_or(tenant_id)).await?;
-        let n = tx
-            .execute(
-                sql::UPDATE_LEARNED,
-                &[&tenant_id, &id, &template, &read_updated_at],
-            )
-            .await
-            .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(n == 1)
-    }
-
-    async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
-        let mut client = self.client.lock().await;
-        let tx = begin(&mut client, self.guc.unwrap_or(tenant_id)).await?;
-        let n = tx
-            .execute(sql::DELETE, &[&tenant_id, &employee_id])
-            .await
-            .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(n == 1)
-    }
-}
-
 fn hex(seed: u64) -> String {
     synth::hex(&synth::chara(seed))
 }
@@ -189,67 +64,99 @@ fn hex(seed: u64) -> String {
 /// テストごとのテナント (自分で作り、終わりに [`Ctx::cleanup`] で消す)。
 struct Ctx {
     tenant_id: Uuid,
-    repo: Arc<PgRepo>,
+    /// worker と同じ実装の repo
+    repo: Arc<PgVeinTemplates>,
+    /// 準備・後始末用の、テストが自分で張った接続 (repo の接続とは別)
+    db: Mutex<PgClient>,
 }
 
 async fn setup(name: &str) -> Ctx {
-    let mut client = connect().await;
+    let mut db = PgClient::new(connect().await);
     let tenant_id = Uuid::new_v4();
-    {
-        let tx = begin(&mut client, tenant_id).await.unwrap();
-        // superuser / BYPASSRLS で繋ぐと RLS を素通りして、テナント分離のテストが意味を失う
-        let bypass: bool = tx
-            .query_one(
-                "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert!(
-            !bypass,
-            "{URL_ENV} のロールは RLS を素通りする。alc_api_app で繋ぐこと"
-        );
-        tx.execute(
-            "INSERT INTO tenants (id, name) VALUES ($1, $2)",
-            &[&tenant_id, &name],
-        )
+    // superuser / BYPASSRLS で繋ぐと RLS を素通りして、テナント分離のテストが意味を失う
+    let bypass: bool = db
+        .tenant_tx(tenant_id, |tx| {
+            Box::pin(async move {
+                let row = tx
+                    .query_typed_one(
+                        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+                        &[],
+                    )
+                    .await?;
+                Ok(row.get(0))
+            })
+        })
         .await
         .unwrap();
-        tx.commit().await.unwrap();
-    }
+    assert!(
+        !bypass,
+        "{URL_ENV} のロールは RLS を素通りする。alc_api_app で繋ぐこと"
+    );
+    let name = name.to_owned();
+    db.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                "INSERT INTO tenants (id, name) VALUES ($1, $2)",
+                &[(&tenant_id, Type::UUID), (&name, Type::TEXT)],
+            )
+            .await
+        })
+    })
+    .await
+    .unwrap();
     Ctx {
         tenant_id,
-        repo: PgRepo::new(client, None),
+        repo: Arc::new(PgVeinTemplates::new(PgClient::new(connect().await))),
+        db: Mutex::new(db),
     }
 }
 
 impl Ctx {
-    /// 設定用の SQL (乗務員を作る・消す) を、このテナントのトランザクションで 1 文流す。
-    async fn exec(&self, statement: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) {
-        let mut client = self.repo.client.lock().await;
-        let tx = begin(&mut client, self.tenant_id).await.unwrap();
-        let n = tx.execute(statement, params).await.unwrap();
-        assert_eq!(n, 1, "{statement}");
-        tx.commit().await.unwrap();
-    }
-
     async fn employee(&self, name: &str) -> Uuid {
         let id = Uuid::new_v4();
-        self.exec(
-            "INSERT INTO employees (id, tenant_id, name) VALUES ($1, $2, $3)",
-            &[&id, &self.tenant_id, &name],
-        )
-        .await;
+        let tenant_id = self.tenant_id;
+        let name = name.to_owned();
+        let n = self
+            .db
+            .lock()
+            .await
+            .tenant_tx(self.tenant_id, move |tx| {
+                Box::pin(async move {
+                    tx.execute_typed(
+                        "INSERT INTO employees (id, tenant_id, name) VALUES ($1, $2, $3)",
+                        &[
+                            (&id, Type::UUID),
+                            (&tenant_id, Type::UUID),
+                            (&name, Type::TEXT),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "INSERT INTO employees");
         id
     }
 
     async fn soft_delete_employee(&self, id: Uuid) {
-        self.exec(
-            "UPDATE employees SET deleted_at = NOW() WHERE tenant_id = $1 AND id = $2",
-            &[&self.tenant_id, &id],
-        )
-        .await;
+        let tenant_id = self.tenant_id;
+        let n = self
+            .db
+            .lock()
+            .await
+            .tenant_tx(self.tenant_id, move |tx| {
+                Box::pin(async move {
+                    tx.execute_typed(
+                        "UPDATE employees SET deleted_at = NOW() WHERE tenant_id = $1 AND id = $2",
+                        &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "UPDATE employees");
     }
 
     /// 口 (`routes::tenant_router`) をこのテナントで叩く。
@@ -297,16 +204,25 @@ impl Ctx {
     }
 
     async fn cleanup(self) {
-        let mut client = self.repo.client.lock().await;
-        let tx = begin(&mut client, self.tenant_id).await.unwrap();
-        for statement in [
-            "DELETE FROM vein_templates WHERE tenant_id = $1",
-            "DELETE FROM employees WHERE tenant_id = $1",
-            "DELETE FROM tenants WHERE id = $1",
-        ] {
-            tx.execute(statement, &[&self.tenant_id]).await.unwrap();
-        }
-        tx.commit().await.unwrap();
+        let tenant_id = self.tenant_id;
+        self.db
+            .lock()
+            .await
+            .tenant_tx(self.tenant_id, move |tx| {
+                Box::pin(async move {
+                    for statement in [
+                        "DELETE FROM vein_templates WHERE tenant_id = $1",
+                        "DELETE FROM employees WHERE tenant_id = $1",
+                        "DELETE FROM tenants WHERE id = $1",
+                    ] {
+                        tx.execute_typed(statement, &[(&tenant_id, Type::UUID)])
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
     }
 }
 
@@ -478,36 +394,74 @@ async fn rls_alone_blocks_another_tenant() {
     assert_eq!(a.put_template(yamada, 51).await.0, StatusCode::OK);
     let row = a.repo.list(a.tenant_id).await.unwrap().remove(0);
 
-    // 引数は A、GUC は B
-    let as_b = PgRepo::new(connect().await, Some(b.tenant_id));
-    assert_eq!(as_b.list(a.tenant_id).await.unwrap(), vec![]);
-    let counted = as_b.registration_count(a.tenant_id, yamada).await;
+    // 引数は A、GUC は B (repo と同じ自由関数を、B を設定したトランザクションの中で呼ぶ)
+    let mut as_b = PgClient::new(connect().await);
+    let listed = as_b
+        .tenant_tx(b.tenant_id, |tx| Box::pin(pg::list(tx, a.tenant_id)))
+        .await;
+    assert_eq!(listed.unwrap(), vec![]);
+    let counted = as_b
+        .tenant_tx(b.tenant_id, |tx| {
+            Box::pin(pg::registration_count(tx, a.tenant_id, yamada))
+        })
+        .await;
     assert_eq!(counted.unwrap(), (0, false));
     // employees も RLS で見えないので、登録は「乗務員が居ない」になる
-    assert_eq!(as_b.upsert(a.tenant_id, tanaka, "x").await.unwrap(), None);
+    let upserted = as_b
+        .tenant_tx(b.tenant_id, |tx| {
+            Box::pin(pg::upsert(tx, a.tenant_id, tanaka, "x"))
+        })
+        .await;
+    assert_eq!(upserted.unwrap(), None);
     let written = as_b
-        .update_learned(a.tenant_id, row.id, "x", row.updated_at)
+        .tenant_tx(b.tenant_id, |tx| {
+            Box::pin(pg::update_learned(
+                tx,
+                a.tenant_id,
+                row.id,
+                "x",
+                row.updated_at,
+            ))
+        })
         .await;
     assert!(!written.unwrap());
-    assert!(!as_b.delete(a.tenant_id, yamada).await.unwrap());
+    let deleted = as_b
+        .tenant_tx(b.tenant_id, |tx| {
+            Box::pin(pg::delete(tx, a.tenant_id, yamada))
+        })
+        .await;
+    assert!(!deleted.unwrap());
     {
         // 他テナントの行は書けない (policy の USING が INSERT の検査にもなる)
-        let mut client = as_b.client.lock().await;
-        let tx = begin(&mut client, b.tenant_id).await.unwrap();
-        let err = tx
-            .execute(
-                "INSERT INTO vein_templates (tenant_id, employee_id, template) VALUES ($1, $2, 'x')",
-                &[&a.tenant_id, &tanaka],
-            )
+        let a_id = a.tenant_id;
+        let err = as_b
+            .tenant_tx(b.tenant_id, move |tx| {
+                Box::pin(async move {
+                    tx.execute_typed(
+                        "INSERT INTO vein_templates (tenant_id, employee_id, template) VALUES ($1, $2, 'x')",
+                        &[(&a_id, Type::UUID), (&tanaka, Type::UUID)],
+                    )
+                    .await
+                })
+            })
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE), "{err}");
     }
     {
-        // テナントを設定しないトランザクションは読めない (前のトランザクションの値が残っていない)
-        let mut client = a.repo.client.lock().await;
-        let tx = client.transaction().await.unwrap();
-        let read = tx.query(sql::LIST, &[&a.tenant_id]).await;
+        // テナントを設定しないトランザクションは読めない (前のトランザクションの値が残っていない)。
+        // 未設定のトランザクションは PgClient からは作れないので、ここだけ素の接続 1 本を使う:
+        // (1) A を設定して COMMIT → (2) 同じ接続の次のトランザクションで、設定せずに読む
+        let mut raw = connect().await;
+        let tx = raw.transaction().await.unwrap();
+        tx.query_typed(SET_TENANT, &[(&a.tenant_id.to_string(), Type::TEXT)])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let tx = raw.transaction().await.unwrap();
+        let read = tx
+            .query_typed(sql::LIST, &[(&a.tenant_id, Type::UUID)])
+            .await;
         assert!(read.is_err(), "テナント未設定で読めた");
     }
 
@@ -515,14 +469,4 @@ async fn rls_alone_blocks_another_tenant() {
     assert_eq!(a.repo.list(a.tenant_id).await.unwrap(), vec![row]);
     a.cleanup().await;
     b.cleanup().await;
-}
-
-/// [`SET_TENANT`] が worker の `in_tenant_tx` の文と同じであること (DB は要らない)。
-#[test]
-fn set_tenant_statement_matches_worker() {
-    let worker_repo = include_str!("../../../src/repo.rs");
-    assert!(
-        worker_repo.contains(&format!("\"{SET_TENANT}\"")),
-        "src/repo.rs の in_tenant_tx の文が変わった。SET_TENANT を合わせること"
-    );
 }
