@@ -24,6 +24,7 @@ log "postgres started"
 
 psql() { PGOPTIONS="-c client_min_messages=warning" command psql -q -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d postgres "$@"; }
 
+# ここから ALTER ROLE … LOGIN までの順は crates/alc-vein/tests/embedded/mod.rs の migrate と同じ (順を変えたらもう一方も)
 psql -f /vein/init_local_db.sql
 # この image は sqlx ではなく psql で流すので表が無い。160 の `migration_status()` が本体で参照するため
 # 空の表だけ用意する。中身は入れないので、この DB では `migration_status()` は適用 0 件を返す

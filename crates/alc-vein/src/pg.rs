@@ -1,5 +1,5 @@
 //! `VeinTemplatesRepository` の tokio-postgres 実装 (Refs ippoan/rust-alc-api#723)。直下の worker と
-//! 実 DB のテスト (`tests/sql_db.rs`) が、同じこの実装を使う。**接続は持たない** (張るのは worker とテスト)。
+//! 組み込みの PostgreSQL に流すテスト (`tests/sql_db.rs`) が、同じこの実装を使う。**接続は持たない** (張るのは worker とテスト)。
 //!
 //! SQL は [`crate::repo::sql`] の定数だけを、共通 crate `alc-worker-db` の [`TenantTx`] が出す
 //! **型付きの名前なしの文** (`query_typed` 系・`execute_typed`) で流す。名前付き prepared statement は
@@ -22,9 +22,6 @@ use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use crate::repo::{sql, VeinTemplateRow, VeinTemplatesRepository};
-
-/// PostgreSQL の unique_violation (alc-core-wasm の sqlx 版と同じ写し方)。
-const PG_UNIQUE_VIOLATION: &str = "23505";
 
 impl TxOutput for VeinTemplateRow {}
 
@@ -124,9 +121,6 @@ pub async fn delete(
 fn db_err(e: tokio_postgres::Error) -> DbError {
     // tokio_postgres::Error の Display は "db error" だけなので、DB の message も載せる
     match e.as_db_error() {
-        Some(db) if db.code().code() == PG_UNIQUE_VIOLATION => {
-            DbError::Conflict(db.message().to_string())
-        }
         Some(db) => DbError::Other(format!("{} ({})", db.message(), db.code().code())),
         None => DbError::Other(e.to_string()),
     }

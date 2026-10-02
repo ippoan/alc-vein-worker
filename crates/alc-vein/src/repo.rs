@@ -38,7 +38,7 @@ impl From<VeinTemplateRow> for VeinTemplateItem {
     }
 }
 
-/// `vein_templates` の SQL。実装は `crate::pg` (worker と実 DB のテストが使う) で、そこが
+/// `vein_templates` の SQL。実装は `crate::pg` (worker と `tests/sql_db.rs` のテストが使う) で、そこが
 /// これを使う (placeholder は `$n`)。
 /// RLS に加えて `WHERE tenant_id` を明示する。
 pub mod sql {

@@ -4,11 +4,10 @@
 #   cargo llvm-cov --locked -p alc-vein --text > cov.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov.txt
 #
-# 計測するのは `cargo test -p alc-vein` の unit test (DB なし。tests/sql_db.rs の実 DB テストは
-# #[ignore] なので入らない)。登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
+# 計測するのは `cargo test -p alc-vein` の全部 = unit test (DB なし) と tests/sql_db.rs (テストの中で起こす
+# 組み込みの PostgreSQL。docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る — 無ければテストが落ちる)。
+# 登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
 # lib.rs は mod 宣言と VeinState だけで実行行が無いので登録しない。
-# pg.rs (repo の tokio-postgres 実装) は実 DB でしか通らず、unit test の計測では実行行が 0 になるので登録しない
-# (確かめるのは tests/sql_db.rs。CI は本数を固定して回す)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
 # 特徴量の検査・テンプレートの組み立て・1:N 照合
@@ -22,3 +21,7 @@ path = "crates/alc-vein/src/routes.rs"
 # trait と SQL の定数。実行行は VeinTemplateRow → VeinTemplateItem の変換だけ
 [[files]]
 path = "crates/alc-vein/src/repo.rs"
+
+# repo の tokio-postgres 実装 (tests/sql_db.rs が組み込みの PostgreSQL で通す。CI は本数を固定して回す)
+[[files]]
+path = "crates/alc-vein/src/pg.rs"

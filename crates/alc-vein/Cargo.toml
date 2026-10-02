@@ -36,8 +36,12 @@ vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.
 # trait・型・matcher・routes と repo の実装 (`pg`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
 # (接続は持たない。張るのは直下の worker と tests/sql_db.rs、Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#723)。
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
-# tests/sql_db.rs (実 DB で repo::sql と RLS を確かめる) 用の native の接続 (runtime 付き)。
+# tests/sql_db.rs: テストの中で起こす組み込みの PostgreSQL (docker も外の DB も要らない)。
+# 版は固定。wasmer 系は直下の Cargo.lock で alpha 版に pin している (Rust 1.92.0 で build が通る版)。
+# dev-dependency なので wasm のビルドには入らない
+pglite-oxide = "=0.5.0"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+# tests/sql_db.rs (組み込みの PostgreSQL で repo::sql と RLS を確かめる) 用の native の接続 (runtime 付き)。
 # dev-dependency なので wasm のビルドには入らない
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 tower = { version = "0.5", features = ["util"] }
