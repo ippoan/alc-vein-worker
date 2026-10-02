@@ -1,0 +1,106 @@
+# 指静脈 (vein) の Worker (Refs ippoan/rust-alc-api#680 / ippoan/rust-alc-api#683 / ippoan/rust-alc-api#691)。
+#
+# ★ この Worker は JWT を検証せず、auth-worker が付け直した X-Tenant-ID を信頼する。
+#   外から直接届いたら ippoan/rust-alc-api#556 と同じ穴になるので、本番 (トップレベル) の到達経路は
+#   auth-worker からの Service Binding だけにする:
+#   - workers_dev = false / preview_urls = false (*.workers.dev と preview URL を開けない)
+#   - route / routes / custom_domain を書かない
+#   staging (env.staging) だけはテストから叩くため workers_dev = true にし、その workers.dev の
+#   ホスト名は Cloudflare Access で保護する (アプリ・ポリシー・service token は Access 側で管理。
+#   Access を通らないリクエストは Worker に届かない)。workers_dev = true を許すのは env.staging だけ。
+#   scripts/check-exposure.sh が CI で毎回これを検査する。
+name = "alc-vein"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 && worker-build --release"
+
+# 応答ヘッダー x-worker-version / x-worker-tag の元 (src/lib.rs)。binding は env に継承されないので
+# トップレベルと env.staging の両方に要る。tag / message は deploy の --tag / --message (deploy.yml)
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# 本番の DB は aws:ap-northeast-1。Worker をその近くで動かす
+[placement]
+region = "aws:ap-northeast-1"
+
+# 本番の DB: Secrets Store の secret (backend と同じ実行用ロールの接続文字列) を binding VEIN_DATABASE_URL で
+# 毎リクエスト読み、その host:port へ Worker の TCP (STARTTLS) で繋ぐ (src/db.rs。Refs ippoan/auth-worker#605)。
+# 入れ直しは Secrets Store の secret を更新するだけで、次の要求から効く (deploy は要らない)。
+# binding が在るのに読めないときは 500 (worker 自身の secret DATABASE_URL へは落ちない)。
+# env.staging には置かない (staging は VPC の経路で、読まれない)。store_id は auth-worker の wrangler.toml と同じ store。
+# ★ この表は [placement] の後に置く (前の方に表を足すと scripts/check-exposure-test.sh の陰性対照が効かなくなる)
+[[secrets_store_secrets]]
+binding = "VEIN_DATABASE_URL"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "alc-app-database-url-rt"
+
+# staging: DB は一時的に (ippoan/rust-alc-api#695) 運用者の Linux 機の docker (container/ の image、127.0.0.1:6432) に置き、
+# Workers VPC の binding VEIN_DB_VPC (VPC Service 型) から既存の Tunnel 経由で繋ぐ (src/db.rs)。
+# VEIN_DB_VPC を外して deploy すると、下の Container 経路 (fallback) に戻る:
+# Cloudflare Containers (postgres + PgBouncer transaction mode、container/) を
+# 抱える Durable Object VeinDb。Worker → VeinDb へ TCP → Container の 6432 へ中継 (src/vein_db.rs)。
+# Container は最後の接続から 10 分で止まり (常時起動にしない)、ディスクは揮発なので
+# 次の起動で空の DB から migration をやり直す。
+#   npx wrangler@4.144.0 deploy --env staging    (TCP 型の VPC Service は wrangler 4.78.0 以上。README)
+[env.staging]
+name = "alc-vein-staging"
+workers_dev = true
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# Worker の実行場所を手元の DB の近くに寄せる (ippoan/rust-alc-api#695)。VPC の Tunnel は関西の colo に繋がっているので、
+# 置き場所を指定しないと、リクエストが入った colo (実測では SIN) で動き、DB の往復ごとに海を越える
+# (一覧の p50 が 944ms。KIX で動いたときは 194ms)。region は強制ではなくヒントで、
+# 実際に動いた場所は応答ヘッダー cf-placement で分かる
+[env.staging.placement]
+region = "aws:ap-northeast-3"
+
+# 手元の DB への口 (ippoan/rust-alc-api#695、一時)。本番 (トップレベル) には置かない (scripts/check-exposure.sh が検査)
+[[env.staging.vpc_services]]
+binding = "VEIN_DB_VPC"
+# service_id は VPC Service の参照 (宛先の Tunnel・host:port は Service 側に閉じる)
+service_id = "01a0efa3-57ee-7631-912e-7f261d828127"
+remote = true
+
+[[env.staging.containers]]
+class_name = "VeinDb"
+image = "./container/Dockerfile"
+# Dockerfile が container/.alc-migrations/ (scripts/fetch-migrations.sh が取る) と tests/seed.sql を COPY するので
+# build context は repo の直下 (持ち込むファイルは container/Dockerfile.dockerignore で絞る)
+image_build_context = "."
+max_instances = 1
+instance_type = "basic"
+# 置き場所の指定が無いと北米 (iad) に置かれ、postgres の往復ごとに太平洋を越える
+# (実測: 一覧 1 回が 2〜3 秒)。Worker が動く日本の近くに寄せる
+constraints = { regions = ["APAC"] }
+# start.sh (initdb / migration / PgBouncer) の出力を Workers Logs に残す
+observability = { logs = { enabled = true } }
+# SSH は明示的に無効 (デバッグで一時的に有効にしても、wrangler は省略したフィールドを API から
+# 消さないので、書いておかないと鍵と ssh が残り続ける — staging で実測)
+ssh = { enabled = false }
+authorized_keys = []
+
+[[env.staging.durable_objects.bindings]]
+name = "VEIN_DB"
+class_name = "VeinDb"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["VeinDb"]
+
+# ローカル (tests/run-local.sh・tests/bench-local.sh の `wrangler dev --env local`) 専用。deploy しない。
+# Secrets Store の binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ。
+# --env なしの `wrangler dev` は、トップレベルの VEIN_DATABASE_URL が「在るが読めない」に見えて 500 になる
+[env.local]
+name = "alc-vein-local"
+workers_dev = false
+preview_urls = false

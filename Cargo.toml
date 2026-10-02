@@ -1,0 +1,50 @@
+# 指静脈 (vein) の Worker。rust-alc-api を Cloudflare Workers へ段階移行する最初の 1 本
+# (Refs ippoan/rust-alc-api#680 / ippoan/rust-alc-api#683)。ippoan/rust-alc-api#721 で backend の repo から
+# この repo へ分けた。直下の package が worker、route の crate は crates/alc-vein (同じ workspace・lock は直下の 1 つ)。
+#
+# 口 (routes)・照合 (matcher)・trait は crates/alc-vein を
+# そのまま使い、この Worker は tokio-postgres の repo 実装 (`WorkerVeinTemplatesRepository`)・
+# DB への経路 (`db.rs`、staging は Container の PgBouncer を抱える Durable Object `VeinDb`) と
+# workers-rs への載せ方だけを持つ (Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#686 / ippoan/rust-alc-api#691)。
+[package]
+name = "alc-vein-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+members = ["crates/alc-vein"]
+
+# alc-core-wasm は ippoan/rust-alc-api に残る。git 依存・rev 固定で引き、**書くのはここ 1 か所だけ**
+# (worker と crates/alc-vein は `workspace = true` で継承する)。出どころが 2 つになると `TenantId` が
+# 別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
+# rev を上げるときは Cargo.lock も一緒に更新する (CLAUDE.md)。
+[workspace.dependencies]
+alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "4f96141f6db258c36b28c880e27000b14391edba" }
+
+# alc-vein は private repo ippoan/vein-match (vein-match / vein-match-search) に git 依存する。
+# 取得の仕方は crates/alc-vein/Cargo.toml と同じ (ローカルは `gh auth setup-git`、CI は
+# ippoan/ci-workflows の private-git-auth)。
+[dependencies]
+alc-core-wasm = { workspace = true }
+alc-vein = { path = "crates/alc-vein" }
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "wasmbind"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# VeinDb の TCP 中継 (copy_bidirectional)
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js", "with-chrono-0_4", "with-uuid-1"] }
+tower-service = "0.3"
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+worker = { version = "0.8", features = ["http", "axum", "tokio-postgres"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
