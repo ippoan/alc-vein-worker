@@ -35,6 +35,8 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   `[env.staging]` 直後の `[env.staging.observability]` という位置に行を挿す作りで、順が変わると検査が意味を失う。
   worker 名・binding・`[version_metadata]` (トップレベルと `env.staging` の両方) も変えない (同じ worker への上書きにするため)。
 - **secret・binding・入口 (route) を増やさない。** Cloudflare の token は org の secret を使い、repo 単位の secret を作らない。
+  本番の DB は Hyperdrive の binding `VEIN_HYPERDRIVE` (トップレベルにだけ。設定は共有で worker ごとに作らない)。
+  **`env.*` の下に `hyperdrive` を置かない** (本番の DB へ届くため。`check-exposure.sh` が検査)。平文の DB binding (`vpc_services` 等) を本番に置かないのも同じ検査。
 - **public repo。** ホスト名・IP・account ID・Tunnel ID・project ref・テナント ID・メール・接続文字列の実物を、
   コード・コメント・commit・PR に書かない (`wrangler.toml` に既に在る binding 用の ID は別)。
 - **タグ `v*` = 本番。** main へのマージは staging に出るだけ。本番は Actions の Tag Release を手動で打つ
