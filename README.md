@@ -13,8 +13,8 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 | 場所 | 中身 |
 |---|---|
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-vein-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ |
-| `crates/alc-vein/` | route の crate (口・照合 `matcher`・trait・SQL の定数・repo の tokio-postgres 実装 `pg`)。接続は持たない (張るのは Worker と実 DB のテスト) |
-| `container/` | staging の DB の image (postgres + PgBouncer)。SQL は ippoan/alc-migrations から取る (下の「migration の取り方」) |
+| `crates/alc-vein/` | route の crate (口・照合 `matcher`・trait・SQL の定数・repo の tokio-postgres 実装 `pg`)。接続は持たない (張るのは Worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL — 下の「DB の検査」) |
+| `container/` | staging の DB の image (postgres + PgBouncer)。SQL は ippoan/alc-migrations から取る (下の「migration の取り方」。同じ SQL を `crates/alc-vein` のテストも使う) |
 | `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh`、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
 | `tests/` | テナント漏れテスト・測定 (staging / ローカル / CI 向け) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (デプロイ) / `tag-release.yml` (本番用のタグ) |
@@ -36,6 +36,10 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
   ローカルは `gh auth setup-git` 済みであること、CI は cargo を打つ job の checkout 直後に
   `ippoan/ci-workflows/.github/actions/private-git-auth` (GitHub App の token で git の URL を書き換える)。
   **cargo を打つ job を足すときはこの step も足す。**
+  `ci.yml` は、依存を取り終えた直後 (`cargo fetch --locked` の後) に、その token を git 設定から外す — dev-dependency の
+  `pglite-oxide` が数百 package を連れてくるので、以降の build script とテストに token を渡さないため。
+  **守れる範囲はそこまで**: 外すのは git 設定の token だけで、取得済みの vein-match の checkout (`~/.cargo/git`) は build script から
+  読めるまま。token の権限は vein-match の contents:read だけで、job の終わりに失効する。
 - rev を上げる手順は `CLAUDE.md`。
 
 ## デプロイ
@@ -116,7 +120,7 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 名前付き prepared statement は Hyperdrive 経由で接続が切れるので、型で塞いでいる (Refs ippoan/rust-alc-api#723)。
 戻り値は印 `TxOutput` の付いた owned 型に限るので、`Row` をトランザクションの外へ返すとコンパイルが通らない。
 実装は `crates/alc-vein/src/pg.rs` の 1 つ (SQL は `repo::sql` の定数、引数の型の並びはここだけ) で、Worker (`src/repo.rs`) は
-それに計測とログを足すだけ、実 DB のテストも同じ実装を使う。
+それに計測とログを足すだけ、DB のテスト (`tests/sql_db.rs`) も同じ実装を使う。
 
 ## 接続ロールを返す口 `GET /internal/db-role` (Refs ippoan/auth-worker#605)
 
@@ -237,39 +241,78 @@ worker-build --release
 bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh
 cargo fmt --check
 cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
-cargo test -p alc-vein          # crates/alc-vein の unit test (routes と matcher)。実 DB のテストは #[ignore] で入らない
+bash scripts/fetch-migrations.sh
+cargo test -p alc-vein          # crates/alc-vein の unit test (routes と matcher) と tests/sql_db.rs (下の「DB の検査」)
 ```
 
 ### coverage の gate
 
-`crates/alc-vein/src/` の `matcher.rs`・`routes.rs`・`repo.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。
-backend の gate を移した、Refs ippoan/rust-alc-api#721)。計測は上の unit test で、DB は要らない。
+`crates/alc-vein/src/` の `matcher.rs`・`routes.rs`・`repo.rs`・`pg.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。
+backend の gate を移した、Refs ippoan/rust-alc-api#721)。計測は上の `cargo test -p alc-vein` と同じテスト (unit test と `sql_db`) で、
+docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る。
 
 ```bash
 cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt     # cargo-llvm-cov が要る
 bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt
 ```
 
-### 実 DB の検査 (SQL の定数と RLS)
+### DB の検査 (SQL の定数と RLS)
 
 `crates/alc-vein/tests/sql_db.rs` は、**worker が使うものと同じ repo の実装** (`alc_vein::pg::PgVeinTemplates`。`BEGIN` → `SET_TENANT` →
-`repo::sql` の定数を型付きの文で → `COMMIT`) に native の tokio-postgres の接続を渡し、upsert・学習の書き戻しと競合・削除済みの乗務員の除外・テナント分離・
-「`WHERE tenant_id` が合っていても `app.current_tenant_id` が別テナントなら RLS だけで止まる」を実 DB で確かめる
-(backend に在った `tests/vein_templates_test.rs` の代わり)。CI は `ci.yml` が起動確認で立てた DB にそのまま流す。
+`repo::sql` の定数を型付きの文で → `COMMIT`) に native の tokio-postgres の接続を渡し、**テストの process の中で起こす組み込みの
+PostgreSQL** (dev-dependency の `pglite-oxide`) に流す (Refs ippoan/rust-alc-api#727)。docker も外の DB も env も要らない。
+`#[ignore]` ではないので `cargo test -p alc-vein` と coverage の計測に入る。
 
 ```bash
-bash scripts/fetch-migrations.sh
-docker build -f container/Dockerfile -t vein-db .
-docker run -d --rm --name vein-db-test -p 127.0.0.1::6432 vein-db     # 空きポートに出す (docker port vein-db-test で見る)
-VEIN_TEST_DATABASE_URL="postgresql://alc_api_app@127.0.0.1:<ポート>/postgres" \
-  cargo test -p alc-vein --test sql_db -- --ignored
+bash scripts/fetch-migrations.sh                # 先に要る (テストが container/.alc-migrations の SQL を流す)
+cargo test -p alc-vein --test sql_db
 ```
 
-- **`VEIN_TEST_DATABASE_URL` が未設定だと失敗する** (skip して緑にしない)。superuser / BYPASSRLS のロールでも失敗する
-- 使い捨ての DB に向ける (テストはテナントと乗務員を自分で作り、終わりに消す。常駐の staging の DB には向けない)
-- repo の写しは持たない (worker と同じ `alc_vein::pg`)。準備・後始末と「RLS だけで止まる」の検査は、テストが自分で張った別の接続で流す。
-  「引数は A・GUC は B」は `tenant_tx(B, …)` の中で `pg` の自由関数を A の引数で呼んで作る
-- テストは 5 本 (どれも `#[ignore]`)。CI は `5 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる
+確かめること (8 本。CI は `8 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
+
+- 登録 → 照合で当たる → 学習後のテンプレートが書き戻される / 同じ乗務員の登録は 1 行を上書き / 読んだ後に登録し直されていたら
+  書き戻しは 0 行 / 別テナントから見えない・削除済みの乗務員の除外・DELETE の行数 (backend に在った `tests/vein_templates_test.rs` の代わり)
+- 「`WHERE tenant_id` が合っていても `app.current_tenant_id` が別テナントなら RLS だけで止まる」(「引数は A・GUC は B」を
+  `tenant_tx(B, …)` の中で `pg` の自由関数を A の引数で呼んで作る。他テナントの行の INSERT は 42501、テナントを設定しない
+  transaction の読みは 22P02)。ippoan/alc-migrations に全表の行の検査が入ったら外す候補
+- `current_user` が繋いだロールであること / DB のエラーが `DbError::Other` (message と SQLSTATE) になり、失敗した transaction が
+  残らないこと / 接続が切れているときの `DbError::Other`
+
+作りと、本物の DB との違い:
+
+- **migration が未取得だと失敗する** (skip して緑にしない)。接続ロールが superuser / BYPASSRLS / 表の所有者でも失敗する
+  (準備の `Embedded::start` が全テストで確かめる)
+- **同時に張れる接続は 1 本。** テストごとに DB を 1 つ起こし、準備の接続と repo の接続を順に張り替える
+  (閉じ切ってから次を張る。`tests/embedded/mod.rs`)
+- エンジンは **PostgreSQL 17.5** (wasm の 32-bit build)。本番は 17 系で major が一致する。CI の staging の DB の image
+  (`container/`) の版とは別
+- **PL/pgSQL の `EXCEPTION` ブロックがエラーを受けない**エンジン差が在る。vein の SQL が触る表
+  (`vein_templates`・`employees`・`tenants`) に trigger は無いので、この検査には効かない
+- 接続は **superuser の session に `SET ROLE` を重ねた形**になる (認証と「昇格できない」ことは再現しない。`current_user` を基準にした
+  policy の評価は同じ)
+- **直結で流す。PgBouncer (transaction mode) 越しの確かめは `tests/run-local.sh` が持つ** (下の「テナント漏れテスト」。
+  worker ごと、staging と同じ image の DB に通す)
+- **migration を流す順は 2 か所に在る**: `container/start.sh` (staging の DB の image) と `crates/alc-vein/tests/embedded/mod.rs` の
+  `migrate` (`init_local_db.sql` → 空の `alc_api._sqlx_migrations` → `migrations/*.sql` を 1 ファイル 1 transaction →
+  `local_app_grants.sql` → `ALTER ROLE alc_api_app LOGIN`)。片方を変えたらもう片方も変える。テストの側は種と PgBouncer を持たず、
+  `ALTER DATABASE … SET search_path` が効かないので migration の接続にだけ options で search_path を渡す
+- 初回は `~/.cache/pglite-oxide` に runtime の cache (約 99MB) が書かれる。unix socket は TMPDIR (長いときは `crates/alc-vein/.vein-pg-*/`、
+  `.gitignore` 済み) に置き、テストの終わりに消す
+
+#### lock の pin
+
+`pglite-oxide` は `=0.5.0` に固定している。その依存の wasmer 系 13 crate は、素の解決だと Rust 1.93 を要求する版になり、
+この repo の toolchain (1.92.0) で build が落ちる (`wasmer … requires rustc 1.93`)。`Cargo.lock` で alpha 版に pin している。
+**toolchain は上げない。** lock を作り直したときは pin し直す:
+
+```bash
+for c in wasmer wasmer-compiler wasmer-derive wasmer-types wasmer-vm; do cargo update -p "$c" --precise 7.2.0-alpha.2; done
+for c in wasmer-wasix wasmer-wasix-types wasmer-config wasmer-journal wasmer-package virtual-fs virtual-mio virtual-net; do
+  cargo update -p "$c" --precise 0.702.0-alpha.2
+done
+grep -c -- '-alpha' Cargo.lock                                                                # 13
+cargo tree --target wasm32-unknown-unknown -e normal | grep -ciE 'pglite|wasmer|webc'         # 0 (本番の wasm に入らない)
+```
 
 ## テナント漏れテスト / 測定
 
