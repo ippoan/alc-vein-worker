@@ -52,33 +52,41 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 
 ## DB への経路 (`src/db.rs` の 1 か所で出し分ける)
 
-上から順に見て、最初にあったものを使う (Cloudflare の DB 接続プールは使わない — staging で同じ経路を
-通せないため。ippoan/rust-alc-api#691)。1・2 とローカルは間に **transaction mode のプーラー** (PgBouncer) が入る。3 は接続文字列の
-host:port へ繋ぐだけで、宛先の形 (プーラーか直接か) は接続文字列しだい (repo の RLS はトランザクション単位なので、どちらでも動く作り)。
+上から順に見て、最初にあったものを使う。本番は **Hyperdrive** (Refs ippoan/rust-alc-api#723)。staging は通さない
+(staging の DB は平文の PgBouncer で、Hyperdrive の接続先にできない)。transaction の部品と SQL の呼び方は staging と本番で
+同じコードが動き、違うのは接続の段だけ。1・2 とローカルは間に **transaction mode のプーラー** (PgBouncer) が入り、3 は Hyperdrive が間に入る。
+4 は接続文字列の host:port へ繋ぐだけで、宛先の形は接続文字列しだい (repo の RLS はトランザクション単位で、SQL は名前なしの文だけなので、どれでも動く作り)。
 
 | 順 | env | 読むもの | 経路 |
 |---|---|---|---|
 | 1 | staging (`--env staging`、**一時**、ippoan/rust-alc-api#695) | Workers VPC の binding `VEIN_DB_VPC` (VPC Service 型、TCP) | Worker → 既存の Cloudflare Tunnel → 運用者の Linux 機の docker (`127.0.0.1:6432` にだけ bind。手元で動かす `container/` の image 内の PgBouncer) |
 | 2 | staging (fallback、ippoan/rust-alc-api#691) | Durable Object の binding `VEIN_DB` | Worker → `VeinDb` へ TCP (`Stub::connect`) → Container の 6432 (PgBouncer、`container/`) へ中継。`VEIN_DB_VPC` を外して deploy するとこちらに戻る |
-| 3 | 本番 (トップレベル) | Secrets Store の binding `VEIN_DATABASE_URL` (secret の名前 `alc-app-database-url-rt`。backend と同じ実行用ロールの接続文字列。Refs ippoan/auth-worker#605) | 接続文字列の host:port へ Worker の TCP (STARTTLS、常に TLS) |
+| 3 | 本番 (トップレベル) | Hyperdrive の binding `VEIN_HYPERDRIVE` (実行用ロールの設定。`wrangler.toml` の `[[hyperdrive]]`、トップレベルにだけ置く) | Worker → Hyperdrive → DB。接続・TLS・接続の使い回しは Hyperdrive が受け持つ (接続の部品は `alc_worker_db::hyperdrive::connect`) |
 | 4 | ローカル | 文字列 `DATABASE_URL` (worker 自身の secret / `wrangler dev --var`) | 接続文字列の host:port へ STARTTLS。`sslmode=disable` + var `ALLOW_INSECURE_DB=1` のときだけ手元の PgBouncer へ平文 |
 
-どれも無ければ 503 (`database_not_configured`)。`src/db.rs` は binding (`VEIN_DB_VPC` → `VEIN_DB`) を接続文字列
-(`VEIN_DATABASE_URL` → `DATABASE_URL`) より先に見る。どちらの binding も
-平文 (trust 認証) なので本番 (トップレベル) に置かないことを `scripts/check-exposure.sh` が検査する。
+どれも無ければ 503 (`database_not_configured`)。`src/db.rs` は binding (`VEIN_DB_VPC` → `VEIN_DB` → `VEIN_HYPERDRIVE`) を接続文字列
+(`DATABASE_URL`) より先に見る。`VEIN_DB_VPC` と `VEIN_DB` は
+平文 (trust 認証) なので本番 (トップレベル) に置かないこと、`VEIN_HYPERDRIVE` (本番の DB へ届く) を `env.*` の下に置かないことを `scripts/check-exposure.sh` が検査する。
 `ALLOW_INSECURE_DB` はローカル専用 (`wrangler dev --var` /
 `.dev.vars`) で、読むのは 4 の段だけ。無ければ `sslmode=disable` でも TLS を強制する。wrangler.toml の vars に書かないことを
 `scripts/check-exposure.sh` が検査する。
 
-### 本番の接続文字列の入れ直し
+### Hyperdrive の設定 (本番の DB)
 
-- GCP Secret Manager の secret `alc-app-database-url-rt` を、secret 管理の MCP で Cloudflare の Secrets Store へ
-  コピーする (値は人にも LLM にも見えない)。Worker は毎リクエスト読むので、**次の要求から効く (deploy は要らない)**。
-- **binding `VEIN_DATABASE_URL` が在るのに読めない (型が違う / 取得に失敗 / 値が無い) ときは 500** (`internal_error`) で、
-  4 の `DATABASE_URL` へは戻らない (古い secret へ黙って戻らないため)。4 へ落ちるのは binding が無いときだけ。
+- **設定は実行用ロールのもの 1 つを複数の worker で共有する (worker ごとに作らない)。** `wrangler.toml` に書くのは設定の ID だけ
+  (接続先・資格情報は設定の側に在り、repo に書かない)。query caching は無効。
+- **資格情報の入れ直しは 2 か所**: GCP Secret Manager の secret `alc-app-database-url-rt` と、Hyperdrive の設定
+  (`wrangler hyperdrive update <ID> --origin-password …` をオーナーの端末で。値を人にも LLM にも見せない)。
+  設定の更新が反映された時点から効く (Worker の deploy は要らない)。
+- **binding `VEIN_HYPERDRIVE` が在るのに使えないときは 500** (`internal_error`) で、4 の `DATABASE_URL` へは戻らない。
+  4 へ落ちるのは binding が無いときだけ。ログに出るのは binding 名・段の label・`kind` だけ (宛先・接続文字列は出ない)。
+- **DB の証明書の検証 (`verify-full`) は設定の側に在り、この repo と CI からは検査できない。** 設定は共有なので、後の
+  `hyperdrive update` で戻っても repo は気づけない。確かめ方: `npx wrangler hyperdrive get <ID>` の `mtls.sslmode` が `verify-full`・
+  `caching.disabled` が `true` (出力には接続先が含まれるので、貼るときはその 2 項目だけ)。
 - worker 自身の secret `DATABASE_URL` (`wrangler secret put`) は、ローカル (`tests/run-local.sh`) 専用の経路として残る。
-  ローカルの `wrangler dev` は **`--env local`** (binding を持たない env。deploy しない) で立てる — `--env` なしだと、トップレベルの `VEIN_DATABASE_URL` が「在るが読めない」に見えて全リクエストが 500 になる。
-  本番に残っている古い worker secret は、Secrets Store への切り替えを確かめた後に消す。
+  ローカルの `wrangler dev` は **`--env local`** (binding を持たない env。deploy しない) で立てる — `--env` なしだと、トップレベルの
+  `VEIN_HYPERDRIVE` の段に入ってローカルの接続文字列の段へ進まない。
+  本番に残っている古い worker secret は、Hyperdrive への切り替えを確かめた後に消す。
 
 ## 到達面
 
@@ -145,7 +153,7 @@ FORCE ROW LEVEL SECURITY の無いものがあり、表の所有者で繋ぐと 
 
 Container 経路は止まった後の cold start (約 3.5 秒)・置き場所が `APAC` までしか絞れない (往復 60〜140ms)・
 起動のたびの migration が重いので、**一時的に** staging の DB を運用者の Linux 機の docker に置く。
-Hyperdrive は使わない (ippoan/rust-alc-api#680)。
+staging は Hyperdrive を通さない (本番だけ。ippoan/rust-alc-api#680 / #723)。
 
 - DB は `container/` の image をそのまま使う (build context は repo の直下)。systemd --user の unit が
   `docker rm -f` → `docker run --rm -p 127.0.0.1:6432:6432` で毎回作り直す (start.sh は既存の PGDATA があると

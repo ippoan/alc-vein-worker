@@ -54,5 +54,7 @@ mutate "本番に vpc_services (平文の DB 経路) を足す" \
   's = s.replace("[build]", "[[vpc_services]]\nbinding = \"VEIN_DB_VPC\"\nservice_id = \"x\"\nremote = true\n\n[build]", 1)'
 mutate "本番に durable_objects の VEIN_DB (平文の DB 経路) を足す" \
   's = s.replace("[build]", "[[durable_objects.bindings]]\nname = \"VEIN_DB\"\nclass_name = \"VeinDb\"\n\n[build]", 1)'
+mutate "staging に hyperdrive (本番の DB へ届く binding) を足す" \
+  's = s.replace("[env.staging.observability]", "[[env.staging.hyperdrive]]\nbinding = \"VEIN_HYPERDRIVE\"\nid = \"x\"\n\n[env.staging.observability]", 1)'
 
 exit "$fail"

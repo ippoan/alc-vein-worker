@@ -27,16 +27,15 @@ binding = "CF_VERSION_METADATA"
 [placement]
 region = "aws:ap-northeast-1"
 
-# 本番の DB: Secrets Store の secret (backend と同じ実行用ロールの接続文字列) を binding VEIN_DATABASE_URL で
-# 毎リクエスト読み、その host:port へ Worker の TCP (STARTTLS) で繋ぐ (src/db.rs。Refs ippoan/auth-worker#605)。
-# 入れ直しは Secrets Store の secret を更新するだけで、次の要求から効く (deploy は要らない)。
-# binding が在るのに読めないときは 500 (worker 自身の secret DATABASE_URL へは落ちない)。
-# env.staging には置かない (staging は VPC の経路で、読まれない)。store_id は auth-worker の wrangler.toml と同じ store。
+# 本番の DB: Cloudflare Hyperdrive の binding VEIN_HYPERDRIVE (src/db.rs。Refs ippoan/rust-alc-api#723)。
+# 設定は実行用ロールのもの 1 つを複数の worker で共有する (worker ごとに作らない)。接続先・資格情報・
+# TLS (証明書の検証) は設定の側に在り、ここに書くのは設定の ID だけ。
+# binding が在るのに使えないときは 500 (ローカル用の文字列 DATABASE_URL へは落ちない)。
+# env.staging / env.local には置かない (binding は env に継承されない。scripts/check-exposure.sh が検査する)。
 # ★ この表は [placement] の後に置く (前の方に表を足すと scripts/check-exposure-test.sh の陰性対照が効かなくなる)
-[[secrets_store_secrets]]
-binding = "VEIN_DATABASE_URL"
-store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
-secret_name = "alc-app-database-url-rt"
+[[hyperdrive]]
+binding = "VEIN_HYPERDRIVE"
+id = "6bdf446634034f989d4e094d5510b162"
 
 # staging: DB は一時的に (ippoan/rust-alc-api#695) 運用者の Linux 機の docker (container/ の image、127.0.0.1:6432) に置き、
 # Workers VPC の binding VEIN_DB_VPC (VPC Service 型) から既存の Tunnel 経由で繋ぐ (src/db.rs)。
@@ -98,8 +97,8 @@ tag = "v1"
 new_sqlite_classes = ["VeinDb"]
 
 # ローカル (tests/run-local.sh・tests/bench-local.sh の `wrangler dev --env local`) 専用。deploy しない。
-# Secrets Store の binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ。
-# --env なしの `wrangler dev` は、トップレベルの VEIN_DATABASE_URL が「在るが読めない」に見えて 500 になる
+# Hyperdrive の binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ。
+# --env なしの `wrangler dev` は、トップレベルの VEIN_HYPERDRIVE の段に入り、ローカルの DATABASE_URL の段へは進まない
 [env.local]
 name = "alc-vein-local"
 workers_dev = false

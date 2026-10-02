@@ -10,9 +10,11 @@
 #     (staging の workers.dev は Cloudflare Access で保護する前提。README 参照)
 #   - トップレベル (本番) に平文 (NoTls + trust) で繋ぐ DB の binding が無い: vpc_services /
 #     vpc_networks (Workers VPC、#695) と durable_objects の VEIN_DB (Container、#691)。
-#     src/db.rs はこれらの binding を接続文字列 (Secrets Store の binding VEIN_DATABASE_URL →
-#     文字列 DATABASE_URL) より先に見るので、本番に紛れると TLS を強制する
+#     src/db.rs はこれらの binding を Hyperdrive の binding VEIN_HYPERDRIVE → 文字列 DATABASE_URL
+#     より先に見るので、本番に紛れると TLS を強制する
 #     経路を飛ばして平文に落ちる。これらは env.staging にだけ置く
+#   - env 配下 (env.staging を含む) に hyperdrive が無い (#723)。Hyperdrive の binding は本番の DB へ
+#     届くので、トップレベル (本番) にだけ置く (workers.dev が開いている staging に置かない)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash scripts/check-exposure.sh [wrangler.toml]
@@ -64,6 +66,11 @@ for key in ("vpc_services", "vpc_networks"):
 for b in cfg.get("durable_objects", {}).get("bindings", []):
     if b.get("name") == "VEIN_DB":
         err("トップレベルの durable_objects に VEIN_DB がある (本番の DB 接続が平文の Container 経路に落ちる。env.staging にだけ置く)")
+
+# Hyperdrive の binding は本番の DB へ届く。workers.dev が開いている staging を含め、env 配下には置かない
+for name, e in envs.items():
+    if e.get("hyperdrive"):
+        err(f"env.{name} に hyperdrive がある (本番の DB へ届く binding。トップレベルにだけ置く)")
 
 if errors:
     sys.exit(1)
