@@ -14,7 +14,7 @@
 # SQL (init_local_db.sql・local_app_grants.sql・migrations/) はこの repo に写しを置かず、正本の
 # ippoan/alc-migrations から版を固定して取る: build の前に `bash scripts/fetch-migrations.sh` が
 # container/ALC_MIGRATIONS_REV の rev を container/.alc-migrations/ に取り出す (無いと下の COPY が落ちる)。
-FROM postgres:16
+FROM postgres:17
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pgbouncer \

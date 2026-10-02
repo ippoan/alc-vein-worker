@@ -191,8 +191,10 @@ systemd の unit・コンテナ・image を消し、staging を Container 経路
 
 ## staging の DB (Cloudflare Containers、fallback)
 
-`container/`: postgres 16 + PgBouncer (`pool_mode = transaction`、サーバー側 4 本、
-`max_prepared_statements = 0`)。**ディスクは揮発**なので、起動のたびに空の DB から
+`container/`: postgres 17 + PgBouncer (`pool_mode = transaction`、サーバー側 4 本、
+`max_prepared_statements = 0`)。image の版は本番 (PostgreSQL 17 系) に合わせる。
+**image の定義 (`container/Dockerfile` の `FROM`) を替えても、動いている常駐のコンテナ (上の「手元の docker」) は作り直すまで前の版のまま。**
+**ディスクは揮発**なので、起動のたびに空の DB から
 alc-migrations の `scripts/init_local_db.sql` → `migrations/` → `scripts/local_app_grants.sql` (本番の GRANT の写し) →
 テナント漏れテストの種 (`tests/seed.sql`) を流し、最後に PgBouncer を起動する。
 
@@ -286,8 +288,8 @@ cargo test -p alc-vein --test sql_db
   (準備の `Embedded::start` が全テストで確かめる)
 - **同時に張れる接続は 1 本。** テストごとに DB を 1 つ起こし、準備の接続と repo の接続を順に張り替える
   (閉じ切ってから次を張る。`tests/embedded/mod.rs`)
-- エンジンは **PostgreSQL 17.5** (wasm の 32-bit build)。本番は 17 系で major が一致する。CI の staging の DB の image
-  (`container/`) の版とは別
+- エンジンは **PostgreSQL 17.5** (wasm の 32-bit build)。本番・staging の DB の image (`container/`)・この組み込みのエンジンは、
+  どれも PostgreSQL 17 系で major が一致する
 - **PL/pgSQL の `EXCEPTION` ブロックがエラーを受けない**エンジン差が在る。vein の SQL が触る表
   (`vein_templates`・`employees`・`tenants`) に trigger は無いので、この検査には効かない
 - 接続は **superuser の session に `SET ROLE` を重ねた形**になる (認証と「昇格できない」ことは再現しない。`current_user` を基準にした
