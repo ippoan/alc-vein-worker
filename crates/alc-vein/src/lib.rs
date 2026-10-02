@@ -8,10 +8,12 @@
 //! (`POST /vein/identify`) のときだけで、オフライン (alc-app 同梱の wasm) では学習しない。
 //!
 //! - [`matcher`]: 特徴量の検査・テンプレートの組み立て・1:N 照合 (DB を持たない)
-//! - [`repo`]: `vein_templates` の読み書き
+//! - [`repo`]: `vein_templates` の読み書き (trait・型・SQL の定数)
+//! - [`pg`]: その tokio-postgres 実装 (共通 crate `alc-worker-db` のテナントの transaction に載せる。接続は持たない)
 //! - [`routes`]: 4 本の口
 
 pub mod matcher;
+pub mod pg;
 pub mod repo;
 pub mod routes;
 

@@ -2,10 +2,11 @@
 # (Refs ippoan/rust-alc-api#680 / ippoan/rust-alc-api#683)。ippoan/rust-alc-api#721 で backend の repo から
 # この repo へ分けた。直下の package が worker、route の crate は crates/alc-vein (同じ workspace・lock は直下の 1 つ)。
 #
-# 口 (routes)・照合 (matcher)・trait は crates/alc-vein を
-# そのまま使い、この Worker は tokio-postgres の repo 実装 (`WorkerVeinTemplatesRepository`)・
+# 口 (routes)・照合 (matcher)・trait・repo の実装 (`alc_vein::pg`、tokio-postgres) は crates/alc-vein を
+# そのまま使い、この Worker は repo の計測とログの包み (`WorkerVeinTemplatesRepository`)・
 # DB への経路 (`db.rs`、staging は Container の PgBouncer を抱える Durable Object `VeinDb`) と
-# workers-rs への載せ方だけを持つ (Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#686 / ippoan/rust-alc-api#691)。
+# workers-rs への載せ方だけを持つ (Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#686 / ippoan/rust-alc-api#691 /
+# ippoan/rust-alc-api#723)。
 [package]
 name = "alc-vein-worker"
 version = "0.1.0"
@@ -22,8 +23,10 @@ members = ["crates/alc-vein"]
 # (worker と crates/alc-vein は `workspace = true` で継承する)。出どころが 2 つになると `TenantId` が
 # 別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
 # rev を上げるときは Cargo.lock も一緒に更新する (CLAUDE.md)。
+# alc-worker-db (ippoan/alc-worker-kit) も同じ (出どころを 2 つにしない。`PgClient` が別の型になる)。
 [workspace.dependencies]
 alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "4f96141f6db258c36b28c880e27000b14391edba" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
 
 # alc-vein は private repo ippoan/vein-match (vein-match / vein-match-search) に git 依存する。
 # 取得の仕方は crates/alc-vein/Cargo.toml と同じ (ローカルは `gh auth setup-git`、CI は
@@ -31,6 +34,7 @@ alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "4f96141
 [dependencies]
 alc-core-wasm = { workspace = true }
 alc-vein = { path = "crates/alc-vein" }
+alc-worker-db = { workspace = true }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "wasmbind"] }

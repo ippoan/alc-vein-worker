@@ -1,5 +1,5 @@
 //! `routes` の口を DB なしで確かめる (repo は fake に差し替える)。
-//! 実 DB (RLS・upsert・updated_at の競合) は tests/vein_templates_test.rs が見る。
+//! 実 DB (RLS・upsert・updated_at の競合) は crates/alc-vein/tests/sql_db.rs が見る。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

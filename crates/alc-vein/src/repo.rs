@@ -1,6 +1,6 @@
 //! `vein_templates` (乗務員 1 人 1 件の指静脈テンプレート、migrations/151) の読み書き。
 //!
-//! ここに在るのは trait・型・SQL の定数だけで、DB 実装は直下の worker (`src/repo.rs`) が持つ (handler のテストが
+//! ここに在るのは trait・型・SQL の定数だけで、DB 実装は [`crate::pg`] が持つ (handler のテストが
 //! mock に差し替えられるよう `VeinState` は trait object で持つ)。RLS に加えて
 //! `WHERE tenant_id` を明示する (staging は superuser 接続で RLS が効かないため)。
 

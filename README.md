@@ -3,8 +3,8 @@
 指静脈 (vein) の 4 本の口 (crates/alc-vein) を workers-rs + tokio-postgres で提供する Cloudflare Worker `alc-vein`。
 rust-alc-api を Cloudflare Workers へ段階移行する最初の 1 本 (Refs ippoan/rust-alc-api#680 / ippoan/rust-alc-api#683 / ippoan/rust-alc-api#691) で、
 backend (ippoan/rust-alc-api) の `workers/vein/` と `crates/alc-vein/` をこの repo へ分けた (Refs ippoan/rust-alc-api#721)。
-口・照合・trait・SQL (`repo::sql`) は alc-vein (`crates/alc-vein`) をそのまま使い、
-この Worker が持つのは repo 実装 (`src/repo.rs`)・DB への経路 (`src/db.rs`)・staging の DB を抱える
+口・照合・trait・SQL (`repo::sql`)・repo の実装 (`pg`) は alc-vein (`crates/alc-vein`) をそのまま使い、
+この Worker が持つのは repo の計測とログの包み (`src/repo.rs`)・DB への経路 (`src/db.rs`)・staging の DB を抱える
 Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 (`src/lib.rs`) だけ。
 
@@ -13,7 +13,7 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 | 場所 | 中身 |
 |---|---|
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-vein-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ |
-| `crates/alc-vein/` | route の crate (口・照合 `matcher`・trait・SQL の定数)。DB 実装は持たない |
+| `crates/alc-vein/` | route の crate (口・照合 `matcher`・trait・SQL の定数・repo の tokio-postgres 実装 `pg`)。接続は持たない (張るのは Worker と実 DB のテスト) |
 | `container/` | staging の DB の image (postgres + PgBouncer)。SQL は ippoan/alc-migrations から取る (下の「migration の取り方」) |
 | `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh`、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
 | `tests/` | テナント漏れテスト・測定 (staging / ローカル / CI 向け) |
@@ -29,6 +29,9 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
   ```bash
   cargo tree -i alc-core-wasm --target wasm32-unknown-unknown   # 出どころが 1 つだけ
   ```
+- **`alc-worker-db`** (テナントの transaction の部品 `PgClient`・`TenantTx`・`TxOutput`) は ippoan/alc-worker-kit (public) に在る。
+  `alc-core-wasm` と同じく、直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書き (feature `chrono`)、
+  Worker と `crates/alc-vein` は `workspace = true` で継承する (出どころが 2 つになると `PgClient` が別の型になる)。
 - **`vein-match` / `vein-match-search`** は private repo ippoan/vein-match への git 依存 (tag 固定)。取得に GitHub の認証が要る:
   ローカルは `gh auth setup-git` 済みであること、CI は cargo を打つ job の checkout 直後に
   `ippoan/ci-workflows/.github/actions/private-git-auth` (GitHub App の token で git の URL を書き換える)。
@@ -99,11 +102,13 @@ host:port へ繋ぐだけで、宛先の形 (プーラーか直接か) は接続
 **repo のメソッド 1 回 = 1 トランザクション。** `BEGIN` の中で
 `set_config('app.current_tenant_id', $1, true)` を打つ (プーラーはトランザクション単位で
 コネクションを使い回すので、session スコープの `set_current_tenant` は使えない)。
-**repo の DB 操作はすべて `in_tenant_tx` を通し、`Row` / `Statement` をトランザクションの外へ出さない**
-(戻り値は印 `TxOutput` の付いた owned 型に限るので、`Row` を返すとコンパイルが通らない)。
-`Row` は prepared statement を握っていて、COMMIT 後に drop すると Close がトランザクションの外に出て
-別のサーバー接続へ回り、`prepared statement "s1" already exists` (42P05) になる (staging で実測)。
-詳細は `src/repo.rs`。
+**repo の DB 操作はすべて、共通 crate `alc-worker-db` の `PgClient::tenant_tx` を通す** (順は `BEGIN` → 頭の文 `SET_TENANT` →
+本文 → `COMMIT` で固定。テナントを設定しないトランザクションを作る口は無い)。その中で流せるのは `TenantTx` の
+**型付きの名前なしの文** (`query_typed`・`query_typed_one`・`query_typed_opt`・`execute_typed`) だけ —
+名前付き prepared statement は Hyperdrive 経由で接続が切れるので、型で塞いでいる (Refs ippoan/rust-alc-api#723)。
+戻り値は印 `TxOutput` の付いた owned 型に限るので、`Row` をトランザクションの外へ返すとコンパイルが通らない。
+実装は `crates/alc-vein/src/pg.rs` の 1 つ (SQL は `repo::sql` の定数、引数の型の並びはここだけ) で、Worker (`src/repo.rs`) は
+それに計測とログを足すだけ、実 DB のテストも同じ実装を使う。
 
 ## 接続ロールを返す口 `GET /internal/db-role` (Refs ippoan/auth-worker#605)
 
@@ -113,8 +118,8 @@ FORCE ROW LEVEL SECURITY の無いものがあり、表の所有者で繋ぐと 
 1 回呼んで確かめる。
 
 - **引数なし。** path・query・header・body を読まない。同じ接続に `SELECT current_user` を 1 文流すだけ
-  (書き込み・`SET`・トランザクションなし。テナントを取らないので `in_tenant_tx` は通さない)。
-  `simple_query` で流すので prepared statement を作らず、上の 42P05 は起きない
+  (書き込み・`SET`・トランザクションなし。テナントを取らないので `tenant_tx` は通さない。`alc-worker-db` の
+  `PgClient::current_user` = 固定の文を `simple_query` で 1 回、prepared statement を作らない)
 - **返す値** (200):
 
   ```json
@@ -239,8 +244,8 @@ bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt
 
 ### 実 DB の検査 (SQL の定数と RLS)
 
-`crates/alc-vein/tests/sql_db.rs` は、worker の `in_tenant_tx` と同じ形 (`BEGIN` → `set_config(.., true)` → `repo::sql` の定数 → `COMMIT`) を
-native の tokio-postgres で組み、upsert・学習の書き戻しと競合・削除済みの乗務員の除外・テナント分離・
+`crates/alc-vein/tests/sql_db.rs` は、**worker が使うものと同じ repo の実装** (`alc_vein::pg::PgVeinTemplates`。`BEGIN` → `SET_TENANT` →
+`repo::sql` の定数を型付きの文で → `COMMIT`) に native の tokio-postgres の接続を渡し、upsert・学習の書き戻しと競合・削除済みの乗務員の除外・テナント分離・
 「`WHERE tenant_id` が合っていても `app.current_tenant_id` が別テナントなら RLS だけで止まる」を実 DB で確かめる
 (backend に在った `tests/vein_templates_test.rs` の代わり)。CI は `ci.yml` が起動確認で立てた DB にそのまま流す。
 
@@ -254,8 +259,9 @@ VEIN_TEST_DATABASE_URL="postgresql://alc_api_app@127.0.0.1:<ポート>/postgres"
 
 - **`VEIN_TEST_DATABASE_URL` が未設定だと失敗する** (skip して緑にしない)。superuser / BYPASSRLS のロールでも失敗する
 - 使い捨ての DB に向ける (テストはテナントと乗務員を自分で作り、終わりに消す。常駐の staging の DB には向けない)
-- worker 本体 (`src/repo.rs`) は wasm 専用で native のテストから呼べないので、テストは同じ形の repo を自分で持つ。
-  トランザクションの頭の文が worker と同じであることは `set_tenant_statement_matches_worker` (DB 不要) が見る
+- repo の写しは持たない (worker と同じ `alc_vein::pg`)。準備・後始末と「RLS だけで止まる」の検査は、テストが自分で張った別の接続で流す。
+  「引数は A・GUC は B」は `tenant_tx(B, …)` の中で `pg` の自由関数を A の引数で呼んで作る
+- テストは 5 本 (どれも `#[ignore]`)。CI は `5 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる
 
 ## テナント漏れテスト / 測定
 

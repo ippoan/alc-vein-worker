@@ -7,6 +7,8 @@
 # 計測するのは `cargo test -p alc-vein` の unit test (DB なし。tests/sql_db.rs の実 DB テストは
 # #[ignore] なので入らない)。登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
 # lib.rs は mod 宣言と VeinState だけで実行行が無いので登録しない。
+# pg.rs (repo の tokio-postgres 実装) は実 DB でしか通らず、unit test の計測では実行行が 0 になるので登録しない
+# (確かめるのは tests/sql_db.rs。CI は本数を固定して回す)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
 # 特徴量の検査・テンプレートの組み立て・1:N 照合
