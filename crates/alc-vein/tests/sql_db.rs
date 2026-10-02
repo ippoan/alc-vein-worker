@@ -1,11 +1,12 @@
-//! `repo::sql` の定数と RLS を、テストの process の中で起こす組み込みの PostgreSQL で確かめる
+//! `repo::sql` の定数を、テストの process の中で起こす組み込みの PostgreSQL で確かめる
 //! (Refs ippoan/rust-alc-api#721 / ippoan/rust-alc-api#727)。
 //!
 //! 口の分岐 (422 / 0〜2 人 / 501 人 / 書き戻しの競合) は `src/routes_tests.rs` が fake の repo で見る。
 //! ここは SQL の側 — `ON CONFLICT (tenant_id, employee_id)` の upsert・`updated_at` を条件にした書き戻し・
-//! 削除済みの乗務員の除外・RLS のテナント分離 — と、登録 → 照合で当たる → 学習後のテンプレートが
+//! 削除済みの乗務員の除外・テナント分離 (`WHERE tenant_id` と RLS が合わさった結果) — と、登録 → 照合で当たる → 学習後のテンプレートが
 //! 書き戻される、の一連を固定する (backend に在った `tests/vein_templates_test.rs` の 4 本と同じ事柄)。
 //! 加えて `current_user` と、`tokio_postgres::Error` → `DbError` の写し (DB のエラー / DB でない失敗) を通す。
+//! RLS が実際に行を止めることは ippoan/alc-migrations の CI (`ci/check_rls_rows.sql`、全部の表を実行用ロールから実際の行で) が確かめる。ここでは確かめない。
 //!
 //! repo は worker が使うものと同じ実装 ([`alc_vein::pg::PgVeinTemplates`]) — メソッド 1 回 = 1 トランザクション、
 //! `BEGIN` → `alc_worker_db::SET_TENANT` → `repo::sql` の定数 (型付きの名前なしの文) → `COMMIT`。
@@ -31,18 +32,15 @@ use std::sync::Arc;
 
 use alc_core_wasm::{DbError, TenantId};
 use alc_vein::matcher::{self, synth};
-use alc_vein::pg::{self, PgVeinTemplates};
-use alc_vein::repo::{sql, VeinTemplatesRepository};
+use alc_vein::pg::PgVeinTemplates;
+use alc_vein::repo::VeinTemplatesRepository;
 use alc_vein::routes::tenant_router;
 use alc_vein::VeinState;
-use alc_worker_db::SET_TENANT;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
 use embedded::{employee, soft_delete_employee, tenant, Embedded, APP_ROLE};
 use serde_json::{json, Value};
-use tokio_postgres::error::SqlState;
-use tokio_postgres::types::Type;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -287,104 +285,6 @@ async fn tenant_isolation_and_deleted_employees() {
         (StatusCode::NOT_FOUND, json!("vein_template_not_found"))
     );
     assert_eq!(list(r, a).await["templates"], json!([]));
-    repo.close().await;
-    db.shutdown();
-}
-
-/// SQL の `WHERE tenant_id = $1` が正しいテナントを指していても、`app.current_tenant_id` が別テナントなら
-/// RLS だけで止まる (上のテストは WHERE と RLS の両方が効いた結果しか見ていない)。
-/// ippoan/alc-migrations に全表の行の検査が入ったら外す候補 (Refs ippoan/rust-alc-api#727)。
-#[tokio::test(flavor = "multi_thread")]
-async fn rls_alone_blocks_another_tenant() {
-    let db = Embedded::start().await;
-    let mut prep = db.client(APP_ROLE).await;
-    let a = tenant(&mut prep.inner, "Vein RLS Tenant A").await;
-    let b = tenant(&mut prep.inner, "Vein RLS Tenant B").await;
-    let yamada = employee(&mut prep.inner, a, "山田").await;
-    let tanaka = employee(&mut prep.inner, a, "田中").await;
-    prep.close().await;
-    let repo = db.repo(APP_ROLE).await;
-    assert_eq!(
-        put_template(&repo.inner, a, yamada, 51).await.0,
-        StatusCode::OK
-    );
-    let row = repo.inner.list(a).await.unwrap().remove(0);
-    repo.close().await;
-
-    // 引数は A、GUC は B (repo と同じ自由関数を、B を設定したトランザクションの中で呼ぶ)
-    let mut as_b = db.client(APP_ROLE).await;
-    let listed = as_b
-        .inner
-        .tenant_tx(b, |tx| Box::pin(pg::list(tx, a)))
-        .await;
-    assert_eq!(listed.unwrap(), vec![]);
-    let counted = as_b
-        .inner
-        .tenant_tx(b, |tx| Box::pin(pg::registration_count(tx, a, yamada)))
-        .await;
-    assert_eq!(counted.unwrap(), (0, false));
-    // employees も RLS で見えないので、登録は「乗務員が居ない」になる
-    let upserted = as_b
-        .inner
-        .tenant_tx(b, |tx| Box::pin(pg::upsert(tx, a, tanaka, "x")))
-        .await;
-    assert_eq!(upserted.unwrap(), None);
-    let written = as_b
-        .inner
-        .tenant_tx(b, |tx| {
-            Box::pin(pg::update_learned(tx, a, row.id, "x", row.updated_at))
-        })
-        .await;
-    assert!(!written.unwrap());
-    let deleted = as_b
-        .inner
-        .tenant_tx(b, |tx| Box::pin(pg::delete(tx, a, yamada)))
-        .await;
-    assert!(!deleted.unwrap());
-    {
-        // 他テナントの行は書けない (policy の USING が INSERT の検査にもなる)
-        let err = as_b
-            .inner
-            .tenant_tx(b, move |tx| {
-                Box::pin(async move {
-                    tx.execute_typed(
-                        "INSERT INTO vein_templates (tenant_id, employee_id, template) VALUES ($1, $2, 'x')",
-                        &[(&a, Type::UUID), (&tanaka, Type::UUID)],
-                    )
-                    .await
-                })
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE), "{err}");
-    }
-    as_b.close().await;
-    {
-        // テナントを設定しないトランザクションは読めない (前のトランザクションの値が残っていない)。
-        // 未設定のトランザクションは PgClient からは作れないので、ここだけ素の接続 1 本を使う:
-        // (1) A を設定して COMMIT → (2) 同じ接続の次のトランザクションで、設定せずに読む
-        let mut raw = db.raw(APP_ROLE).await;
-        let tx = raw.inner.transaction().await.unwrap();
-        tx.query_typed(SET_TENANT, &[(&a.to_string(), Type::TEXT)])
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let tx = raw.inner.transaction().await.unwrap();
-        let read = tx.query_typed(sql::LIST, &[(&a, Type::UUID)]).await;
-        // 表が見つからない (42P01) で落ちたのではなく、テナントの GUC が空で落ちたこと
-        let err = read.expect_err("テナント未設定で読めた");
-        assert_eq!(
-            err.code(),
-            Some(&SqlState::INVALID_TEXT_REPRESENTATION),
-            "{err}"
-        );
-        drop(tx);
-        raw.close().await;
-    }
-
-    // A の登録は元のまま
-    let repo = db.repo(APP_ROLE).await;
-    assert_eq!(repo.inner.list(a).await.unwrap(), vec![row]);
     repo.close().await;
     db.shutdown();
 }

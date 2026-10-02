@@ -80,7 +80,7 @@ jobs:
           cargo llvm-cov --locked -p alc-vein --no-report 2>&1 | tee "$RUNNER_TEMP/alc-vein-test.txt"
           # sql_db の結果の行だけを見る (unit test の行と取り違えない)
           awk '/Running.*tests\/sql_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-vein-test.txt" \
-            | grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored'
           cov="$RUNNER_TEMP/alc-vein-cov.txt"
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p alc-vein --text > "$cov"

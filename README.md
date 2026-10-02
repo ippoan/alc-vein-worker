@@ -260,7 +260,7 @@ cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt     # cargo-l
 bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt
 ```
 
-### DB の検査 (SQL の定数と RLS)
+### DB の検査 (SQL の定数)
 
 `crates/alc-vein/tests/sql_db.rs` は、**worker が使うものと同じ repo の実装** (`alc_vein::pg::PgVeinTemplates`。`BEGIN` → `SET_TENANT` →
 `repo::sql` の定数を型付きの文で → `COMMIT`) に native の tokio-postgres の接続を渡し、**テストの process の中で起こす組み込みの
@@ -272,15 +272,16 @@ bash scripts/fetch-migrations.sh                # 先に要る (テストが con
 cargo test -p alc-vein --test sql_db
 ```
 
-確かめること (8 本。CI は `8 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
+確かめること (7 本。CI は `7 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
 
 - 登録 → 照合で当たる → 学習後のテンプレートが書き戻される / 同じ乗務員の登録は 1 行を上書き / 読んだ後に登録し直されていたら
   書き戻しは 0 行 / 別テナントから見えない・削除済みの乗務員の除外・DELETE の行数 (backend に在った `tests/vein_templates_test.rs` の代わり)
-- 「`WHERE tenant_id` が合っていても `app.current_tenant_id` が別テナントなら RLS だけで止まる」(「引数は A・GUC は B」を
-  `tenant_tx(B, …)` の中で `pg` の自由関数を A の引数で呼んで作る。他テナントの行の INSERT は 42501、テナントを設定しない
-  transaction の読みは 22P02)。ippoan/alc-migrations に全表の行の検査が入ったら外す候補
 - `current_user` が繋いだロールであること / DB のエラーが `DbError::Other` (message と SQLSTATE) になり、失敗した transaction が
   残らないこと / 接続が切れているときの `DbError::Other`
+
+**RLS が実際に行を止めることは、ここでは確かめない。** RLS の確かめは ippoan/alc-migrations の CI (`ci/check_rls_rows.sql`。
+`tenant_id` を持つ全部の表を、実行用ロールから実際の行で) が持つ (Refs ippoan/rust-alc-api#727)。上の「別テナントから見えない」は、
+vein の SQL の `WHERE tenant_id` と RLS が合わさった結果を正しい引数で見るもの。
 
 作りと、本物の DB との違い:
 
