@@ -4,7 +4,7 @@
 backend (ippoan/rust-alc-api) から分けた repo (Refs ippoan/rust-alc-api#721)。構造は `.claude/skills/alc-vein-worker-map`、詳細は `README.md`。
 
 - 直下 = Worker 本体 (workers-rs + tokio-postgres、wasm32-unknown-unknown。workspace の root)
-- `crates/alc-vein/` = 口 4 本・照合・trait・SQL の定数・repo の実装 `pg` (tokio-postgres。接続は持たない — 張るのは worker とテスト)
+- `crates/alc-vein/` = 口 4 本・照合・trait・SQL の定数・repo の実装 `pg` (tokio-postgres。接続は持たない — 張るのは worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL)
 - `container/` = staging の DB の image。SQL は ippoan/alc-migrations から取る
 
 ## コマンド
@@ -13,15 +13,15 @@ backend (ippoan/rust-alc-api) から分けた repo (Refs ippoan/rust-alc-api#721
 bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh   # 公開範囲の検査と陰性対照
 cargo fmt --check
 cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
-cargo test -p alc-vein                                                  # unit test (routes と matcher)
-cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt && bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt   # coverage 100% の gate
+bash scripts/fetch-migrations.sh && cargo test -p alc-vein              # unit test (routes と matcher) と tests/sql_db.rs (組み込みの PostgreSQL。docker も env も要らない)
+cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt && bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt   # coverage 100% の gate (CI はテストをこの計測の 1 回にまとめる)
 worker-build --release                                                  # worker-build 0.8.7
-bash scripts/fetch-migrations.sh                                        # docker build の前に必ず
+bash scripts/fetch-migrations.sh                                        # テスト・coverage・docker build の前に必ず
 docker build -f container/Dockerfile -t vein-db .
 npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信しない
-# 実 DB の検査 (上の image を空きポートで立ててから。README の「実 DB の検査」)
-VEIN_TEST_DATABASE_URL=... cargo test -p alc-vein --test sql_db -- --ignored   # repo::sql の定数と RLS
-APP_DB_URL=... bash tests/run-local.sh                                         # worker を通したテナント漏れテスト
+bash scripts/fetch-migrations.sh && cargo test -p alc-vein --test sql_db   # repo::sql の定数と RLS (README の「DB の検査」)
+# worker を通したテナント漏れテスト (上の image を空きポートで立ててから)
+APP_DB_URL=... bash tests/run-local.sh
 ```
 
 private repo ippoan/vein-match への git 依存がある。ローカルは `gh auth setup-git` 済みであること。
@@ -46,10 +46,15 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   **名前付き prepared statement を呼ぶコード (`execute`・`query`・`query_one`・`query_opt`・`prepare`) を足さない** — 使うのは
   `TenantTx` の `query_typed`・`query_typed_one`・`query_typed_opt`・`execute_typed` だけ (Hyperdrive 経由では名前付きの文で接続が切れる)。
   生の `tokio_postgres::Client` を `src/db.rs` の外へ出さない。
-- **実 DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は接続先 (`VEIN_TEST_DATABASE_URL`) が無ければ失敗する作り
-  (skip にしない)。`repo::sql` の定数・`pg.rs` の引数の型・`alc-worker-db` の rev を変えたら、このテストを実 DB で通す。
-  CI は本数を固定して回す (`ci.yml` の `5 passed`。テストを減らさない)。
-  `coverage_100.toml` の 3 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`) は行カバレッジ 100% (登録を外さない)。
+- **DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は、テストの中で起こす組み込みの PostgreSQL
+  (`pglite-oxide`) に流す。migration が未取得 (`container/.alc-migrations` が無い) なら失敗する作り
+  (skip にしない・`#[ignore]` にしない)。`repo::sql` の定数・`pg.rs` の引数の型・`alc-worker-db` の rev を変えたら、このテストを通す。
+  CI は本数を固定して回す (`ci.yml` の `8 passed`。テストを減らさない)。CI がテストを走らせるのは coverage の計測の 1 回だけ
+  (素の `cargo test` の step は無い — dev-dependency を 2 回 compile しないため。step を分けて計測から外さない)。
+  `coverage_100.toml` の 4 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`・`pg.rs`) は行カバレッジ 100% (登録を外さない)。
+- **`pglite-oxide` は `=0.5.0` に固定** (`crates/alc-vein/Cargo.toml` の dev-dependency)。wasmer 系 13 crate は `Cargo.lock` で
+  alpha 版に pin している (Rust 1.92.0 で build が通る版)。lock を作り直すときは pin し直す (手順は README の「lock の pin」)。
+  本番の wasm に入らないこと (`cargo tree --target wasm32-unknown-unknown -e normal` に pglite / wasmer が 0 行) を崩さない。
 - **staging の DB を動かしている機では、`127.0.0.1:6432` を常駐のコンテナが使っている** (README)。手元の検査の DB は別名・空きポート
   (`-p 127.0.0.1::6432`) で立て、常駐のコンテナには繋がない・止めない。
 
@@ -61,8 +66,9 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   (2 つになると、コンパイルは通るのに全リクエストが 500 になる)。
 - **`alc-worker-db`** (ippoan/alc-worker-kit): `alc-core-wasm` と同じ。直下の `Cargo.toml` の `[workspace.dependencies]` の `rev` の
   1 か所だけを変え、`cargo update -p alc-worker-db` で `Cargo.lock` を一緒に更新し、`cargo tree -i alc-worker-db --target wasm32-unknown-unknown`
-  で出どころが 1 つだけであることを確かめる (`worker`・`tokio-postgres` も版が 1 つのままであること)。その後、実 DB の検査を通す。
-- **alc-migrations** (staging の DB の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
+  で出どころが 1 つだけであることを確かめる (`worker`・`tokio-postgres` も版が 1 つのままであること)。その後、
+  `bash scripts/fetch-migrations.sh && cargo test -p alc-vein --test sql_db` を通す。
+- **alc-migrations** (staging の DB と、テストの組み込みの PostgreSQL の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
   rev は ippoan/rust-alc-api の `Cargo.toml` が固定している alc-migrations の rev と揃える。
-  `bash scripts/fetch-migrations.sh` → `docker build` → 起動確認 (CI の「staging DB の Container image が起動する」と同じ命令) を手元で通す。
+  `bash scripts/fetch-migrations.sh` → `cargo test -p alc-vein` → `docker build` → 起動確認 (CI の「staging DB の Container image が起動する」と同じ命令) を手元で通す。
 - **vein-match**: `crates/alc-vein/Cargo.toml` の `tag` (2 行とも) と `Cargo.lock`。

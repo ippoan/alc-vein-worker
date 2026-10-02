@@ -5,3 +5,5 @@
 .dev.vars*
 # scripts/fetch-migrations.sh が ippoan/alc-migrations から取り出す SQL (commit しない)
 /container/.alc-migrations
+# crates/alc-vein/tests/embedded/mod.rs が組み込みの PostgreSQL の unix socket を置く (TMPDIR が長いときだけ)
+crates/alc-vein/.vein-pg-*/
