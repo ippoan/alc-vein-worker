@@ -179,14 +179,7 @@ impl Embedded {
         su.close().await;
     }
 
-    /// 素の接続 (テナントを設定しない transaction の検査だけに使う)。search_path は接続の options で渡す —
-    /// 本物の DB は `ALTER DATABASE … SET search_path` が既定を持つが、組み込みではそれが効かないので、
-    /// 渡さないと「表が見つからない」(42P01) で落ちてしまい、テナント未設定で落ちたことにならない。
-    pub async fn raw(&self, user: &str) -> Held<Client> {
-        self.connect(user, Some(SEARCH_PATH)).await
-    }
-
-    /// `role` で繋いだ `PgClient` (準備と、RLS だけで止まることの検査に使う)。
+    /// `role` で繋いだ `PgClient` (準備に使う)。
     pub async fn client(&self, role: &str) -> Held<PgClient> {
         let Held { inner, task } = self.connect(role, None).await;
         Held {
