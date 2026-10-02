@@ -49,13 +49,35 @@ jobs:
         with:
           shared-key: vein-worker
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # これ以降の build script・テストに、private repo (vein-match) の取得用 token を渡さない
+      # (dev-dependency の pglite-oxide が数百 package を連れてくるため。取得は上の cargo fetch で済んでいる)
+      - name: private repo の取得用 token を git 設定から外す
+        run: |
+          cargo fetch --locked
+          n=0
+          while read -r k; do
+            git config --global --unset-all "$k"; n=$((n+1))
+          done < <(git config --global --name-only --get-regexp '^url\..*\.insteadof$')
+          # 1 つも外せなかったら落とす (上の action の作りが変わったことに気づくため)
+          [ "$n" -ge 1 ] || { echo "::error::外す設定が見つからない"; exit 1; }
+          ! git config --global --get-regexp '^url\..*\.insteadof$' >/dev/null
       - run: cargo fmt --check
       - run: cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
-      # crates/alc-vein の unit test (routes_tests と matcher)
-      - run: cargo test -p alc-vein
+      # テスト (組み込みの PostgreSQL) と、image が COPY する SQL を ippoan/alc-migrations から取る
+      # (版は container/ALC_MIGRATIONS_REV)
+      - run: bash scripts/fetch-migrations.sh
+      # crates/alc-vein の unit test と、組み込みの PostgreSQL に流す tests/sql_db.rs (docker も env も要らない)。
+      # sql_db の本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)
+      - name: unit test と sql_db (組み込みの PostgreSQL)
+        run: |
+          set -o pipefail
+          cargo test --locked -p alc-vein 2>&1 | tee "$RUNNER_TEMP/alc-vein-test.txt"
+          cargo test --locked -p alc-vein --test sql_db 2>&1 | tee "$RUNNER_TEMP/sql-db.txt"
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/sql-db.txt"
       - uses: taiki-e/install-action@cargo-llvm-cov
       # 行カバレッジ 100% の gate (登録簿は直下の coverage_100.toml。backend の coverage_100.toml が
-      # crates/alc-vein に掛けていたものを移した、Refs ippoan/rust-alc-api#721)。計測は上と同じ unit test
+      # crates/alc-vein に掛けていたものを移した、Refs ippoan/rust-alc-api#721)。計測は上と同じテスト
+      # (unit test と sql_db)
       - name: Coverage 100% gate (crates/alc-vein)
         run: |
           cov="$RUNNER_TEMP/alc-vein-cov.txt"
@@ -70,8 +92,6 @@ jobs:
           gz=$(gzip -9c build/index_bg.wasm | wc -c)
           echo "alc-vein wasm: raw=${raw} B / gzip=${gz} B" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$gz" -lt 10000000 ] || { echo "::error::gzip 後 ${gz} B が 10MB を超えた"; exit 1; }
-      # image が COPY する SQL を ippoan/alc-migrations から取る (版は container/ALC_MIGRATIONS_REV)
-      - run: bash scripts/fetch-migrations.sh
       # staging の DB (Cloudflare Containers、container/) が空の DB から migration を流して
       # PgBouncer まで立ち上がること。alc-migrations の rev を上げたときに staging だけ壊れるのを防ぐ
       - name: staging DB の Container image が起動する
@@ -87,24 +107,13 @@ jobs:
           n=$(psql "postgresql://alc_api_app@127.0.0.1:6432/postgres" -Atc "BEGIN; SELECT set_config('app.current_tenant_id', '0a000000-0000-4000-8000-00000000000a', true); SELECT count(*) FROM alc_api.employees; COMMIT;" | sed -n 3p)
           echo "employees (tenant A) = ${n}"
           [ "$n" = 7 ] || { docker logs vein-db; exit 1; }
-      # ここから下は上で立てた DB (PgBouncer の transaction mode、RLS が効く alc_api_app) を使う実 DB の検査
-      # (backend の tests/vein_templates_test.rs が見ていた事柄を移した、Refs ippoan/rust-alc-api#721)。
-      # 接続文字列は runner の中の使い捨ての DB (trust 認証) のもので、secret ではない。
-      #
-      # crates/alc-vein/tests/sql_db.rs: repo::sql の定数と RLS。テストは #[ignore] なので --ignored で回し、
-      # 本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)
-      - name: 実 DB で SQL の定数と RLS を確かめる (sql_db)
-        env:
-          VEIN_TEST_DATABASE_URL: postgresql://alc_api_app@127.0.0.1:6432/postgres
-        run: |
-          set -o pipefail
-          cargo test -p alc-vein --test sql_db -- --ignored 2>&1 | tee "$RUNNER_TEMP/sql-db.txt"
-          grep -Eq '^test result: ok\. 5 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/sql-db.txt"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       # worker (wrangler dev --env local、上で作った build/) を通して 2 テナントを並列に叩き、他テナントの行が
-      # 混ざらないことを数える。種は image が起動時に入れているので PG_ADMIN_URL は渡さない
+      # 混ざらないことを数える。DB は上の「staging DB の Container image が起動する」で立てたもの
+      # (PgBouncer の transaction mode、RLS が効く alc_api_app。接続文字列は runner の中の使い捨ての DB = trust 認証の
+      # もので、secret ではない)。種は image が起動時に入れているので PG_ADMIN_URL は渡さない
       - name: worker を通したテナント漏れテスト (tests/run-local.sh)
         timeout-minutes: 10
         env:
