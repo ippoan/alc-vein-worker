@@ -15,8 +15,8 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (package `alc-vein-worker`、wasm32-unknown-unknown)。workspace の root で、`Cargo.lock` はここの 1 つだけ |
 | `crates/alc-vein/` | route の crate (口・照合 `matcher`・trait・SQL の定数)。DB 実装は持たない |
 | `container/` | staging の DB の image (postgres + PgBouncer)。SQL は ippoan/alc-migrations から取る (下の「migration の取り方」) |
-| `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh` |
-| `tests/` | テナント漏れテスト・測定 (staging / ローカル向け) |
+| `scripts/` | 公開範囲の検査 (`check-exposure.sh` と陰性対照 `check-exposure-test.sh`)、`fetch-migrations.sh`、coverage の gate (`check_coverage_100.sh`、登録簿は直下の `coverage_100.toml`) |
+| `tests/` | テナント漏れテスト・測定 (staging / ローカル / CI 向け) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (デプロイ) / `tag-release.yml` (本番用のタグ) |
 
 ## 依存の取り方
@@ -224,8 +224,38 @@ worker-build --release
 bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh
 cargo fmt --check
 cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
-cargo test -p alc-vein          # crates/alc-vein の unit test (routes と matcher)
+cargo test -p alc-vein          # crates/alc-vein の unit test (routes と matcher)。実 DB のテストは #[ignore] で入らない
 ```
+
+### coverage の gate
+
+`crates/alc-vein/src/` の `matcher.rs`・`routes.rs`・`repo.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。
+backend の gate を移した、Refs ippoan/rust-alc-api#721)。計測は上の unit test で、DB は要らない。
+
+```bash
+cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt     # cargo-llvm-cov が要る
+bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt
+```
+
+### 実 DB の検査 (SQL の定数と RLS)
+
+`crates/alc-vein/tests/sql_db.rs` は、worker の `in_tenant_tx` と同じ形 (`BEGIN` → `set_config(.., true)` → `repo::sql` の定数 → `COMMIT`) を
+native の tokio-postgres で組み、upsert・学習の書き戻しと競合・削除済みの乗務員の除外・テナント分離・
+「`WHERE tenant_id` が合っていても `app.current_tenant_id` が別テナントなら RLS だけで止まる」を実 DB で確かめる
+(backend に在った `tests/vein_templates_test.rs` の代わり)。CI は `ci.yml` が起動確認で立てた DB にそのまま流す。
+
+```bash
+bash scripts/fetch-migrations.sh
+docker build -f container/Dockerfile -t vein-db .
+docker run -d --rm --name vein-db-test -p 127.0.0.1::6432 vein-db     # 空きポートに出す (docker port vein-db-test で見る)
+VEIN_TEST_DATABASE_URL="postgresql://alc_api_app@127.0.0.1:<ポート>/postgres" \
+  cargo test -p alc-vein --test sql_db -- --ignored
+```
+
+- **`VEIN_TEST_DATABASE_URL` が未設定だと失敗する** (skip して緑にしない)。superuser / BYPASSRLS のロールでも失敗する
+- 使い捨ての DB に向ける (テストはテナントと乗務員を自分で作り、終わりに消す。常駐の staging の DB には向けない)
+- worker 本体 (`src/repo.rs`) は wasm 専用で native のテストから呼べないので、テストは同じ形の repo を自分で持つ。
+  トランザクションの頭の文が worker と同じであることは `set_tenant_statement_matches_worker` (DB 不要) が見る
 
 ## テナント漏れテスト / 測定
 
@@ -247,6 +277,7 @@ image を作る前に `bash scripts/fetch-migrations.sh`):
 
 ```bash
 PG_ADMIN_URL=... APP_DB_URL=... bash tests/run-local.sh     # tenant-leak.mjs (A/B 各 200 本、同時 20)
+APP_DB_URL=... bash tests/run-local.sh                      # PG_ADMIN_URL 無し = 種を流さない (image が起動時に入れた種を使う。CI はこの形)
 PG_ADMIN_URL=... APP_DB_URL=... bash tests/bench-local.sh   # /vein/identify の CPU 時間 (100/500/1000/5000 件)
 ```
 

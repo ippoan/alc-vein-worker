@@ -18,6 +18,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # tests/run-local.sh の `wrangler dev` の版。deploy.yml の WRANGLER_VERSION と揃える
+  WRANGLER_VERSION: 4.144.0
 
 jobs:
   # 先頭の check-exposure.sh は「外から素で届かない」(本番は workers_dev / preview_urls = false、
@@ -42,7 +44,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: vein-worker
@@ -51,6 +53,14 @@ jobs:
       - run: cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
       # crates/alc-vein の unit test (routes_tests と matcher)
       - run: cargo test -p alc-vein
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # 行カバレッジ 100% の gate (登録簿は直下の coverage_100.toml。backend の coverage_100.toml が
+      # crates/alc-vein に掛けていたものを移した、Refs ippoan/rust-alc-api#721)。計測は上と同じ unit test
+      - name: Coverage 100% gate (crates/alc-vein)
+        run: |
+          cov="$RUNNER_TEMP/alc-vein-cov.txt"
+          cargo llvm-cov --locked -p alc-vein --text > "$cov"
+          bash scripts/check_coverage_100.sh --use-cache "$cov"
       # worker-build の版は wrangler.toml の [build] command と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --release
@@ -77,6 +87,29 @@ jobs:
           n=$(psql "postgresql://alc_api_app@127.0.0.1:6432/postgres" -Atc "BEGIN; SELECT set_config('app.current_tenant_id', '0a000000-0000-4000-8000-00000000000a', true); SELECT count(*) FROM alc_api.employees; COMMIT;" | sed -n 3p)
           echo "employees (tenant A) = ${n}"
           [ "$n" = 7 ] || { docker logs vein-db; exit 1; }
+      # ここから下は上で立てた DB (PgBouncer の transaction mode、RLS が効く alc_api_app) を使う実 DB の検査
+      # (backend の tests/vein_templates_test.rs が見ていた事柄を移した、Refs ippoan/rust-alc-api#721)。
+      # 接続文字列は runner の中の使い捨ての DB (trust 認証) のもので、secret ではない。
+      #
+      # crates/alc-vein/tests/sql_db.rs: repo::sql の定数と RLS。テストは #[ignore] なので --ignored で回し、
+      # 1 本も走らずに緑になるのを防ぐため件数も見る
+      - name: 実 DB で SQL の定数と RLS を確かめる (sql_db)
+        env:
+          VEIN_TEST_DATABASE_URL: postgresql://alc_api_app@127.0.0.1:6432/postgres
+        run: |
+          set -o pipefail
+          cargo test -p alc-vein --test sql_db -- --ignored 2>&1 | tee "$RUNNER_TEMP/sql-db.txt"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored' "$RUNNER_TEMP/sql-db.txt"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # worker (wrangler dev --env local、上で作った build/) を通して 2 テナントを並列に叩き、他テナントの行が
+      # 混ざらないことを数える。種は image が起動時に入れているので PG_ADMIN_URL は渡さない
+      - name: worker を通したテナント漏れテスト (tests/run-local.sh)
+        timeout-minutes: 10
+        env:
+          APP_DB_URL: postgresql://alc_api_app@127.0.0.1:6432/postgres
+        run: bash tests/run-local.sh
 
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
   # この workflow に deploy 系の job は無い (デプロイは deploy.yml。PR では --dry-run だけで、

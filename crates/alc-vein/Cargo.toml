@@ -29,5 +29,8 @@ vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.
 # trait・型・matcher・routes だけを持ち、wasm32-unknown-unknown でビルドできる
 # (DB 実装は直下の worker が持つ、Refs ippoan/rust-alc-api#682)。
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+# tests/sql_db.rs (実 DB で repo::sql と RLS を確かめる) 用の native の接続。worker 本体の tokio-postgres
+# (直下の Cargo.toml、wasm 用の feature `js`) とは別で、dev-dependency なので wasm のビルドには入らない
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 tower = { version = "0.5", features = ["util"] }

@@ -14,10 +14,14 @@ bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh   # 公開
 cargo fmt --check
 cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
 cargo test -p alc-vein                                                  # unit test (routes と matcher)
+cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt && bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt   # coverage 100% の gate
 worker-build --release                                                  # worker-build 0.8.7
 bash scripts/fetch-migrations.sh                                        # docker build の前に必ず
 docker build -f container/Dockerfile -t vein-db .
 npx wrangler@4.144.0 deploy --dry-run [--env staging]                   # 配信しない
+# 実 DB の検査 (上の image を空きポートで立ててから。README の「実 DB の検査」)
+VEIN_TEST_DATABASE_URL=... cargo test -p alc-vein --test sql_db -- --ignored   # repo::sql の定数と RLS
+APP_DB_URL=... bash tests/run-local.sh                                         # worker を通したテナント漏れテスト
 ```
 
 private repo ippoan/vein-match への git 依存がある。ローカルは `gh auth setup-git` 済みであること。
@@ -36,6 +40,11 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 - **タグ `v*` = 本番。** main へのマージは staging に出るだけ。本番は Actions の Tag Release を手動で打つ
   (マージで自動のタグは付けない)。手で `v*` のタグを push しない。
 - DB 操作は `in_tenant_tx` を通す (1 メソッド = 1 トランザクション、戻り値は `TxOutput`)。SQL は `crates/alc-vein` の `repo::sql` の 1 か所。
+- **実 DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は接続先 (`VEIN_TEST_DATABASE_URL`) が無ければ失敗する作り
+  (skip にしない)。`repo::sql` の定数や `in_tenant_tx` の頭の文を変えたら、このテストを実 DB で通す。
+  `coverage_100.toml` の 3 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`) は行カバレッジ 100% (登録を外さない)。
+- **staging の DB を動かしている機では、`127.0.0.1:6432` を常駐のコンテナが使っている** (README)。手元の検査の DB は別名・空きポート
+  (`-p 127.0.0.1::6432`) で立て、常駐のコンテナには繋がない・止めない。
 
 ## rev を上げる手順
 

@@ -2,7 +2,9 @@
 # alc-vein Worker を `wrangler dev` で立て、テナント漏れテスト (tenant-leak.mjs) を回す
 # (Refs ippoan/rust-alc-api#680 / ippoan/rust-alc-api#683 / ippoan/rust-alc-api#691)。接続文字列は repo に書かず環境変数で渡す:
 #
-#   PG_ADMIN_URL  種 (seed.sql) を流す superuser の接続文字列
+#   PG_ADMIN_URL  種 (seed.sql) を流す superuser の接続文字列。未設定なら種を流さない — container/ の
+#                 image は起動時に同じ種 (下の既定の 2 テナント) を入れていて、superuser へは外から
+#                 繋げないため (CI はこの形)。種が無い DB では登録が 404 になりテストが落ちる
 #   APP_DB_URL    worker が繋ぐ接続文字列 (DATABASE_URL として渡す)。**RLS が効く alc_api_app で**
 #                 (superuser は RLS を素通りしてテストが意味を失う)。本番 (Supabase のプーラー) /
 #                 staging (Container の PgBouncer) と同じくトランザクション単位でコネクションを
@@ -13,7 +15,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-: "${PG_ADMIN_URL:?superuser の接続文字列が要る}"
 : "${APP_DB_URL:?alc_api_app の接続文字列が要る}"
 PORT="${PORT:-8787}"
 export TENANT_A="${TENANT_A:-0a000000-0000-4000-8000-00000000000a}"
@@ -27,8 +28,12 @@ if [ "$bypass" != "f" ]; then
   exit 1
 fi
 
-psql -q "$PG_ADMIN_URL" -v tenant="$TENANT_A" -v name=leak-a -v employees="$N_A" -f tests/seed.sql
-psql -q "$PG_ADMIN_URL" -v tenant="$TENANT_B" -v name=leak-b -v employees="$N_B" -f tests/seed.sql
+if [ -n "${PG_ADMIN_URL:-}" ]; then
+  psql -q "$PG_ADMIN_URL" -v tenant="$TENANT_A" -v name=leak-a -v employees="$N_A" -f tests/seed.sql
+  psql -q "$PG_ADMIN_URL" -v tenant="$TENANT_B" -v name=leak-b -v employees="$N_B" -f tests/seed.sql
+else
+  echo "PG_ADMIN_URL が未設定なので種を流さない (DB に既に在る種を使う)"
+fi
 
 log="$(mktemp)"
 # 本番と同じ口 (DATABASE_URL、src/db.rs) を平文 (sslmode=disable) で手元の DB へ向ける。
