@@ -1,0 +1,22 @@
+# 行カバレッジ 100% の登録簿 (Refs ippoan/rust-alc-api#721)。backend (ippoan/rust-alc-api) の
+# coverage_100.toml が crates/alc-vein に掛けていた gate を、この repo の CI (ci.yml) に移したもの。
+#
+#   cargo llvm-cov --locked -p alc-vein --text > cov.txt
+#   bash scripts/check_coverage_100.sh --use-cache cov.txt
+#
+# 計測するのは `cargo test -p alc-vein` の unit test (DB なし。tests/sql_db.rs の実 DB テストは
+# #[ignore] なので入らない)。登録したファイルが計測に出ない・実行行が 0 のときも落ちる。
+# lib.rs は mod 宣言と VeinState だけで実行行が無いので登録しない。
+# worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
+
+# 特徴量の検査・テンプレートの組み立て・1:N 照合
+[[files]]
+path = "crates/alc-vein/src/matcher.rs"
+
+# 4 本の口 (422 / 404 / 上限 / 書き戻しの競合の分岐)
+[[files]]
+path = "crates/alc-vein/src/routes.rs"
+
+# trait と SQL の定数。実行行は VeinTemplateRow → VeinTemplateItem の変換だけ
+[[files]]
+path = "crates/alc-vein/src/repo.rs"
