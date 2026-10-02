@@ -14,7 +14,7 @@ bash scripts/check-exposure.sh && bash scripts/check-exposure-test.sh   # 公開
 cargo fmt --check
 cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
 bash scripts/fetch-migrations.sh && cargo test -p alc-vein              # unit test (routes と matcher) と tests/sql_db.rs (組み込みの PostgreSQL。docker も env も要らない)
-cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt && bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt   # coverage 100% の gate
+cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt && bash scripts/check_coverage_100.sh --use-cache /tmp/alc-vein-cov.txt   # coverage 100% の gate (CI はテストをこの計測の 1 回にまとめる)
 worker-build --release                                                  # worker-build 0.8.7
 bash scripts/fetch-migrations.sh                                        # テスト・coverage・docker build の前に必ず
 docker build -f container/Dockerfile -t vein-db .
@@ -49,7 +49,8 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 - **DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は、テストの中で起こす組み込みの PostgreSQL
   (`pglite-oxide`) に流す。migration が未取得 (`container/.alc-migrations` が無い) なら失敗する作り
   (skip にしない・`#[ignore]` にしない)。`repo::sql` の定数・`pg.rs` の引数の型・`alc-worker-db` の rev を変えたら、このテストを通す。
-  CI は本数を固定して回す (`ci.yml` の `8 passed`。テストを減らさない)。
+  CI は本数を固定して回す (`ci.yml` の `8 passed`。テストを減らさない)。CI がテストを走らせるのは coverage の計測の 1 回だけ
+  (素の `cargo test` の step は無い — dev-dependency を 2 回 compile しないため。step を分けて計測から外さない)。
   `coverage_100.toml` の 4 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`・`pg.rs`) は行カバレッジ 100% (登録を外さない)。
 - **`pglite-oxide` は `=0.5.0` に固定** (`crates/alc-vein/Cargo.toml` の dev-dependency)。wasmer 系 13 crate は `Cargo.lock` で
   alpha 版に pin している (Rust 1.92.0 で build が通る版)。lock を作り直すときは pin し直す (手順は README の「lock の pin」)。

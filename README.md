@@ -250,6 +250,8 @@ cargo test -p alc-vein          # crates/alc-vein の unit test (routes と matc
 `crates/alc-vein/src/` の `matcher.rs`・`routes.rs`・`repo.rs`・`pg.rs` は行カバレッジ 100% を保つ (登録簿は直下の `coverage_100.toml`。
 backend の gate を移した、Refs ippoan/rust-alc-api#721)。計測は上の `cargo test -p alc-vein` と同じテスト (unit test と `sql_db`) で、
 docker は要らないが、先に `bash scripts/fetch-migrations.sh` が要る。
+**CI がテストを走らせるのはこの計測の 1 回だけ** (`cargo llvm-cov … --no-report` → `cargo llvm-cov report`。素の `cargo test` の step は無い —
+分けると dev-dependency の `pglite-oxide` と wasmer 系を 2 回 compile することになる)。手元では、素の `cargo test -p alc-vein` と下の計測のどちらを流してもよい。
 
 ```bash
 cargo llvm-cov --locked -p alc-vein --text > /tmp/alc-vein-cov.txt     # cargo-llvm-cov が要る

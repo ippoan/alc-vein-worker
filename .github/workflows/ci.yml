@@ -66,22 +66,24 @@ jobs:
       # テスト (組み込みの PostgreSQL) と、image が COPY する SQL を ippoan/alc-migrations から取る
       # (版は container/ALC_MIGRATIONS_REV)
       - run: bash scripts/fetch-migrations.sh
-      # crates/alc-vein の unit test と、組み込みの PostgreSQL に流す tests/sql_db.rs (docker も env も要らない)。
-      # sql_db の本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)
-      - name: unit test と sql_db (組み込みの PostgreSQL)
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # crates/alc-vein の unit test と tests/sql_db.rs (組み込みの PostgreSQL。docker も env も要らない) を、
+      # 計測つきで 1 回だけ走らせる (素の cargo test と分けると、dev-dependency を 2 回 compile することになる)。
+      # sql_db の本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)。
+      # 行カバレッジ 100% の gate の登録簿は直下の coverage_100.toml (backend の coverage_100.toml が
+      # crates/alc-vein に掛けていたものを移した、Refs ippoan/rust-alc-api#721)
+      - name: unit test と sql_db (組み込みの PostgreSQL) + Coverage 100% gate (crates/alc-vein)
         run: |
           set -o pipefail
-          cargo test --locked -p alc-vein 2>&1 | tee "$RUNNER_TEMP/alc-vein-test.txt"
-          cargo test --locked -p alc-vein --test sql_db 2>&1 | tee "$RUNNER_TEMP/sql-db.txt"
-          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/sql-db.txt"
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      # 行カバレッジ 100% の gate (登録簿は直下の coverage_100.toml。backend の coverage_100.toml が
-      # crates/alc-vein に掛けていたものを移した、Refs ippoan/rust-alc-api#721)。計測は上と同じテスト
-      # (unit test と sql_db)
-      - name: Coverage 100% gate (crates/alc-vein)
-        run: |
+          # 前の計測の残り (cache から戻った profraw) を数えない
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --locked -p alc-vein --no-report 2>&1 | tee "$RUNNER_TEMP/alc-vein-test.txt"
+          # sql_db の結果の行だけを見る (unit test の行と取り違えない)
+          awk '/Running.*tests\/sql_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/alc-vein-test.txt" \
+            | grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored'
           cov="$RUNNER_TEMP/alc-vein-cov.txt"
-          cargo llvm-cov --locked -p alc-vein --text > "$cov"
+          # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
+          cargo llvm-cov report --locked -p alc-vein --text > "$cov"
           bash scripts/check_coverage_100.sh --use-cache "$cov"
       # worker-build の版は wrangler.toml の [build] command と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
