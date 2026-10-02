@@ -179,6 +179,10 @@ systemd の unit・コンテナ・image を消し、staging を Container 経路
 alc-migrations の `scripts/init_local_db.sql` → `migrations/` → `scripts/local_app_grants.sql` (本番の GRANT の写し) →
 テナント漏れテストの種 (`tests/seed.sql`) を流し、最後に PgBouncer を起動する。
 
+migration は sqlx ではなく psql で 1 ファイルずつ流すので、sqlx の適用履歴の表 `alc_api._sqlx_migrations` が無い。
+migration 160 の `migration_status()` が本体でその表を参照するため、`container/start.sh` が migration の前に**空の表だけ**用意する
+(中身は入れないので、この DB では `migration_status()` は適用 0 件を返す。vein は呼ばない)。
+
 ### migration の取り方
 
 image が COPY する SQL (`init_local_db.sql`・`local_app_grants.sql`・`migrations/`) は、この repo に写しを置かず、

@@ -25,9 +25,9 @@ log "postgres started"
 psql() { PGOPTIONS="-c client_min_messages=warning" command psql -q -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d postgres "$@"; }
 
 psql -f /vein/init_local_db.sql
-# migration 160 の関数 alc_api.migration_status() は sqlx の適用履歴の表を読む。ここは sqlx ではなく psql で
-# 流すのでその表が無く、無いと 160 の CREATE FUNCTION が落ちる。sqlx と同じ形の空の表を先に作る (行は入れない)
-psql -c "CREATE TABLE alc_api._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)"
+# この image は sqlx ではなく psql で流すので表が無い。160 の `migration_status()` が本体で参照するため
+# 空の表だけ用意する。中身は入れないので、この DB では `migration_status()` は適用 0 件を返す
+psql -c "CREATE TABLE IF NOT EXISTS alc_api._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)"
 {
   for f in /vein/migrations/*.sql; do
     printf 'BEGIN;\n\\i %s\nCOMMIT;\n' "$f"

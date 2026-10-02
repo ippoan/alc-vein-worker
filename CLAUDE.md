@@ -44,5 +44,6 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   その後 `cargo tree -i alc-core-wasm --target wasm32-unknown-unknown` で出どころが 1 つだけであることを確かめる
   (2 つになると、コンパイルは通るのに全リクエストが 500 になる)。
 - **alc-migrations** (staging の DB の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
+  rev は ippoan/rust-alc-api の `Cargo.toml` が固定している alc-migrations の rev と揃える。
   `bash scripts/fetch-migrations.sh` → `docker build` → 起動確認 (CI の「staging DB の Container image が起動する」と同じ命令) を手元で通す。
 - **vein-match**: `crates/alc-vein/Cargo.toml` の `tag` (2 行とも) と `Cargo.lock`。
