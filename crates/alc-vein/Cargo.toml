@@ -1,0 +1,33 @@
+[package]
+name = "alc-vein"
+version = "0.1.0"
+edition = "2021"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
+
+# vein-match は private repo (ippoan/vein-match)。取得には GitHub の認証が要る:
+# ローカルは `gh auth setup-git` 済みであること、CI は
+# ippoan/ci-workflows の private-git-auth action が GitHub App の token で git の URL を書き換える
+# (Refs ippoan/vein-match#20)。tag を上げるときは Cargo.lock も一緒に更新する。
+# vein-match (core) は特徴量の 16 進デコードと読み込み検査 (`decode_hex` / `load`) に、
+# vein-match-search は 1:N 照合・テンプレートの組み立てに使う (同じ git の同じ tag)。
+[dependencies]
+# 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
+alc-core-wasm = { workspace = true }
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["json"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+vein-match = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.1" }
+vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.1" }
+
+# trait・型・matcher・routes だけを持ち、wasm32-unknown-unknown でビルドできる
+# (DB 実装は直下の worker が持つ、Refs ippoan/rust-alc-api#682)。
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }

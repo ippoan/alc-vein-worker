@@ -1,0 +1,8 @@
+# build context は repo の直下。Dockerfile が COPY するものだけを通す。
+*
+!container/.alc-migrations/scripts/init_local_db.sql
+!container/.alc-migrations/scripts/local_app_grants.sql
+!container/.alc-migrations/migrations/
+!tests/seed.sql
+!container/pgbouncer.ini
+!container/start.sh

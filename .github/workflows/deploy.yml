@@ -1,0 +1,203 @@
+name: Deploy
+
+# 指静脈 (vein) の Worker alc-vein のデプロイ (Refs ippoan/rust-alc-api#697 / ippoan/rust-alc-api#721)。ci.yml とは別 workflow。
+#   - タグ v*               → 本番 (wrangler.toml のトップレベル)。Tag Release (tag-release.yml) を手動で打つ
+#   - main への push        → staging (--env staging)
+#   - pull_request          → wrangler deploy --dry-run だけ (secret 不要。この workflow 自体の検証)
+# マージで自動のタグは付けない (マージ = staging、手動のタグ = 本番)。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。staging の URL は実ホスト名なので
+# ログに出さない: wrangler の出力はファイルに取り、mask してから伏せて出す。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # README と揃える
+  WRANGLER_VERSION: 4.144.0
+
+jobs:
+  # ci.yml は別 workflow で needs にできず、タグの push では走らない。デプロイの前の検査をここでも回す
+  check:
+    name: check (exposure / fmt / clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-exposure.sh
+      - run: bash scripts/check-exposure-test.sh
+      # private repo ippoan/vein-match (crates/alc-vein の git 依存) の取得用 (README 参照)
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: vein-worker
+          save-if: false
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
+
+  dry-run:
+    name: wrangler deploy --dry-run
+    needs: [check]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: vein-worker
+          save-if: false
+      # wrangler.toml の [build] command と同じ版
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - name: 本番 (トップレベル)
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
+      # staging の Container image が COPY する SQL (版は container/ALC_MIGRATIONS_REV)
+      - run: bash scripts/fetch-migrations.sh
+      - name: staging
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run --env staging
+
+  deploy-staging:
+    name: deploy staging
+    needs: [check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: vein-deploy-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: vein-worker
+          save-if: false
+      - run: cargo install -q worker-build@0.8.7 --locked
+      # wrangler が docker で build する Container image が COPY する SQL (版は container/ALC_MIGRATIONS_REV)
+      - run: bash scripts/fetch-migrations.sh
+      # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す (ログファイルそのものは出さない)。
+      #   - staging の URL (実ホスト名): ::add-mask:: + <staging> に置換
+      #   - 32 桁の hex (account ID): ::add-mask:: + <account> に置換
+      - name: wrangler deploy --env staging
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy --env staging \
+            --tag "staging-${GITHUB_SHA::7}" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          url=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' "$log" | head -1 || true)
+          if [ -n "$url" ]; then
+            echo "::add-mask::${url}"
+            echo "::add-mask::${url#https://}"
+            echo "$url" >"$RUNNER_TEMP/staging-url"
+          fi
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          [ -n "$url" ] || { echo "::error::wrangler の出力に staging の URL が無い"; exit 1; }
+      # Access が効いていること: token 無しは Worker に届かず、Access が 302 (ログインへ) か 403 を返す。
+      # deploy が途中で失敗しても Worker はアップロード済みのことがあるので、deploy が走った限り必ず確かめる
+      - name: token 無しの /vein/templates が Access に止められる
+        if: ${{ !cancelled() && steps.deploy.outcome != 'skipped' }}
+        run: |
+          if [ ! -s "$RUNNER_TEMP/staging-url" ]; then
+            echo "::warning::wrangler の出力に staging の URL が無いので Access の検査を skip (Worker の公開状態は dashboard で確かめること)"
+            exit 0
+          fi
+          url=$(cat "$RUNNER_TEMP/staging-url")
+          # デプロイ直後は workers.dev のルートが行き渡るまで 404 が返る。404 だけは
+          # 10 秒おきに最大 12 回待つ。200 (Access が効いていない) とその他のコードは即 fail
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/vein/templates")
+            echo "[${i}/12] token 無しの GET <staging>/vein/templates → ${code}"
+            case "$code" in
+              302|403) exit 0 ;;
+              404) [ "$i" -lt 12 ] && sleep 10 ;;
+              *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
+            esac
+          done
+          echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
+          exit 1
+
+  deploy-prod:
+    name: deploy production
+    needs: [check]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: vein-deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: vein-worker
+          save-if: false
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - name: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy \
+            --tag "$GITHUB_REF_NAME" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # 本番は workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::本番に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi

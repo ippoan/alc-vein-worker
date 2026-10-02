@@ -1,0 +1,96 @@
+name: CI
+
+# 指静脈 (vein) の Worker alc-vein の検査 (ippoan/rust-alc-api の ci.yml の vein-worker job と、Bazel の
+# shard `vein` で回っていた crates/alc-vein の unit test を移したもの。Refs ippoan/rust-alc-api#721)。
+# デプロイは deploy.yml (別 workflow)。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # PR の古い run は捨てるが、main は途中で切らない
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 先頭の check-exposure.sh は「外から素で届かない」(本番は workers_dev / preview_urls = false、
+  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ) の検査 —
+  # この Worker は X-Tenant-ID を信頼するので、崩れたら ippoan/rust-alc-api#556 と同じ穴になる。
+  # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
+  vein-worker:
+    name: Vein Worker (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 外から直接届かないことの検査 (wrangler.toml)
+        run: bash scripts/check-exposure.sh
+      - name: check-exposure.sh の陰性対照
+        run: bash scripts/check-exposure-test.sh
+      # private repo ippoan/vein-match (vein-match / vein-match-search の git 依存) の取得用 (README 参照)
+      - uses: ippoan/ci-workflows/.github/actions/private-git-auth@main
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          repositories: vein-match
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: vein-worker
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
+      # crates/alc-vein の unit test (routes_tests と matcher)
+      - run: cargo test -p alc-vein
+      # worker-build の版は wrangler.toml の [build] command と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --release
+      - name: bundle サイズ (上限 10MB は gzip 後)
+        run: |
+          raw=$(stat -c%s build/index_bg.wasm)
+          gz=$(gzip -9c build/index_bg.wasm | wc -c)
+          echo "alc-vein wasm: raw=${raw} B / gzip=${gz} B" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$gz" -lt 10000000 ] || { echo "::error::gzip 後 ${gz} B が 10MB を超えた"; exit 1; }
+      # image が COPY する SQL を ippoan/alc-migrations から取る (版は container/ALC_MIGRATIONS_REV)
+      - run: bash scripts/fetch-migrations.sh
+      # staging の DB (Cloudflare Containers、container/) が空の DB から migration を流して
+      # PgBouncer まで立ち上がること。alc-migrations の rev を上げたときに staging だけ壊れるのを防ぐ
+      - name: staging DB の Container image が起動する
+        run: |
+          docker build -q -f container/Dockerfile -t vein-db .
+          docker run -d --name vein-db -p 6432:6432 vein-db
+          for _ in $(seq 1 60); do
+            if psql "postgresql://alc_api_app@127.0.0.1:6432/postgres" -Atc 'SELECT 1' >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker logs vein-db 2>&1 | grep '^\[vein-db'
+          # RLS が効く alc_api_app で、種のテナントの乗務員が見える
+          n=$(psql "postgresql://alc_api_app@127.0.0.1:6432/postgres" -Atc "BEGIN; SELECT set_config('app.current_tenant_id', '0a000000-0000-4000-8000-00000000000a', true); SELECT count(*) FROM alc_api.employees; COMMIT;" | sed -n 3p)
+          echo "employees (tenant A) = ${n}"
+          [ "$n" = 7 ] || { docker logs vein-db; exit 1; }
+
+  # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
+  # この workflow に deploy 系の job は無い (デプロイは deploy.yml。PR では --dry-run だけで、
+  # reusable が head SHA の全 check の完了を待つので dry-run の失敗でも merge されない)
+  auto-merge:
+    name: Auto Merge
+    needs: [vein-worker]
+    if: github.event_name == 'pull_request' && needs.vein-worker.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      # 無いと startup_failure になる
+      checks: read
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
