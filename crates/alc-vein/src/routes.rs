@@ -100,14 +100,14 @@ async fn identify(
         .await
         .map_err(|e| internal_error("vein identify list", e))?;
     let templates: Vec<&str> = rows.iter().map(|r| r.template.as_str()).collect();
-    let t8 = chrono::Utc::now().timestamp() as u8;
-    let found = matcher::identify(&templates, &chara, t8).map_err(|e| {
-        let message = format!(
-            "登録が {} 人あり、1:N 照合の上限 {MAX_TEMPLATES} 人を超えています",
-            e.0
-        );
-        unprocessable("too_many_templates", &message)
-    })?;
+    let found =
+        matcher::identify(&templates, &chara, chrono::Utc::now().timestamp()).map_err(|e| {
+            let message = format!(
+                "登録が {} 人あり、1:N 照合の上限 {MAX_TEMPLATES} 人を超えています",
+                e.0
+            );
+            unprocessable("too_many_templates", &message)
+        })?;
     for &i in &found.unreadable {
         let employee_id = rows[i].employee_id;
         tracing::warn!("vein identify: {employee_id} のテンプレートを読めず照合から外した");

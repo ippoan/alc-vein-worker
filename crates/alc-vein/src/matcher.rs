@@ -116,10 +116,23 @@ pub fn check_capacity(n: usize) -> Result<(), TooManyTemplates> {
     Ok(())
 }
 
+/// 学習に渡す時刻の値 (`fv_search_user` の `t8`)。unix 秒を **0〜254** に写す。
+/// 0xff は照合のライブラリが「時刻」ではなく「学習の作業域の今の中身をそのまま書く」指示として扱う値で、
+/// 渡すと、当たった利用者のテンプレートに一覧の末尾の利用者の学習記録が写る (Refs ippoan/rust-alc-api#692)。
+/// ライブラリがこの値を使うのは、学習記録が満杯のときに置き換える枠を選ぶところだけ。
+fn learn_t8(unix_secs: i64) -> u8 {
+    unix_secs.rem_euclid(255) as u8
+}
+
 /// テナントの全テンプレートで `Library` を組み、`chara` (検査済みの 0xBDBD 構造体) を
-/// 1:N で照合する。当たれば学習 (`t8` = 今の unix 秒の下位 8 ビット) し、学習後の
+/// 1:N で照合する。当たれば学習 (`unix_secs` = 今の unix 秒。学習へは [`learn_t8`] で
+/// 0〜254 に写して渡す (0xff は渡さない)) し、学習後の
 /// テンプレートを取り出す。0〜1 人でも動くよう `Library` は `max(件数, 2)` 人ぶんで組む。
-pub fn identify(templates: &[&str], chara: &[u8], t8: u8) -> Result<Identify, TooManyTemplates> {
+pub fn identify(
+    templates: &[&str],
+    chara: &[u8],
+    unix_secs: i64,
+) -> Result<Identify, TooManyTemplates> {
     check_capacity(templates.len())?;
     let mut lib = Library::new(templates.len().max(2)).expect("2..=500 人は Library::new の範囲内");
     let mut unreadable = Vec::new();
@@ -128,7 +141,7 @@ pub fn identify(templates: &[&str], chara: &[u8], t8: u8) -> Result<Identify, To
             unreadable.push(i);
         }
     }
-    let (r, _) = fv_search_user(&mut lib, chara, SEARCH_LEVEL, Some(t8));
+    let (r, _) = fv_search_user(&mut lib, chara, SEARCH_LEVEL, Some(learn_t8(unix_secs)));
     let hit = (r > 0).then(|| {
         let index = (r - 1) as usize;
         // 当たった利用者には記録があり (get_enroll_plain が None にならない)、mode 1 の
@@ -323,5 +336,44 @@ mod tests {
         // ちょうど 500 人は組める
         let got = identify(&many[..MAX_TEMPLATES], &synth::chara(1), 5).unwrap();
         assert!(got.hit.is_some());
+    }
+
+    #[test]
+    fn learn_t8_never_returns_0xff() {
+        assert_eq!(learn_t8(0), 0);
+        assert_eq!(learn_t8(254), 254);
+        assert_eq!(learn_t8(255), 0);
+        assert_eq!(learn_t8(256), 1);
+        assert_eq!(learn_t8(-1), 254);
+        // 端の値でも panic しない
+        assert_ne!(learn_t8(i64::MAX), 0xff);
+        assert_ne!(learn_t8(i64::MIN), 0xff);
+        assert!((0..=1024).all(|s| learn_t8(s) != 0xff));
+    }
+
+    #[test]
+    fn identify_at_the_255th_second_does_not_copy_another_users_learning() {
+        // 7 人を並べ、末尾の 7 番を 6 回当てて学習記録を作る
+        let mut tpl: Vec<String> = (1..=7).map(enrolled).collect();
+        for _ in 0..6 {
+            let refs: Vec<&str> = tpl.iter().map(String::as_str).collect();
+            let hit = identify(&refs, &synth::chara(7), 0).unwrap().hit.unwrap();
+            assert_eq!(hit.index, 6);
+            tpl[6] = hit.learned;
+        }
+        // 1 番の指を、unix 秒の下位 8 ビットが 0xff になる時刻に照合して書き戻す
+        let refs: Vec<&str> = tpl.iter().map(String::as_str).collect();
+        let hit = identify(&refs, &synth::chara(1), 255).unwrap().hit.unwrap();
+        assert_eq!(hit.index, 0);
+        tpl[0] = hit.learned;
+        // 7 番の指は 7 番に当たる (1 番に 7 番の学習記録が写っていない)
+        let refs: Vec<&str> = tpl.iter().map(String::as_str).collect();
+        let got = identify(&refs, &synth::chara(7), 0).unwrap();
+        assert_eq!(got.hit.unwrap().index, 6);
+        // 1〜7 番の指がそれぞれ自分に当たる
+        for k in 0..7 {
+            let got = identify(&refs, &synth::chara(k as u64 + 1), 0).unwrap();
+            assert_eq!(got.hit.unwrap().index, k);
+        }
     }
 }
