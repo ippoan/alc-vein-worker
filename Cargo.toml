@@ -19,14 +19,14 @@ crate-type = ["cdylib"]
 [workspace]
 members = ["crates/alc-vein"]
 
-# alc-core-wasm は ippoan/rust-alc-api に残る。git 依存・rev 固定で引き、**書くのはここ 1 か所だけ**
-# (worker と crates/alc-vein は `workspace = true` で継承する)。出どころが 2 つになると `TenantId` が
-# 別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
-# rev を上げるときは Cargo.lock も一緒に更新する (CLAUDE.md)。
-# alc-worker-db (ippoan/alc-worker-kit) も同じ (出どころを 2 つにしない。`PgClient` が別の型になる)。
+# alc-core-wasm と alc-worker-db は ippoan/alc-worker-kit から引く (alc-core-wasm の正本は rust-alc-api から kit へ移した。
+# Refs ippoan/rust-alc-api#736)。git 依存・rev 固定で、**2 つとも同じ rev**。**書くのはここ 1 か所だけ**
+# (worker と crates/alc-vein は `workspace = true` で継承する)。出どころが 2 つになると `TenantId` (alc-core-wasm)・
+# `PgClient` (alc-worker-db) が別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
+# rev を上げるときは 2 つを一緒に上げ、Cargo.lock も一緒に更新する (CLAUDE.md)。
 [workspace.dependencies]
-alc-core-wasm = { git = "https://github.com/ippoan/rust-alc-api", rev = "4f96141f6db258c36b28c880e27000b14391edba" }
-alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
+alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639", features = ["chrono"] }
 
 # alc-vein は private repo ippoan/vein-match (vein-match / vein-match-search) に git 依存する。
 # 取得の仕方は crates/alc-vein/Cargo.toml と同じ (ローカルは `gh auth setup-git`、CI は

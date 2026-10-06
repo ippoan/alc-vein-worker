@@ -62,13 +62,11 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 
 ## rev を上げる手順
 
-- **`alc-core-wasm`** (ippoan/rust-alc-api): 直下の `Cargo.toml` の `[workspace.dependencies]` の `rev` を変え (**書くのはここ 1 か所だけ**。
-  `crates/alc-vein/Cargo.toml` や `[dependencies]` に git / path を書かない)、`cargo update -p alc-core-wasm` で `Cargo.lock` を一緒に更新する。
-  その後 `cargo tree -i alc-core-wasm --target wasm32-unknown-unknown` で出どころが 1 つだけであることを確かめる
-  (2 つになると、コンパイルは通るのに全リクエストが 500 になる)。
-- **`alc-worker-db`** (ippoan/alc-worker-kit): `alc-core-wasm` と同じ。直下の `Cargo.toml` の `[workspace.dependencies]` の `rev` の
-  1 か所だけを変え、`cargo update -p alc-worker-db` で `Cargo.lock` を一緒に更新し、`cargo tree -i alc-worker-db --target wasm32-unknown-unknown`
-  で出どころが 1 つだけであることを確かめる (`worker`・`tokio-postgres` も版が 1 つのままであること)。その後、
+- **`alc-core-wasm`** と **`alc-worker-db`** (どちらも ippoan/alc-worker-kit。**2 つは同じ rev で一緒に上げる**): 直下の `Cargo.toml` の
+  `[workspace.dependencies]` の `rev` を変え (**書くのはここ 1 か所だけ**。`crates/alc-vein/Cargo.toml` や `[dependencies]` に git / path を書かない)、
+  `cargo update -p alc-core-wasm -p alc-worker-db` で `Cargo.lock` を一緒に更新する。その後 `cargo tree -i alc-core-wasm --target wasm32-unknown-unknown` と
+  `cargo tree -i alc-worker-db --target wasm32-unknown-unknown` で出どころが 1 つずつであることを確かめる
+  (2 つになると、コンパイルは通るのに全リクエストが 500 になる。`worker`・`tokio-postgres` も版が 1 つのままであること)。その後、
   `bash scripts/fetch-migrations.sh && cargo test -p alc-vein --test sql_db` を通す。
 - **alc-migrations** (staging の DB と、テストの組み込みの PostgreSQL の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
   rev は ippoan/rust-alc-api の `Cargo.toml` が固定している alc-migrations の rev と揃える。
