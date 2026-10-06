@@ -21,7 +21,8 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
 
 ## 依存の取り方
 
-- **`alc-core-wasm`** は ippoan/rust-alc-api (public) に残る。直下の `Cargo.toml` の `[workspace.dependencies]` に
+- **`alc-core-wasm`** は ippoan/alc-worker-kit (public) から引く (正本を ippoan/rust-alc-api から kit へ移した。Refs ippoan/rust-alc-api#736。
+  中身は前に引いていた rust-alc-api 4f96141 のものと同じ)。**`alc-worker-db` と同じ kit の rev** で、直下の `Cargo.toml` の `[workspace.dependencies]` に
   **git 依存・rev 固定で 1 か所だけ**書き、Worker と `crates/alc-vein` は `workspace = true` で継承する。
   出どころが 2 つになると `TenantId` が別の型になり、**コンパイルは通るのに全リクエストが 500** になる
   (layer が入れる型と route が取り出す型が合わない)。確かめ方:
@@ -30,7 +31,7 @@ Durable Object (`src/vein_db.rs`) と workers-rs への載せ方
   cargo tree -i alc-core-wasm --target wasm32-unknown-unknown   # 出どころが 1 つだけ
   ```
 - **`alc-worker-db`** (テナントの transaction の部品 `PgClient`・`TenantTx`・`TxOutput`) は ippoan/alc-worker-kit (public) に在る。
-  `alc-core-wasm` と同じく、直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書き (feature `chrono`)、
+  `alc-core-wasm` と同じく、直下の `[workspace.dependencies]` に **git 依存・rev 固定で 1 か所だけ**書き (feature `chrono`。`alc-core-wasm` と同じ rev。同じ git URL の 2 つの rev を混ぜない)、
   Worker と `crates/alc-vein` は `workspace = true` で継承する (出どころが 2 つになると `PgClient` が別の型になる)。
 - **`vein-match` / `vein-match-search`** は private repo ippoan/vein-match への git 依存 (tag 固定)。取得に GitHub の認証が要る:
   ローカルは `gh auth setup-git` 済みであること、CI は cargo を打つ job の checkout 直後に
