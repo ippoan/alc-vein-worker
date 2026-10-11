@@ -25,8 +25,8 @@ members = ["crates/alc-vein"]
 # `PgClient` (alc-worker-db) が別の型になり、コンパイルは通るのに全リクエストが 500 になる (layer が入れる型と route が取り出す型が合わない)。
 # rev を上げるときは 2 つを一緒に上げ、Cargo.lock も一緒に更新する (CLAUDE.md)。
 [workspace.dependencies]
-alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
-alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639", features = ["chrono"] }
+alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2", features = ["chrono"] }
 
 # alc-vein は private repo ippoan/vein-match (vein-match / vein-match-search) に git 依存する。
 # 取得の仕方は crates/alc-vein/Cargo.toml と同じ (ローカルは `gh auth setup-git`、CI は
