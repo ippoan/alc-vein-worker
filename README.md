@@ -273,10 +273,12 @@ bash scripts/fetch-migrations.sh                # 先に要る (テストが con
 cargo test -p alc-vein --test sql_db
 ```
 
-確かめること (7 本。CI は `7 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
+確かめること (9 本。CI は `9 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
 
 - 登録 → 照合で当たる → 学習後のテンプレートが書き戻される / 同じ乗務員の登録は 1 行を上書き / 読んだ後に登録し直されていたら
   書き戻しは 0 行 / 別テナントから見えない・削除済みの乗務員の除外・DELETE の行数 (backend に在った `tests/vein_templates_test.rs` の代わり)
+- dev端末の要求 (`X-Device-Dev: 1` → `app.device_dev`、alc-migrations 179) の登録は `is_dev` の行になり dev からだけ見える /
+  dev の照合・学習の書き戻し・削除は dev の行だけを相手にし、本番の行は変わらない
 - `current_user` が繋いだロールであること / DB のエラーが `DbError::Other` (message と SQLSTATE) になり、失敗した transaction が
   残らないこと / 接続が切れているときの `DbError::Other`
 

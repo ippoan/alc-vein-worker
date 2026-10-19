@@ -9,7 +9,8 @@
 //! ## RLS (trait のメソッド 1 回 = 1 トランザクション)
 //!
 //! [`PgVeinTemplates`] の各メソッドは `PgClient::tenant_tx` を 1 回開く。順は `BEGIN` →
-//! `alc_worker_db::SET_TENANT` (`set_config('app.current_tenant_id', $1, true)` と search_path) → 自由関数 →
+//! `alc_worker_db::SET_TENANT` (`set_config('app.current_tenant_id', $1, true)` と search_path) →
+//! [`set_device_dev`] (dev端末の要求だけ `app.device_dev` を立てる) → 自由関数 →
 //! `COMMIT`。自由関数は [`TenantTx`] を取るので、テナントを設定していない transaction では呼べない
 //! (`TenantTx` は `tenant_tx` の中でしか手に入らない)。戻り値は `TxOutput` (owned な型) に限られ、
 //! `Row` を transaction の外へは持ち出せない。
@@ -24,6 +25,15 @@ use uuid::Uuid;
 use crate::repo::{sql, VeinTemplateRow, VeinTemplatesRepository};
 
 impl TxOutput for VeinTemplateRow {}
+
+/// `dev` なら [`sql::SET_DEVICE_DEV`] を流す (tenant_tx の最初の文。dev でなければ何もしない = 設定は空のまま)。
+/// alc-measurements-worker の `set_device_dev` の写し (kit に口ができたら置き換える)
+pub async fn set_device_dev(tx: &TenantTx<'_>, dev: bool) -> Result<(), tokio_postgres::Error> {
+    if dev {
+        tx.execute_typed(sql::SET_DEVICE_DEV, &[]).await?;
+    }
+    Ok(())
+}
 
 /// [`sql::UPSERT`]。`Ok(None)` = そのテナントに生きている乗務員が居ない。
 pub async fn upsert(
@@ -152,6 +162,7 @@ impl VeinTemplatesRepository for PgVeinTemplates {
     async fn upsert(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
         template: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
@@ -159,17 +170,23 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { upsert(tx, tenant_id, employee_id, &template).await })
+                Box::pin(async move {
+                    set_device_dev(tx, dev).await?;
+                    upsert(tx, tenant_id, employee_id, &template).await
+                })
             })
             .await
             .map_err(db_err)
     }
 
-    async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
+    async fn list(&self, tenant_id: Uuid, dev: bool) -> Result<Vec<VeinTemplateRow>, DbError> {
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { list(tx, tenant_id).await })
+                Box::pin(async move {
+                    set_device_dev(tx, dev).await?;
+                    list(tx, tenant_id).await
+                })
             })
             .await
             .map_err(db_err)
@@ -178,12 +195,16 @@ impl VeinTemplatesRepository for PgVeinTemplates {
     async fn registration_count(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
     ) -> Result<(i64, bool), DbError> {
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { registration_count(tx, tenant_id, employee_id).await })
+                Box::pin(async move {
+                    set_device_dev(tx, dev).await?;
+                    registration_count(tx, tenant_id, employee_id).await
+                })
             })
             .await
             .map_err(db_err)
@@ -192,6 +213,7 @@ impl VeinTemplatesRepository for PgVeinTemplates {
     async fn update_learned(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         id: Uuid,
         template: &str,
         read_updated_at: DateTime<Utc>,
@@ -201,6 +223,7 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         client
             .tenant_tx(tenant_id, move |tx| {
                 Box::pin(async move {
+                    set_device_dev(tx, dev).await?;
                     update_learned(tx, tenant_id, id, &template, read_updated_at).await
                 })
             })
@@ -208,11 +231,14 @@ impl VeinTemplatesRepository for PgVeinTemplates {
             .map_err(db_err)
     }
 
-    async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
+    async fn delete(&self, tenant_id: Uuid, dev: bool, employee_id: Uuid) -> Result<bool, DbError> {
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { delete(tx, tenant_id, employee_id).await })
+                Box::pin(async move {
+                    set_device_dev(tx, dev).await?;
+                    delete(tx, tenant_id, employee_id).await
+                })
             })
             .await
             .map_err(db_err)

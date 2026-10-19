@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Extension;
+use axum::middleware;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use alc_core_wasm::{DbError, TenantId};
+use alc_core_wasm::{require_tenant_header, DbError};
 
-use super::tenant_router;
+use super::{tenant_router, with_device_dev_slot};
 use crate::matcher::{synth, MAX_TEMPLATES};
 use crate::repo::{VeinTemplateRow, VeinTemplatesRepository};
 use crate::VeinState;
@@ -32,10 +32,13 @@ struct FakeRepo {
     conflict: AtomicBool,
     /// update_learned の呼び出し (id, 読んだ updated_at)。
     learned_calls: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+    /// 各メソッドが受けた `dev` (メソッド名, dev) を呼ばれた順に。
+    devs: Mutex<Vec<(&'static str, bool)>>,
 }
 
 impl FakeRepo {
-    fn check(&self) -> Result<(), DbError> {
+    fn check(&self, method: &'static str, dev: bool) -> Result<(), DbError> {
+        self.devs.lock().unwrap().push((method, dev));
         if self.fail.load(Ordering::SeqCst) {
             return Err(DbError::Other("pool timed out".into()));
         }
@@ -63,10 +66,11 @@ impl VeinTemplatesRepository for FakeRepo {
     async fn upsert(
         &self,
         _tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
         template: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
-        self.check()?;
+        self.check("upsert", dev)?;
         if self.fail_upsert.load(Ordering::SeqCst) {
             return Err(DbError::Other("pool timed out".into()));
         }
@@ -87,17 +91,18 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(Some(now))
     }
 
-    async fn list(&self, _tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
-        self.check()?;
+    async fn list(&self, _tenant_id: Uuid, dev: bool) -> Result<Vec<VeinTemplateRow>, DbError> {
+        self.check("list", dev)?;
         Ok(self.rows.lock().unwrap().clone())
     }
 
     async fn registration_count(
         &self,
         _tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
     ) -> Result<(i64, bool), DbError> {
-        self.check()?;
+        self.check("registration_count", dev)?;
         let rows = self.rows.lock().unwrap();
         let enrolled = rows.iter().any(|r| r.employee_id == employee_id);
         Ok((rows.len() as i64, enrolled))
@@ -106,10 +111,12 @@ impl VeinTemplatesRepository for FakeRepo {
     async fn update_learned(
         &self,
         _tenant_id: Uuid,
+        dev: bool,
         id: Uuid,
         template: &str,
         read_updated_at: DateTime<Utc>,
     ) -> Result<bool, DbError> {
+        self.devs.lock().unwrap().push(("update_learned", dev));
         self.learned_calls
             .lock()
             .unwrap()
@@ -127,8 +134,13 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(true)
     }
 
-    async fn delete(&self, _tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
-        self.check()?;
+    async fn delete(
+        &self,
+        _tenant_id: Uuid,
+        dev: bool,
+        employee_id: Uuid,
+    ) -> Result<bool, DbError> {
+        self.check("delete", dev)?;
         let mut rows = self.rows.lock().unwrap();
         let before = rows.len();
         rows.retain(|r| r.employee_id != employee_id);
@@ -137,18 +149,33 @@ impl VeinTemplatesRepository for FakeRepo {
 }
 
 async fn call(repo: &Arc<FakeRepo>, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+    call_with(repo, method, uri, body, None).await
+}
+
+/// worker (直下の `src/lib.rs`) と同じ層の順で叩く。`device_dev` = `X-Device-Dev` の値 (None = 欄なし)。
+async fn call_with(
+    repo: &Arc<FakeRepo>,
+    method: &str,
+    uri: &str,
+    body: Value,
+    device_dev: Option<&str>,
+) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
     };
     let app = tenant_router()
-        .with_state(state)
-        .layer(Extension(TenantId(Uuid::nil())));
-    let req = Request::builder()
+        .layer(middleware::from_fn(require_tenant_header))
+        .layer(middleware::from_fn(with_device_dev_slot))
+        .with_state(state);
+    let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
+        .header("X-Tenant-ID", Uuid::nil().to_string());
+    if let Some(v) = device_dev {
+        req = req.header("X-Device-Dev", v);
+    }
+    let req = req.body(Body::from(body.to_string())).unwrap();
     let res = app.oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
@@ -384,4 +411,37 @@ async fn put_new_employee_at_500_is_rejected_but_overwrite_passes() {
     let (status, _) = call(&repo, "PUT", &format!("/vein/templates/{id500}"), body).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(repo.rows.lock().unwrap().len(), MAX_TEMPLATES);
+}
+
+/// `X-Device-Dev: 1` の要求は 4 口とも repo に `dev = true` を渡す (identify は一覧と書き戻しの両方)。
+/// 欄なし・"1" 以外は `dev = false`。
+#[tokio::test]
+async fn device_dev_header_reaches_every_repo_call() {
+    for (header, dev) in [(Some("1"), true), (None, false), (Some("true"), false)] {
+        let repo = Arc::new(FakeRepo::default());
+        let id = repo.add_employee("山田");
+        let uri = format!("/vein/templates/{id}");
+        let put = json!({ "charas": [hex(1), hex(1)] });
+        let (status, _) = call_with(&repo, "PUT", &uri, put, header).await;
+        assert_eq!(status, StatusCode::OK);
+        let chara = json!({ "chara": hex(1) });
+        let (_, v) = call_with(&repo, "POST", "/vein/identify", chara, header).await;
+        assert_eq!(v["employee_id"], id.to_string());
+        let (status, _) = call_with(&repo, "GET", "/vein/templates", Value::Null, header).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call_with(&repo, "DELETE", &uri, Value::Null, header).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let expected: Vec<_> = [
+            "registration_count",
+            "upsert",
+            "list",
+            "update_learned",
+            "list",
+            "delete",
+        ]
+        .into_iter()
+        .map(|m| (m, dev))
+        .collect();
+        assert_eq!(*repo.devs.lock().unwrap(), expected, "{header:?}");
+    }
 }

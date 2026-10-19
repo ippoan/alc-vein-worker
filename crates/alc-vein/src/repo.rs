@@ -42,11 +42,17 @@ impl From<VeinTemplateRow> for VeinTemplateItem {
 /// これを使う (placeholder は `$n`)。
 /// RLS に加えて `WHERE tenant_id` を明示する。
 pub mod sql {
+    /// dev端末の要求で、transaction の中だけ `app.device_dev` を `'1'` にする (固定。値を埋め込まない)。
+    /// 列 `is_dev` の既定値と RLS がこれを見て、dev の行と本番の行を分ける (alc-migrations 179)。
+    /// alc-measurements-worker の `SET_DEVICE_DEV` と同じ文
+    pub const SET_DEVICE_DEV: &str = "SELECT set_config('app.device_dev', '1', true)";
+
     /// 乗務員のテンプレートを登録し直す。$1 tenant_id / $2 employee_id / $3 template → updated_at (乗務員が居なければ 0 行)。
+    /// `is_dev` は書かない (列の既定値 = `app.device_dev`)。一意は (tenant_id, employee_id, is_dev)。
     pub const UPSERT: &str = r#"INSERT INTO vein_templates (tenant_id, employee_id, template)
     SELECT e.tenant_id, e.id, $3 FROM employees e
     WHERE e.tenant_id = $1 AND e.id = $2 AND e.deleted_at IS NULL
-    ON CONFLICT (tenant_id, employee_id)
+    ON CONFLICT (tenant_id, employee_id, is_dev)
     DO UPDATE SET template = EXCLUDED.template, updated_at = NOW()
     RETURNING updated_at"#;
 
@@ -71,6 +77,9 @@ pub mod sql {
     pub const DELETE: &str = "DELETE FROM vein_templates WHERE tenant_id = $1 AND employee_id = $2";
 }
 
+/// 全メソッドの `dev` = dev端末の要求か (`X-Device-Dev: 1`、kit の `DeviceDevSlot`)。実装は transaction の最初に
+/// [`sql::SET_DEVICE_DEV`] を流し、dev の要求は dev の行だけを、本番の要求は本番の行だけを読み書きする。
+///
 /// wasm32 (Workers) でも `Send + Sync` を外さない: routes の axum handler と
 /// `Router::with_state` が Send を要求するため。!Send を持つ実装は `SendWrapper` で包む。
 #[async_trait::async_trait]
@@ -80,18 +89,20 @@ pub trait VeinTemplatesRepository: Send + Sync {
     async fn upsert(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
         template: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError>;
 
     /// テナントの全テンプレート (削除済みの乗務員を除く)。並びは登録順。
-    async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError>;
+    async fn list(&self, tenant_id: Uuid, dev: bool) -> Result<Vec<VeinTemplateRow>, DbError>;
 
     /// 照合に載る登録の人数 (`list` と同じ条件 = 削除済みの乗務員を除く) と、
     /// `employee_id` がその中に既に居るか (居れば PUT は上書きで人数が増えない)。
     async fn registration_count(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
     ) -> Result<(i64, bool), DbError>;
 
@@ -100,11 +111,12 @@ pub trait VeinTemplatesRepository: Send + Sync {
     async fn update_learned(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         id: Uuid,
         template: &str,
         read_updated_at: DateTime<Utc>,
     ) -> Result<bool, DbError>;
 
     /// 乗務員のテンプレートを消す。`Ok(false)` = 登録が無い。
-    async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError>;
+    async fn delete(&self, tenant_id: Uuid, dev: bool, employee_id: Uuid) -> Result<bool, DbError>;
 }
