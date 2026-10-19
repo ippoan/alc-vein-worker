@@ -7,16 +7,10 @@
 //!
 //! 認可は `alc-misc` の `employees::update_face` と同じ形で `TenantId` の Extension だけを
 //! 見る。役割 (キオスクに DELETE を開かない等) は auth-worker の許可表が決める。
-//!
-//! dev端末の印 `X-Device-Dev: 1` は、kit の `require_tenant_header` が認証の後に書く `DeviceDevSlot` から読み
-//! (ヘッダを口で読み直さない)、repo に `dev` として渡す。slot を要求ごとに置くのは [`with_device_dev_slot`]
-//! (worker は `require_tenant_header` の外側に掛ける)。
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, State},
     http::StatusCode,
-    middleware::Next,
-    response::Response,
     routing::{post, put},
     Extension, Json, Router,
 };
@@ -25,7 +19,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use alc_core_wasm::api_error::{internal_error, not_found, unprocessable, ApiError};
-use alc_core_wasm::{DeviceDevSlot, TenantId};
+use alc_core_wasm::TenantId;
 
 use crate::matcher::{self, CharaError, MAX_TEMPLATES};
 use crate::repo::VeinTemplateItem;
@@ -39,13 +33,6 @@ pub fn tenant_router() -> Router<VeinState> {
             put(upsert_template).delete(delete_template),
         )
         .route("/vein/identify", post(identify))
-}
-
-/// 要求ごとに空の `DeviceDevSlot` を置く (kit の `require_tenant_header` は、在る slot にだけ認証の後で dev の印を書く。
-/// 共有の 1 つを使い回さない)。alc-measurements-worker の `with_device_dev_slot` の写し (kit に口ができたら置き換える)
-pub async fn with_device_dev_slot(mut req: Request, next: Next) -> Response {
-    req.extensions_mut().insert(DeviceDevSlot::default());
-    next.run(req).await
 }
 
 #[derive(Deserialize)]
@@ -65,7 +52,6 @@ fn chara_error(e: CharaError) -> ApiError {
 async fn upsert_template(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
-    Extension(slot): Extension<DeviceDevSlot>,
     Path(employee_id): Path<Uuid>,
     Json(body): Json<UpsertBody>,
 ) -> Result<Json<Value>, ApiError> {
@@ -84,7 +70,7 @@ async fn upsert_template(
     // 新規登録で上限を超えさせない (上書きは人数が増えないので通す)
     let (registered, enrolled) = state
         .templates
-        .registration_count(tenant_id, slot.get(), employee_id)
+        .registration_count(tenant_id, employee_id)
         .await
         .map_err(|e| internal_error("vein registration_count", e))?;
     matcher::check_capacity(registered as usize + usize::from(!enrolled)).map_err(|_| {
@@ -93,7 +79,7 @@ async fn upsert_template(
     })?;
     let updated_at = state
         .templates
-        .upsert(tenant_id, slot.get(), employee_id, &template)
+        .upsert(tenant_id, employee_id, &template)
         .await
         .map_err(|e| internal_error("vein upsert_template", e))?
         .ok_or_else(|| not_found("employee_not_found"))?;
@@ -105,16 +91,12 @@ async fn upsert_template(
 async fn identify(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
-    Extension(slot): Extension<DeviceDevSlot>,
     Json(body): Json<IdentifyBody>,
 ) -> Result<Json<Value>, ApiError> {
     let chara = matcher::decode_chara(&body.chara).map_err(chara_error)?;
-    // 一覧と書き戻しの両方に同じ dev を渡す (片方だけだと、dev の鍵が本番のテンプレートを相手にするか、
-    // 書き戻しが 0 行で黙って捨てられる)
-    let dev = slot.get();
     let rows = state
         .templates
-        .list(tenant_id, dev)
+        .list(tenant_id)
         .await
         .map_err(|e| internal_error("vein identify list", e))?;
     let templates: Vec<&str> = rows.iter().map(|r| r.template.as_str()).collect();
@@ -137,7 +119,7 @@ async fn identify(
     // 学習は次の照合でまた起きるので、書き戻しの競合 (0 行) や失敗は捨ててよい
     let written = state
         .templates
-        .update_learned(tenant_id, dev, row.id, &hit.learned, row.updated_at)
+        .update_learned(tenant_id, row.id, &hit.learned, row.updated_at)
         .await;
     // Ok(false) = 間に登録し直し等が入った競合で、書き戻しを捨てた
     let employee_id = row.employee_id;
@@ -150,11 +132,10 @@ async fn identify(
 async fn list_templates(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
-    Extension(slot): Extension<DeviceDevSlot>,
 ) -> Result<Json<Value>, ApiError> {
     let rows = state
         .templates
-        .list(tenant_id, slot.get())
+        .list(tenant_id)
         .await
         .map_err(|e| internal_error("vein list_templates", e))?;
     let templates: Vec<VeinTemplateItem> = rows.into_iter().map(Into::into).collect();
@@ -167,12 +148,11 @@ async fn list_templates(
 async fn delete_template(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
-    Extension(slot): Extension<DeviceDevSlot>,
     Path(employee_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let deleted = state
         .templates
-        .delete(tenant_id, slot.get(), employee_id)
+        .delete(tenant_id, employee_id)
         .await
         .map_err(|e| internal_error("vein delete_template", e))?;
     if deleted {
