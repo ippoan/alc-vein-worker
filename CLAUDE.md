@@ -59,6 +59,9 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   本番の wasm に入らないこと (`cargo tree --target wasm32-unknown-unknown -e normal` に pglite / wasmer が 0 行) を崩さない。
 - **staging の DB を動かしている機では、`127.0.0.1:6432` を常駐のコンテナが使っている** (README)。手元の検査の DB は別名・空きポート
   (`-p 127.0.0.1::6432`) で立て、常駐のコンテナには繋がない・止めない。
+- **指静脈テンプレートは開発用の端末 (`X-Device-Dev`) でも本番と共有する。印は読まない (`app.device_dev` を立てない)。**
+  開発用の鍵で試すときも、本番で登録済みのテンプレートで照合できるようにするため (ユーザー決定 2026-10-19。ippoan/vein-match#20)。
+  DB の `vein_templates.is_dev` (alc-migrations 179) は印が立たないので常に false。`ON CONFLICT` は 2 列 `(tenant_id, employee_id)`。
 
 ## rev を上げる手順
 
