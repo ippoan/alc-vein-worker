@@ -21,7 +21,8 @@ mod vein_db;
 use std::sync::Arc;
 
 use alc_core_wasm::require_tenant_header;
-use alc_vein::{routes::tenant_router, VeinState};
+use alc_vein::routes::{tenant_router, with_device_dev_slot};
+use alc_vein::VeinState;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use axum::{middleware, Router};
@@ -40,9 +41,13 @@ pub use crate::vein_db::VeinDb;
 /// **`internal` は `vein` より先に merge する。** axum の `merge` は fallback を後から merge した側の
 /// もので置き換えるので、後に置くと、どの route にも当たらない path の fallback から tenant の layer が
 /// 外れる (ヘッダー無しの未定義の path が 401 でなく 404 になる)。
+///
+/// `vein` の層は後に足した方が外側: dev端末の印の slot を置く → tenant と dev の印を読む → 口
+/// (alc-measurements-worker と同じ順)。`internal` には付けない。
 fn router(state: VeinState, internal: Router) -> Router {
     let vein = tenant_router()
         .layer(middleware::from_fn(require_tenant_header))
+        .layer(middleware::from_fn(with_device_dev_slot))
         .with_state(state);
     Router::new()
         .merge(internal)

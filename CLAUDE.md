@@ -46,10 +46,15 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
   **名前付き prepared statement を呼ぶコード (`execute`・`query`・`query_one`・`query_opt`・`prepare`) を足さない** — 使うのは
   `TenantTx` の `query_typed`・`query_typed_one`・`query_typed_opt`・`execute_typed` だけ (Hyperdrive 経由では名前付きの文で接続が切れる)。
   生の `tokio_postgres::Client` を `src/db.rs` の外へ出さない。
+- **dev端末の印 `X-Device-Dev: 1` を `app.device_dev` に通す** (ippoan/alc-app#387)。印は kit の `require_tenant_header` が書く
+  `DeviceDevSlot` から読み (口でヘッダを読み直さない)、repo の全メソッドに `dev` を渡し、`pg.rs` の各 `tenant_tx` の最初の文で
+  `set_device_dev` を流す (列 `is_dev` の既定値と RLS が dev の行を分ける。alc-migrations 179)。identify は一覧と書き戻しの両方に同じ `dev`。
+  slot を置く層 `with_device_dev_slot` は `require_tenant_header` の外側 (`internal` には付けない)。
+  **`set_device_dev` と `with_device_dev_slot` は alc-measurements-worker の写し。kit に口ができたら置き換える (measurements の CLAUDE.md:49 と同じ扱い)。**
 - **DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は、テストの中で起こす組み込みの PostgreSQL
   (`pglite-oxide`) に流す。migration が未取得 (`container/.alc-migrations` が無い) なら失敗する作り
   (skip にしない・`#[ignore]` にしない)。`repo::sql` の定数・`pg.rs` の引数の型・`alc-worker-db` の rev を変えたら、このテストを通す。
-  CI は本数を固定して回す (`ci.yml` の `7 passed`。テストを減らさない)。CI がテストを走らせるのは coverage の計測の 1 回だけ
+  CI は本数を固定して回す (`ci.yml` の `9 passed`。テストを減らさない)。CI がテストを走らせるのは coverage の計測の 1 回だけ
   (素の `cargo test` の step は無い — dev-dependency を 2 回 compile しないため。step を分けて計測から外さない)。
   `coverage_100.toml` の 4 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`・`pg.rs`) は行カバレッジ 100% (登録を外さない)。
   RLS が実際に行を止めることの確かめは ippoan/alc-migrations の CI (`ci/check_rls_rows.sql`) が持ち、この repo では確かめない

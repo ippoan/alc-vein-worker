@@ -93,41 +93,45 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
     async fn upsert(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
         template: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
-        self.timed(self.inner.upsert(tenant_id, employee_id, template))
+        self.timed(self.inner.upsert(tenant_id, dev, employee_id, template))
             .await
     }
 
-    async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
-        self.timed(self.inner.list(tenant_id)).await
+    async fn list(&self, tenant_id: Uuid, dev: bool) -> Result<Vec<VeinTemplateRow>, DbError> {
+        self.timed(self.inner.list(tenant_id, dev)).await
     }
 
     async fn registration_count(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         employee_id: Uuid,
     ) -> Result<(i64, bool), DbError> {
-        self.timed(self.inner.registration_count(tenant_id, employee_id))
+        self.timed(self.inner.registration_count(tenant_id, dev, employee_id))
             .await
     }
 
     async fn update_learned(
         &self,
         tenant_id: Uuid,
+        dev: bool,
         id: Uuid,
         template: &str,
         read_updated_at: DateTime<Utc>,
     ) -> Result<bool, DbError> {
         self.timed(
             self.inner
-                .update_learned(tenant_id, id, template, read_updated_at),
+                .update_learned(tenant_id, dev, id, template, read_updated_at),
         )
         .await
     }
 
-    async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
-        self.timed(self.inner.delete(tenant_id, employee_id)).await
+    async fn delete(&self, tenant_id: Uuid, dev: bool, employee_id: Uuid) -> Result<bool, DbError> {
+        self.timed(self.inner.delete(tenant_id, dev, employee_id))
+            .await
     }
 }
