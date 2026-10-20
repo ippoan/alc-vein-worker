@@ -4,7 +4,7 @@
 //! SQL は [`crate::repo::sql`] の定数だけを、共通 crate `alc-worker-db` の [`TenantTx`] が出す
 //! **型付きの名前なしの文** (`query_typed` 系・`execute_typed`) で流す。名前付き prepared statement は
 //! Hyperdrive 経由で接続が切れるので使わない (`TenantTx` に口が無い)。引数の型の並びが書かれるのは、
-//! 下の自由関数 5 つの 1 か所だけ (`$n` の意味は `repo::sql` の各定数の doc)。
+//! 下の自由関数 7 つの 1 か所だけ (`$n` の意味は `repo::sql` の各定数の doc)。
 //!
 //! ## RLS (trait のメソッド 1 回 = 1 トランザクション)
 //!
@@ -21,9 +21,10 @@ use futures_util::lock::Mutex;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
-use crate::repo::{sql, VeinTemplateRow, VeinTemplatesRepository};
+use crate::repo::{sql, PendingTemplate, VeinTemplateRow, VeinTemplatesRepository};
 
 impl TxOutput for VeinTemplateRow {}
+impl TxOutput for PendingTemplate {}
 
 /// [`sql::UPSERT`]。`Ok(None)` = そのテナントに生きている乗務員が居ない。
 pub async fn upsert(
@@ -63,6 +64,45 @@ pub async fn list(
             updated_at: r.get(4),
         })
         .collect())
+}
+
+/// [`sql::LIST_PENDING`]。
+pub async fn list_pending(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+) -> Result<Vec<PendingTemplate>, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(sql::LIST_PENDING, &[(&tenant_id, Type::UUID)])
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingTemplate {
+            employee_id: r.get(0),
+            updated_at: r.get(1),
+        })
+        .collect())
+}
+
+/// [`sql::APPROVE`]。`Ok(true)` = 1 行承認した。
+pub async fn approve(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    approved_by: Uuid,
+    updated_at: DateTime<Utc>,
+) -> Result<bool, tokio_postgres::Error> {
+    let n = tx
+        .execute_typed(
+            sql::APPROVE,
+            &[
+                (&tenant_id, Type::UUID),
+                (&employee_id, Type::UUID),
+                (&approved_by, Type::UUID),
+                (&updated_at, Type::TIMESTAMPTZ),
+            ],
+        )
+        .await?;
+    Ok(n == 1)
 }
 
 /// [`sql::REGISTRATION_COUNT`]。
@@ -170,6 +210,34 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         client
             .tenant_tx(tenant_id, move |tx| {
                 Box::pin(async move { list(tx, tenant_id).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn list_pending(&self, tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { list_pending(tx, tenant_id).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn approve(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        approved_by: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move {
+                    approve(tx, tenant_id, employee_id, approved_by, updated_at).await
+                })
             })
             .await
             .map_err(db_err)

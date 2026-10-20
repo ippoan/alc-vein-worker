@@ -28,6 +28,14 @@ pub struct VeinTemplateItem {
     pub updated_at: DateTime<Utc>,
 }
 
+/// `GET /vein/templates/pending` の 1 件 (承認待ち。テンプレートは返さない)。
+/// `updated_at` は承認の版 (`POST .../approve` の body に同じ値を返す)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingTemplate {
+    pub employee_id: Uuid,
+    pub updated_at: DateTime<Utc>,
+}
+
 impl From<VeinTemplateRow> for VeinTemplateItem {
     fn from(r: VeinTemplateRow) -> Self {
         Self {
@@ -43,19 +51,33 @@ impl From<VeinTemplateRow> for VeinTemplateItem {
 /// RLS に加えて `WHERE tenant_id` を明示する。
 pub mod sql {
     /// 乗務員のテンプレートを登録し直す。$1 tenant_id / $2 employee_id / $3 template → updated_at (乗務員が居なければ 0 行)。
-    pub const UPSERT: &str = r#"INSERT INTO vein_templates (tenant_id, employee_id, template)
-    SELECT e.tenant_id, e.id, $3 FROM employees e
+    /// 登録は常に承認待ち (`approved_at` / `approved_by` = NULL)。上書きも承認待ちに戻す (migration 181)。
+    pub const UPSERT: &str = r#"INSERT INTO vein_templates (tenant_id, employee_id, template, approved_at, approved_by)
+    SELECT e.tenant_id, e.id, $3, NULL::timestamptz, NULL::uuid FROM employees e
     WHERE e.tenant_id = $1 AND e.id = $2 AND e.deleted_at IS NULL
     ON CONFLICT (tenant_id, employee_id)
-    DO UPDATE SET template = EXCLUDED.template, updated_at = NOW()
+    DO UPDATE SET template = EXCLUDED.template, updated_at = NOW(), approved_at = NULL, approved_by = NULL
     RETURNING updated_at"#;
 
-    /// テナントの全テンプレート (削除済みの乗務員を除く、登録順)。$1 tenant_id → id, employee_id, name, template, updated_at。
+    /// テナントの承認済みのテンプレート (削除済みの乗務員を除く、登録順)。照合 (identify) と
+    /// `GET /vein/templates` の両方が使う。承認待ちは載せない。$1 tenant_id → id, employee_id, name, template, updated_at。
     pub const LIST: &str = r#"SELECT v.id, v.employee_id, e.name, v.template, v.updated_at
     FROM vein_templates v
     JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
-    WHERE v.tenant_id = $1 AND e.deleted_at IS NULL
+    WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NOT NULL
     ORDER BY v.created_at, v.id"#;
+
+    /// 承認待ちの一覧 (削除済みの乗務員を除く、古い順)。テンプレートは返さない。$1 tenant_id → employee_id, updated_at。
+    pub const LIST_PENDING: &str = r#"SELECT v.employee_id, v.updated_at
+    FROM vein_templates v
+    JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
+    WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NULL
+    ORDER BY v.updated_at, v.id"#;
+
+    /// 承認する。$4 = 一覧で見た updated_at のままで、承認待ちのときだけ (版の固定)。
+    /// $1 tenant_id / $2 employee_id / $3 approved_by (承認した管理者の user_id) / $4 updated_at。0 行 = 409。
+    pub const APPROVE: &str = r#"UPDATE vein_templates SET approved_at = NOW(), approved_by = $3
+    WHERE tenant_id = $1 AND employee_id = $2 AND updated_at = $4 AND approved_at IS NULL"#;
 
     /// 照合に載る登録の人数と、$2 employee_id が既に居るか。$1 tenant_id → (COUNT, BOOL)。
     pub const REGISTRATION_COUNT: &str = r#"SELECT COUNT(*), COALESCE(BOOL_OR(v.employee_id = $2), FALSE)
@@ -84,8 +106,20 @@ pub trait VeinTemplatesRepository: Send + Sync {
         template: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError>;
 
-    /// テナントの全テンプレート (削除済みの乗務員を除く)。並びは登録順。
+    /// テナントの承認済みのテンプレート (削除済みの乗務員を除く)。並びは登録順。
     async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError>;
+
+    /// 承認待ちの一覧 (古い順)。
+    async fn list_pending(&self, tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError>;
+
+    /// 承認する。`updated_at` が一致し承認待ちのときだけ承認して `Ok(true)`、そうでなければ `Ok(false)` (409 に写す)。
+    async fn approve(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        approved_by: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DbError>;
 
     /// 照合に載る登録の人数 (`list` と同じ条件 = 削除済みの乗務員を除く) と、
     /// `employee_id` がその中に既に居るか (居れば PUT は上書きで人数が増えない)。

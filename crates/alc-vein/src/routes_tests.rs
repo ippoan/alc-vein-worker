@@ -13,19 +13,23 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use alc_core_wasm::{DbError, TenantId};
+use alc_core_wasm::{AuthUser, DbError, TenantId};
 
 use super::tenant_router;
 use crate::matcher::{synth, MAX_TEMPLATES};
-use crate::repo::{VeinTemplateRow, VeinTemplatesRepository};
+use crate::repo::{PendingTemplate, VeinTemplateRow, VeinTemplatesRepository};
 use crate::VeinState;
 
 /// fake の repo。`employees` に居る乗務員だけ登録でき、`fail` で全メソッドが DB エラー、
-/// `conflict` で書き戻しが競合 (0 行) になる。
+/// `conflict` で書き戻しが競合 (0 行) になる。登録は承認待ち (`pending`) で入り、`list` は承認済みだけを返す。
 #[derive(Default)]
 struct FakeRepo {
     employees: Mutex<Vec<(Uuid, String)>>,
     rows: Mutex<Vec<VeinTemplateRow>>,
+    /// 承認待ちの乗務員 (`rows` のうち `list` に出さないもの)。
+    pending: Mutex<Vec<Uuid>>,
+    /// 承認した管理者の user_id (承認した順)。
+    approved_by: Mutex<Vec<Uuid>>,
     fail: AtomicBool,
     /// upsert だけを DB エラーにする (人数の数えは通す)。
     fail_upsert: AtomicBool,
@@ -84,12 +88,57 @@ impl VeinTemplatesRepository for FakeRepo {
             template: template.to_string(),
             updated_at: now,
         });
+        // 登録は上書きも承認待ち
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|e| *e != employee_id);
+        pending.push(employee_id);
         Ok(Some(now))
     }
 
     async fn list(&self, _tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
         self.check()?;
-        Ok(self.rows.lock().unwrap().clone())
+        let pending = self.pending.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .iter()
+            .filter(|r| !pending.contains(&r.employee_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_pending(&self, _tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError> {
+        self.check()?;
+        let pending = self.pending.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .iter()
+            .filter(|r| pending.contains(&r.employee_id))
+            .map(|r| PendingTemplate {
+                employee_id: r.employee_id,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
+    async fn approve(
+        &self,
+        _tenant_id: Uuid,
+        employee_id: Uuid,
+        approved_by: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DbError> {
+        self.check()?;
+        let mut pending = self.pending.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
+        let version_matches = rows
+            .iter()
+            .any(|r| r.employee_id == employee_id && r.updated_at == updated_at);
+        if !version_matches || !pending.contains(&employee_id) {
+            return Ok(false);
+        }
+        pending.retain(|e| *e != employee_id);
+        self.approved_by.lock().unwrap().push(approved_by);
+        Ok(true)
     }
 
     async fn registration_count(
@@ -136,13 +185,38 @@ impl VeinTemplatesRepository for FakeRepo {
     }
 }
 
+/// 承認する管理者の user_id (`call_as(Some("admin"), ..)` が付ける)。
+const ADMIN_ID: Uuid = Uuid::from_u128(0xAD);
+
+/// 端末の鍵 (`AuthUser` を持たない) として叩く。
 async fn call(repo: &Arc<FakeRepo>, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+    call_as(repo, None, method, uri, body).await
+}
+
+/// `role` が `Some` なら、tenant_header が `X-User-*` から復元する `AuthUser` を付けて叩く。
+async fn call_as(
+    repo: &Arc<FakeRepo>,
+    role: Option<&str>,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
     };
-    let app = tenant_router()
+    let mut app = tenant_router()
         .with_state(state)
         .layer(Extension(TenantId(Uuid::nil())));
+    if let Some(role) = role {
+        app = app.layer(Extension(AuthUser {
+            user_id: ADMIN_ID,
+            email: "admin@example.com".to_string(),
+            name: String::new(),
+            tenant_id: Uuid::nil(),
+            tenant_slug: None,
+            role: role.to_string(),
+        }));
+    }
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -162,12 +236,26 @@ fn hex(seed: u64) -> String {
     synth::hex(&synth::chara(seed))
 }
 
-/// 乗務員を作って種 `seed` の指を登録する。
-async fn enroll(repo: &Arc<FakeRepo>, name: &str, seed: u64) -> Uuid {
+/// 乗務員を作って種 `seed` の指を登録する (承認待ちのまま)。`updated_at` も返す。
+async fn enroll_pending(repo: &Arc<FakeRepo>, name: &str, seed: u64) -> (Uuid, Value) {
     let id = repo.add_employee(name);
     let body = json!({ "charas": [hex(seed), hex(seed)] });
-    let (status, _) = call(repo, "PUT", &format!("/vein/templates/{id}"), body).await;
+    let (status, v) = call(repo, "PUT", &format!("/vein/templates/{id}"), body).await;
     assert_eq!(status, StatusCode::OK);
+    (id, v["updated_at"].clone())
+}
+
+/// 管理者として承認する。
+async fn approve(repo: &Arc<FakeRepo>, id: Uuid, updated_at: &Value) -> StatusCode {
+    let uri = format!("/vein/templates/{id}/approve");
+    let body = json!({ "updated_at": updated_at });
+    call_as(repo, Some("admin"), "POST", &uri, body).await.0
+}
+
+/// 乗務員を作って種 `seed` の指を登録し、管理者が承認する (照合に載る)。
+async fn enroll(repo: &Arc<FakeRepo>, name: &str, seed: u64) -> Uuid {
+    let (id, updated_at) = enroll_pending(repo, name, seed).await;
+    assert_eq!(approve(repo, id, &updated_at).await, StatusCode::NO_CONTENT);
     id
 }
 
@@ -384,4 +472,148 @@ async fn put_new_employee_at_500_is_rejected_but_overwrite_passes() {
     let (status, _) = call(&repo, "PUT", &format!("/vein/templates/{id500}"), body).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(repo.rows.lock().unwrap().len(), MAX_TEMPLATES);
+}
+
+#[tokio::test]
+async fn put_is_pending_until_an_admin_approves() {
+    let repo = Arc::new(FakeRepo::default());
+    let (id, updated_at) = enroll_pending(&repo, "山田", 1).await;
+
+    // 承認待ちは照合にも GET にも出ない
+    let (_, v) = call(&repo, "POST", "/vein/identify", json!({ "chara": hex(1) })).await;
+    assert_eq!(v, json!({ "employee_id": null }));
+    let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
+    assert_eq!(v["templates"], json!([]));
+
+    // 管理者の一覧には出る (テンプレートは返さない)
+    let (status, v) = call_as(
+        &repo,
+        Some("admin"),
+        "GET",
+        "/vein/templates/pending",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v, json!([{ "employee_id": id, "updated_at": updated_at }]));
+
+    // 承認すると照合にも GET にも出て、一覧から消え、承認した管理者が残る
+    assert_eq!(
+        approve(&repo, id, &updated_at).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, v) = call(&repo, "POST", "/vein/identify", json!({ "chara": hex(1) })).await;
+    assert_eq!(v, json!({ "employee_id": id, "name": "山田" }));
+    let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
+    assert_eq!(v["templates"][0]["employee_id"], id.to_string());
+    let (_, v) = call_as(
+        &repo,
+        Some("admin"),
+        "GET",
+        "/vein/templates/pending",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(v, json!([]));
+    assert_eq!(*repo.approved_by.lock().unwrap(), vec![ADMIN_ID]);
+}
+
+#[tokio::test]
+async fn re_registering_returns_to_pending() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enroll(&repo, "山田", 1).await;
+    // 承認済みの乗務員の上書きも承認待ちに戻り、照合から外れる
+    let body = json!({ "charas": [hex(2), hex(2)] });
+    let (status, v) = call(&repo, "PUT", &format!("/vein/templates/{id}"), body).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, found) = call(&repo, "POST", "/vein/identify", json!({ "chara": hex(2) })).await;
+    assert_eq!(found, json!({ "employee_id": null }));
+    let (_, pending) = call_as(
+        &repo,
+        Some("admin"),
+        "GET",
+        "/vein/templates/pending",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        pending,
+        json!([{ "employee_id": id, "updated_at": v["updated_at"] }])
+    );
+}
+
+#[tokio::test]
+async fn approve_conflicts_on_stale_version_or_already_approved() {
+    let repo = Arc::new(FakeRepo::default());
+    let (id, first) = enroll_pending(&repo, "山田", 1).await;
+
+    // 登録し直された後に、古い updated_at で承認しようとすると 409 (別の指を承認しない)
+    let body = json!({ "charas": [hex(2), hex(2)] });
+    let (_, v) = call(&repo, "PUT", &format!("/vein/templates/{id}"), body).await;
+    assert_eq!(approve(&repo, id, &first).await, StatusCode::CONFLICT);
+    assert_eq!(
+        approve(&repo, id, &v["updated_at"]).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // 承認済みの再承認と、登録の無い乗務員は 409
+    assert_eq!(
+        approve(&repo, id, &v["updated_at"]).await,
+        StatusCode::CONFLICT
+    );
+    let none = Uuid::new_v4();
+    assert_eq!(
+        approve(&repo, none, &v["updated_at"]).await,
+        StatusCode::CONFLICT
+    );
+    let uri = format!("/vein/templates/{id}/approve");
+    let (_, e) = call_as(
+        &repo,
+        Some("admin"),
+        "POST",
+        &uri,
+        json!({ "updated_at": v["updated_at"] }),
+    )
+    .await;
+    assert_eq!(e["error"], "approve_conflict");
+}
+
+#[tokio::test]
+async fn pending_and_approve_are_admin_only() {
+    let repo = Arc::new(FakeRepo::default());
+    let (id, updated_at) = enroll_pending(&repo, "山田", 1).await;
+    let approve_uri = format!("/vein/templates/{id}/approve");
+    let body = json!({ "updated_at": updated_at });
+    // AuthUser が無い (端末の鍵) / admin 以外の role は 403
+    for role in [None, Some("user"), Some("Admin"), Some("")] {
+        let (status, v) = call_as(&repo, role, "GET", "/vein/templates/pending", Value::Null).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role:?}");
+        assert_eq!(v["error"], "forbidden");
+        let (status, _) = call_as(&repo, role, "POST", &approve_uri, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role:?}");
+    }
+    // 403 では承認されない
+    let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
+    assert_eq!(v["templates"], json!([]));
+    assert!(repo.approved_by.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pending_and_approve_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let (id, updated_at) = enroll_pending(&repo, "山田", 1).await;
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = call_as(
+        &repo,
+        Some("admin"),
+        "GET",
+        "/vein/templates/pending",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        approve(&repo, id, &updated_at).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
