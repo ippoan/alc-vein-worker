@@ -58,10 +58,17 @@ for (const t of Object.values(TENANTS)) {
   t.expected = new Set(t.employees);
 }
 
-async function call(method, path, tenant, body) {
+// 管理者のヘッダー (auth-worker が付ける X-User-*)。3 つ揃わないと AuthUser が復元されず、承認系の口は 403
+const ADMIN = {
+  "X-User-ID": "ad000000-0000-4000-8000-0000000000ad",
+  "X-User-Email": "admin@example.invalid",
+  "X-User-Role": "admin",
+};
+
+async function call(method, path, tenant, body, extra = {}) {
   const res = await fetch(`${URL_}${path}`, {
     method,
-    headers: { ...gate, "X-Tenant-ID": tenant, "content-type": "application/json" },
+    headers: { ...gate, ...extra, "X-Tenant-ID": tenant, "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await res.text();
@@ -110,6 +117,55 @@ for (let i = 0; i < Math.max(TENANTS.A.n, TENANTS.B.n); i++) {
   }
 }
 await pool(enroll, CONCURRENCY);
+
+// 1b. 登録は承認待ち: 承認するまで一覧に出ない。承認は管理者だけ・版を固定・自テナントの行だけ
+const approval = [];
+for (const [name, t] of Object.entries(TENANTS)) {
+  approval.push(async () => {
+    const r = await call("GET", "/vein/templates", t.id);
+    count(`list ${name} before approval (0)`, r.status === 200 && r.json?.templates?.length === 0, r);
+  });
+}
+await pool(approval, CONCURRENCY);
+const pending = {};
+for (const [name, t] of Object.entries(TENANTS)) {
+  const none = await call("GET", "/vein/templates/pending", t.id);
+  count(`pending ${name} without admin header (403)`, none.status === 403, none);
+  const r = await call("GET", "/vein/templates/pending", t.id, undefined, ADMIN);
+  const ids = (r.json ?? []).map((x) => x.employee_id);
+  count(
+    `pending ${name} (expect ${t.n})`,
+    r.status === 200 && ids.length === t.n && ids.every((id) => t.expected.has(id)),
+    r,
+  );
+  pending[name] = r.json ?? [];
+  const body = { updated_at: pending[name][0]?.updated_at };
+  const denied = await call("POST", `/vein/templates/${t.employees[0]}/approve`, t.id, body);
+  count(`approve ${name} without admin header (403)`, denied.status === 403, denied);
+}
+// 他テナントの行は見えない: A の管理者が B の乗務員を承認しようとしても 409 (B の版を知っていても)
+for (const [name, t, other, otherName] of [
+  ["A", TENANTS.A, TENANTS.B, "B"],
+  ["B", TENANTS.B, TENANTS.A, "A"],
+]) {
+  const body = { updated_at: pending[otherName][0]?.updated_at };
+  const r = await call("POST", `/vein/templates/${other.employees[0]}/approve`, t.id, body, ADMIN);
+  count(`cross-tenant approve ${name}→other (409)`, r.status === 409, r);
+}
+const approve = [];
+for (const [name, t] of Object.entries(TENANTS)) {
+  for (const p of pending[name]) {
+    approve.push(async () => {
+      const r = await call("POST", `/vein/templates/${p.employee_id}/approve`, t.id, { updated_at: p.updated_at }, ADMIN);
+      count(`approve ${name} (204)`, r.status === 204, r);
+    });
+  }
+}
+await pool(approve, CONCURRENCY);
+for (const [name, t] of Object.entries(TENANTS)) {
+  const r = await call("GET", "/vein/templates/pending", t.id, undefined, ADMIN);
+  count(`pending ${name} after approval (0)`, r.status === 200 && r.json?.length === 0, r);
+}
 
 // 2. 他テナントの乗務員へは登録も削除もできない (404)
 const cross = [];
