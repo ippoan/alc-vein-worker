@@ -21,10 +21,17 @@ const employeeId = (g) => {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 };
 
-async function call(method, path, body) {
+// 管理者のヘッダー (登録は承認待ちなので、照合の前に承認する)。3 つ揃わないと承認系の口は 403
+const ADMIN = {
+  "X-User-ID": "ad000000-0000-4000-8000-0000000000ad",
+  "X-User-Email": "admin@example.invalid",
+  "X-User-Role": "admin",
+};
+
+async function call(method, path, body, extra = {}) {
   const res = await fetch(`${URL_}${path}`, {
     method,
-    headers: { "X-Tenant-ID": TENANT, "content-type": "application/json" },
+    headers: { ...extra, "X-Tenant-ID": TENANT, "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   return { status: res.status, json: await res.json().catch(() => null), timing: res.headers.get("server-timing") };
@@ -39,6 +46,20 @@ await Promise.all(
       const c = hex(chara(SEED_BASE + g));
       const r = await call("PUT", `/vein/templates/${employeeId(g)}`, { charas: [c, c] });
       if (r.status !== 200) throw new Error(`enroll ${g}: ${r.status} ${JSON.stringify(r.json)}`);
+    }
+  }),
+);
+
+// 承認 (承認待ちは照合に載らない)。一覧で見た updated_at を送る
+const pending = await call("GET", "/vein/templates/pending", undefined, ADMIN);
+if (pending.status !== 200) throw new Error(`pending: ${pending.status} ${JSON.stringify(pending.json)}`);
+let approveNext = 0;
+await Promise.all(
+  Array.from({ length: 20 }, async () => {
+    while (approveNext < pending.json.length) {
+      const p = pending.json[approveNext++];
+      const r = await call("POST", `/vein/templates/${p.employee_id}/approve`, { updated_at: p.updated_at }, ADMIN);
+      if (r.status !== 204) throw new Error(`approve ${p.employee_id}: ${r.status} ${JSON.stringify(r.json)}`);
     }
   }),
 );

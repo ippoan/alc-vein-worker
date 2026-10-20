@@ -1,6 +1,6 @@
 # alc-vein-worker
 
-指静脈 (vein) の 4 本の口 (crates/alc-vein) を workers-rs + tokio-postgres で提供する Cloudflare Worker `alc-vein`。
+指静脈 (vein) の口 (crates/alc-vein。登録・照合・一覧・削除の 4 本と、管理者の承認待ちの一覧・承認の 2 本) を workers-rs + tokio-postgres で提供する Cloudflare Worker `alc-vein`。
 rust-alc-api を Cloudflare Workers へ段階移行する最初の 1 本 (Refs ippoan/rust-alc-api#680 / ippoan/rust-alc-api#683 / ippoan/rust-alc-api#691) で、
 backend (ippoan/rust-alc-api) の `workers/vein/` と `crates/alc-vein/` をこの repo へ分けた (Refs ippoan/rust-alc-api#721)。
 口・照合・trait・SQL (`repo::sql`)・repo の実装 (`pg`) は alc-vein (`crates/alc-vein`) をそのまま使い、
@@ -273,10 +273,12 @@ bash scripts/fetch-migrations.sh                # 先に要る (テストが con
 cargo test -p alc-vein --test sql_db
 ```
 
-確かめること (7 本。CI は `7 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
+確かめること (8 本。CI は `8 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
 
 - 登録 → 照合で当たる → 学習後のテンプレートが書き戻される / 同じ乗務員の登録は 1 行を上書き / 読んだ後に登録し直されていたら
   書き戻しは 0 行 / 別テナントから見えない・削除済みの乗務員の除外・DELETE の行数 (backend に在った `tests/vein_templates_test.rs` の代わり)
+- 登録は承認待ちで照合・`GET /vein/templates` に載らず、管理者が `updated_at` を固定して承認すると載る / 登録し直すと承認待ちに戻る /
+  版違い・承認済み・別テナントの承認は 409 / 管理者以外は 403 (Refs ippoan/alc-app#436)
 - `current_user` が繋いだロールであること / DB のエラーが `DbError::Other` (message と SQLSTATE) になり、失敗した transaction が
   残らないこと / 接続が切れているときの `DbError::Other`
 

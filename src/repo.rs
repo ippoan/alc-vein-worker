@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alc_core_wasm::DbError;
 use alc_vein::pg::PgVeinTemplates;
-use alc_vein::repo::{VeinTemplateRow, VeinTemplatesRepository};
+use alc_vein::repo::{PendingTemplate, VeinTemplateRow, VeinTemplatesRepository};
 use alc_worker_db::PgClient;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -102,6 +102,24 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
 
     async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
         self.timed(self.inner.list(tenant_id)).await
+    }
+
+    async fn list_pending(&self, tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError> {
+        self.timed(self.inner.list_pending(tenant_id)).await
+    }
+
+    async fn approve(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        approved_by: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DbError> {
+        self.timed(
+            self.inner
+                .approve(tenant_id, employee_id, approved_by, updated_at),
+        )
+        .await
     }
 
     async fn registration_count(

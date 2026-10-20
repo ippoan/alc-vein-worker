@@ -3,23 +3,28 @@
 //! - `PUT /vein/templates/{employee_id}` `{"charas": [hex, ...]}` → 登録し直す (キオスクからも)
 //! - `POST /vein/identify` `{"chara": hex}` → 1:N 照合 + 学習の書き戻し
 //! - `GET /vein/templates` → オフライン照合用の全件 (`logic_version` つき)
-//! - `DELETE /vein/templates/{employee_id}` → 登録の削除
+//! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下もこれ)
+//! - `GET /vein/templates/pending` → 承認待ちの一覧 (管理者だけ)
+//! - `POST /vein/templates/{employee_id}/approve` `{"updated_at": ...}` → 承認 (管理者だけ)
 //!
-//! 認可は `alc-misc` の `employees::update_face` と同じ形で `TenantId` の Extension だけを
-//! 見る。役割 (キオスクに DELETE を開かない等) は auth-worker の許可表が決める。
+//! 登録 (PUT) は経路によらず承認待ちで、照合 (identify) と `GET /vein/templates` は承認済みだけを使う
+//! (なりすまし対策。Refs ippoan/alc-app#436)。承認待ちの一覧と承認だけは `AuthUser` (`X-User-Role`) の
+//! `role == "admin"` を見る (`AuthUser` が無ければ 403)。他の口は `TenantId` の Extension だけを
+//! 見て、役割 (キオスクに DELETE を開かない等) は auth-worker の許可表が決める。
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{post, put},
+    routing::{get, post, put},
     Extension, Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use alc_core_wasm::api_error::{internal_error, not_found, unprocessable, ApiError};
-use alc_core_wasm::TenantId;
+use alc_core_wasm::{AuthUser, TenantId};
 
 use crate::matcher::{self, CharaError, MAX_TEMPLATES};
 use crate::repo::VeinTemplateItem;
@@ -27,7 +32,12 @@ use crate::VeinState;
 
 pub fn tenant_router() -> Router<VeinState> {
     Router::new()
-        .route("/vein/templates", axum::routing::get(list_templates))
+        .route("/vein/templates", get(list_templates))
+        .route("/vein/templates/pending", get(list_pending))
+        .route(
+            "/vein/templates/{employee_id}/approve",
+            post(approve_template),
+        )
         .route(
             "/vein/templates/{employee_id}",
             put(upsert_template).delete(delete_template),
@@ -41,12 +51,32 @@ struct UpsertBody {
 }
 
 #[derive(Deserialize)]
+struct ApproveBody {
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
 struct IdentifyBody {
     chara: String,
 }
 
 fn chara_error(e: CharaError) -> ApiError {
     unprocessable(e.code(), e.message())
+}
+
+/// 承認系の口の認可。`AuthUser` が無い (端末の鍵など) か `role != "admin"` なら 403。
+/// 返すのは承認した管理者の user_id。
+fn require_admin(user: Option<Extension<AuthUser>>) -> Result<Uuid, ApiError> {
+    match user {
+        Some(Extension(u)) if u.role == "admin" => Ok(u.user_id),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "forbidden",
+                "message": "管理者だけが使えます",
+            })),
+        )),
+    }
 }
 
 async fn upsert_template(
@@ -143,6 +173,47 @@ async fn list_templates(
         "logic_version": vein_match_search::VERSION,
         "templates": templates,
     })))
+}
+
+async fn list_pending(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    user: Option<Extension<AuthUser>>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(user)?;
+    let pending = state
+        .templates
+        .list_pending(tenant_id)
+        .await
+        .map_err(|e| internal_error("vein list_pending", e))?;
+    Ok(Json(json!(pending)))
+}
+
+async fn approve_template(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    user: Option<Extension<AuthUser>>,
+    Path(employee_id): Path<Uuid>,
+    Json(body): Json<ApproveBody>,
+) -> Result<StatusCode, ApiError> {
+    let approved_by = require_admin(user)?;
+    let approved = state
+        .templates
+        .approve(tenant_id, employee_id, approved_by, body.updated_at)
+        .await
+        .map_err(|e| internal_error("vein approve_template", e))?;
+    if approved {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        // 版が違う (登録し直された) か、承認待ちでない (承認済み・登録が無い)
+        Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "approve_conflict",
+                "message": "承認待ちの登録が変わっています。一覧を読み直してください",
+            })),
+        ))
+    }
 }
 
 async fn delete_template(

@@ -30,7 +30,7 @@ mod embedded;
 
 use std::sync::Arc;
 
-use alc_core_wasm::{DbError, TenantId};
+use alc_core_wasm::{AuthUser, DbError, TenantId};
 use alc_vein::matcher::{self, synth};
 use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::VeinTemplatesRepository;
@@ -48,7 +48,7 @@ fn hex(seed: u64) -> String {
     synth::hex(&synth::chara(seed))
 }
 
-/// 口 (`routes::tenant_router`) を `tenant_id` で叩く。
+/// 口 (`routes::tenant_router`) を `tenant_id` で叩く (端末の鍵 = `AuthUser` 無し)。
 async fn send(
     repo: &Arc<PgVeinTemplates>,
     tenant_id: Uuid,
@@ -56,12 +56,34 @@ async fn send(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    send_as(repo, tenant_id, None, method, uri, body).await
+}
+
+/// `role` が `Some` なら、tenant_header が復元する `AuthUser` を付けて叩く (user_id は `admin_id()`)。
+async fn send_as(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    role: Option<&str>,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
     };
-    let app = tenant_router()
+    let mut app = tenant_router()
         .with_state(state)
         .layer(Extension(TenantId(tenant_id)));
+    if let Some(role) = role {
+        app = app.layer(Extension(AuthUser {
+            user_id: admin_id(),
+            email: "admin@example.com".to_string(),
+            name: String::new(),
+            tenant_id,
+            tenant_slug: None,
+            role: role.to_string(),
+        }));
+    }
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -88,6 +110,46 @@ async fn put_template(
     let body = json!({ "charas": [hex(seed), hex(seed)] });
     let uri = format!("/vein/templates/{employee_id}");
     send(repo, tenant_id, "PUT", &uri, Some(body)).await
+}
+
+/// 承認する管理者の user_id。
+fn admin_id() -> Uuid {
+    Uuid::from_u128(0xAD)
+}
+
+/// 登録して管理者が承認する (照合・一覧に載る)。PUT の結果を返す。
+async fn put_approved(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    seed: u64,
+) -> (StatusCode, Value) {
+    let (status, put) = put_template(repo, tenant_id, employee_id, seed).await;
+    if status == StatusCode::OK {
+        let (approved, _) = approve(repo, tenant_id, employee_id, &put["updated_at"]).await;
+        assert_eq!(approved, StatusCode::NO_CONTENT, "{put}");
+    }
+    (status, put)
+}
+
+/// 管理者として承認する。
+async fn approve(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    updated_at: &Value,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{employee_id}/approve");
+    let body = json!({ "updated_at": updated_at });
+    send_as(repo, tenant_id, Some("admin"), "POST", &uri, Some(body)).await
+}
+
+/// 管理者として承認待ちの一覧を読む。
+async fn pending(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid) -> Value {
+    let uri = "/vein/templates/pending";
+    let (status, v) = send_as(repo, tenant_id, Some("admin"), "GET", uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v
 }
 
 async fn identify(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid, seed: u64) -> Value {
@@ -127,11 +189,11 @@ async fn enroll_identify_writes_back_learned_template() {
     let repo = db.repo(APP_ROLE).await;
     let r = &repo.inner;
 
-    let (status, put) = put_template(r, t, yamada, 11).await;
+    let (status, put) = put_approved(r, t, yamada, 11).await;
     assert_eq!(status, StatusCode::OK, "{put}");
     assert_eq!(put["employee_id"], yamada.to_string());
     assert!(put["updated_at"].is_string());
-    assert_eq!(put_template(r, t, suzuki, 12).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, t, suzuki, 12).await.0, StatusCode::OK);
 
     let before = list(r, t).await;
     assert_eq!(before["logic_version"], "0.1.1");
@@ -171,8 +233,8 @@ async fn put_upserts_one_row_per_employee() {
     let repo = db.repo(APP_ROLE).await;
     let r = &repo.inner;
 
-    assert_eq!(put_template(r, t, yamada, 21).await.0, StatusCode::OK);
-    assert_eq!(put_template(r, t, yamada, 22).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, t, yamada, 21).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, t, yamada, 22).await.0, StatusCode::OK);
     assert_eq!(templates(&list(r, t).await).len(), 1);
     assert_eq!(identify(r, t, 22).await["employee_id"], yamada.to_string());
     assert_eq!(identify(r, t, 21).await["employee_id"], Value::Null);
@@ -200,11 +262,11 @@ async fn update_learned_discards_on_conflict() {
     let repo = db.repo(APP_ROLE).await;
     let r = &repo.inner;
 
-    assert_eq!(put_template(r, t, yamada, 31).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, t, yamada, 31).await.0, StatusCode::OK);
     let read = r.list(t).await.unwrap().remove(0);
 
     // 間に登録し直し (updated_at が進む)
-    assert_eq!(put_template(r, t, yamada, 32).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, t, yamada, 32).await.0, StatusCode::OK);
     let written = r
         .update_learned(t, read.id, "stale", read.updated_at)
         .await
@@ -238,8 +300,8 @@ async fn tenant_isolation_and_deleted_employees() {
     prep.close().await;
     let repo = db.repo(APP_ROLE).await;
     let r = &repo.inner;
-    assert_eq!(put_template(r, a, yamada, 41).await.0, StatusCode::OK);
-    assert_eq!(put_template(r, a, tanaka, 42).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, a, yamada, 41).await.0, StatusCode::OK);
+    assert_eq!(put_approved(r, a, tanaka, 42).await.0, StatusCode::OK);
 
     assert_eq!(list(r, b).await["templates"], json!([]));
     assert_eq!(identify(r, b, 41).await, json!({ "employee_id": null }));
@@ -289,6 +351,104 @@ async fn tenant_isolation_and_deleted_employees() {
     db.shutdown();
 }
 
+/// 登録は承認待ちで、照合にも一覧にも載らない。管理者が `updated_at` を固定して承認すると載る。
+/// 登録し直すと承認待ちに戻り、別テナントからは承認できず、管理者以外は 403。
+#[tokio::test(flavor = "multi_thread")]
+async fn registration_is_pending_until_an_admin_approves() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Approval Tenant A").await;
+    let b = tenant(&mut prep.inner, "Vein Approval Tenant B").await;
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+
+    // 登録 (端末の鍵) は承認待ち。照合にも一覧にも出ず、承認待ちの一覧に出る (テンプレートは返さない)
+    let (status, put) = put_template(r, a, yamada, 51).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(identify(r, a, 51).await, json!({ "employee_id": null }));
+    assert_eq!(list(r, a).await["templates"], json!([]));
+    let waiting = pending(r, a).await;
+    assert_eq!(
+        waiting,
+        json!([{ "employee_id": yamada, "updated_at": put["updated_at"] }])
+    );
+    // 承認待ちも人数に数える (上限の判定)
+    assert_eq!(r.registration_count(a, yamada).await.unwrap(), (1, true));
+
+    // 管理者以外 (AuthUser 無し・admin 以外) は一覧も承認も 403 で、承認されない
+    let approve_uri = format!("/vein/templates/{yamada}/approve");
+    let body = json!({ "updated_at": put["updated_at"] });
+    for role in [None, Some("user")] {
+        let uri = "/vein/templates/pending";
+        assert_eq!(
+            send_as(r, a, role, "GET", uri, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let sent = send_as(r, a, role, "POST", &approve_uri, Some(body.clone())).await;
+        assert_eq!(sent.0, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(list(r, a).await["templates"], json!([]));
+
+    // 別テナントの管理者は承認できない (0 行 → 409)
+    assert_eq!(
+        approve(r, b, yamada, &put["updated_at"]).await.0,
+        StatusCode::CONFLICT
+    );
+    // 古い updated_at は 409。登録し直しても承認待ちのまま
+    let (_, again) = put_template(r, a, yamada, 52).await;
+    assert_ne!(again["updated_at"], put["updated_at"]);
+    let stale = approve(r, a, yamada, &put["updated_at"]).await;
+    assert_eq!(stale.0, StatusCode::CONFLICT);
+    assert_eq!(stale.1["error"], "approve_conflict");
+    assert_eq!(identify(r, a, 52).await, json!({ "employee_id": null }));
+
+    // 一致する updated_at で承認すると照合・一覧に載り、承認待ちから消える
+    let ok = approve(r, a, yamada, &again["updated_at"]).await;
+    assert_eq!(ok.0, StatusCode::NO_CONTENT);
+    assert_eq!(identify(r, a, 52).await["employee_id"], yamada.to_string());
+    assert_eq!(templates(&list(r, a).await).len(), 1);
+    assert_eq!(pending(r, a).await, json!([]));
+    // 承認済みの再承認は 409
+    let twice = approve(r, a, yamada, &again["updated_at"]).await;
+    assert_eq!(twice.0, StatusCode::CONFLICT);
+
+    // 承認済みの乗務員を登録し直すと承認待ちに戻り、照合から外れる
+    let (_, third) = put_template(r, a, yamada, 53).await;
+    assert_eq!(identify(r, a, 53).await, json!({ "employee_id": null }));
+    assert_eq!(list(r, a).await["templates"], json!([]));
+    assert_eq!(pending(r, a).await[0]["updated_at"], third["updated_at"]);
+    // 承認待ちの却下は DELETE
+    let path = format!("/vein/templates/{yamada}");
+    assert_eq!(
+        send(r, a, "DELETE", &path, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(pending(r, a).await, json!([]));
+
+    // approved_by に承認した管理者が残る (承認し直して superuser で読む)
+    let (_, fourth) = put_template(r, a, yamada, 54).await;
+    assert_eq!(
+        approve(r, a, yamada, &fourth["updated_at"]).await.0,
+        StatusCode::NO_CONTENT
+    );
+    repo.close().await;
+    let su = db.superuser().await;
+    let row = su
+        .inner
+        .query_one(
+            "SELECT approved_by, approved_at IS NOT NULL FROM alc_api.vein_templates WHERE employee_id = $1",
+            &[&yamada],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<Uuid>>(0), Some(admin_id()));
+    assert!(row.get::<_, bool>(1));
+    su.close().await;
+    db.shutdown();
+}
+
 /// `current_user` は繋いだロール (表の所有者でない方)。
 #[tokio::test(flavor = "multi_thread")]
 async fn current_user_is_the_app_role() {
@@ -318,7 +478,8 @@ async fn db_error_becomes_other_with_sqlstate() {
     );
     // 同じ接続で次のメソッドが通る (ROLLBACK 済み)
     assert_eq!(r.list(t).await.unwrap(), vec![]);
-    assert!(r.upsert(t, yamada, "ok").await.unwrap().is_some());
+    let at = r.upsert(t, yamada, "ok").await.unwrap().unwrap();
+    assert!(r.approve(t, yamada, admin_id(), at).await.unwrap());
     let row = r.list(t).await.unwrap().remove(0);
     let err = r
         .update_learned(t, row.id, "a\0b", row.updated_at)
@@ -331,7 +492,7 @@ async fn db_error_becomes_other_with_sqlstate() {
     assert_eq!(r.list(t).await.unwrap(), vec![row]);
     repo.close().await;
 
-    // 表の権限を持たないロールで繋いだ repo は、5 メソッドとも 42501
+    // 表の権限を持たないロールで繋いだ repo は、7 メソッドとも 42501
     let repo = db.repo("anon").await;
     let r = &repo.inner;
     assert_eq!(r.current_user().await.as_deref(), Some("anon"));
@@ -345,6 +506,9 @@ async fn db_error_becomes_other_with_sqlstate() {
             .unwrap_err()
     ));
     assert!(denied(r.delete(t, yamada).await.unwrap_err()));
+    assert!(denied(r.list_pending(t).await.unwrap_err()));
+    let denied_approve = r.approve(t, yamada, admin_id(), chrono::Utc::now()).await;
+    assert!(denied(denied_approve.unwrap_err()));
     repo.close().await;
     db.shutdown();
 }
@@ -375,6 +539,9 @@ async fn closed_connection_becomes_other() {
         Err(DbError::Other(_))
     ));
     assert!(matches!(repo.delete(t, t).await, Err(DbError::Other(_))));
+    assert!(matches!(repo.list_pending(t).await, Err(DbError::Other(_))));
+    let approved = repo.approve(t, t, t, chrono::Utc::now()).await;
+    assert!(matches!(approved, Err(DbError::Other(_))));
     assert_eq!(repo.current_user().await, None);
     drop(repo);
     db.shutdown();
