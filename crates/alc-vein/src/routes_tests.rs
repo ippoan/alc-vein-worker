@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -16,8 +17,9 @@ use uuid::Uuid;
 use alc_core_wasm::{AuthUser, DbError, TenantId};
 
 use super::tenant_router;
+use super::{MAX_MODULE_RECORDS, MAX_MODULE_RECORD_BYTES};
 use crate::matcher::{synth, MAX_TEMPLATES};
-use crate::repo::{ApprovalItem, VeinTemplateRow, VeinTemplatesRepository};
+use crate::repo::{ApprovalItem, VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE};
 use crate::VeinState;
 
 /// fake の repo。`employees` に居る乗務員だけ登録でき、`fail` で全メソッドが DB エラー、
@@ -28,6 +30,8 @@ struct FakeRepo {
     rows: Mutex<Vec<VeinTemplateRow>>,
     /// 承認待ちの乗務員 (`rows` のうち `list` に出さないもの)。
     pending: Mutex<Vec<Uuid>>,
+    /// `rows` のうち形式が module の乗務員 (それ以外は chara)。
+    modules: Mutex<Vec<Uuid>>,
     /// 承認した管理者の user_id (承認した順)。
     approved_by: Mutex<Vec<Uuid>>,
     fail: AtomicBool,
@@ -69,6 +73,7 @@ impl VeinTemplatesRepository for FakeRepo {
         _tenant_id: Uuid,
         employee_id: Uuid,
         template: &str,
+        format: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         self.check()?;
         if self.fail_upsert.load(Ordering::SeqCst) {
@@ -88,6 +93,12 @@ impl VeinTemplatesRepository for FakeRepo {
             template: template.to_string(),
             updated_at: now,
         });
+        // 形式も上書きする
+        let mut modules = self.modules.lock().unwrap();
+        modules.retain(|e| *e != employee_id);
+        if format == FORMAT_MODULE {
+            modules.push(employee_id);
+        }
         // 登録は上書きも承認待ち
         let mut pending = self.pending.lock().unwrap();
         pending.retain(|e| *e != employee_id);
@@ -95,13 +106,17 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(Some(now))
     }
 
-    async fn list(&self, _tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
+    async fn list(&self, _tenant_id: Uuid, format: &str) -> Result<Vec<VeinTemplateRow>, DbError> {
         self.check()?;
         let pending = self.pending.lock().unwrap();
+        let modules = self.modules.lock().unwrap();
         let rows = self.rows.lock().unwrap();
         Ok(rows
             .iter()
-            .filter(|r| !pending.contains(&r.employee_id))
+            .filter(|r| {
+                !pending.contains(&r.employee_id)
+                    && modules.contains(&r.employee_id) == (format == FORMAT_MODULE)
+            })
             .cloned()
             .collect())
     }
@@ -149,11 +164,17 @@ impl VeinTemplatesRepository for FakeRepo {
         &self,
         _tenant_id: Uuid,
         employee_id: Uuid,
+        format: &str,
     ) -> Result<(i64, bool), DbError> {
         self.check()?;
+        let modules = self.modules.lock().unwrap();
         let rows = self.rows.lock().unwrap();
-        let enrolled = rows.iter().any(|r| r.employee_id == employee_id);
-        Ok((rows.len() as i64, enrolled))
+        let of_format: Vec<_> = rows
+            .iter()
+            .filter(|r| modules.contains(&r.employee_id) == (format == FORMAT_MODULE))
+            .collect();
+        let enrolled = of_format.iter().any(|r| r.employee_id == employee_id);
+        Ok((of_format.len() as i64, enrolled))
     }
 
     async fn update_learned(
@@ -693,4 +714,132 @@ async fn pending_and_approve_db_error_is_500() {
         approve(&repo, id, &updated_at).await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+/// 長さ `n` バイトの記録 (中身は何でもよい) の base64。
+fn record(n: usize) -> String {
+    STANDARD.encode(vec![0xA5u8; n])
+}
+
+/// `PUT /vein/templates/{id}/module` を端末の鍵で叩く。
+async fn put_module(repo: &Arc<FakeRepo>, id: Uuid, record: &str) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/module");
+    call(repo, "PUT", &uri, json!({ "record": record })).await
+}
+
+#[tokio::test]
+async fn put_module_stores_the_record_as_is_and_is_pending() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = repo.add_employee("山田");
+    let rec = record(MAX_MODULE_RECORD_BYTES);
+    let (status, v) = put_module(&repo, id, &rec).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["employee_id"], id.to_string());
+    assert!(v["updated_at"].is_string());
+    // base64 のまま・module の行として入り、承認待ち (一覧に出ない)
+    assert_eq!(repo.template_of(id), rec);
+    assert_eq!(*repo.modules.lock().unwrap(), vec![id]);
+    let (_, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(v["templates"], json!([]));
+}
+
+#[tokio::test]
+async fn put_module_rejects_bad_base64_empty_and_too_long() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = repo.add_employee("山田");
+    for rec in ["not base64!", ""] {
+        let (status, v) = put_module(&repo, id, rec).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rec:?}");
+        assert_eq!(v["error"], "invalid_module_record");
+    }
+    let (status, v) = put_module(&repo, id, &record(MAX_MODULE_RECORD_BYTES + 1)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "module_record_too_long");
+    assert!(repo.rows.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn put_module_unknown_employee_is_404_and_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = Uuid::new_v4();
+    let (status, v) = put_module(&repo, id, &record(8)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"], "employee_not_found");
+    repo.fail_upsert.store(true, Ordering::SeqCst);
+    assert_eq!(
+        put_module(&repo, id, &record(8)).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        put_module(&repo, id, &record(8)).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn put_module_new_employee_at_91_is_409_but_overwrite_and_chara_rows_pass() {
+    let repo = Arc::new(FakeRepo::default());
+    // chara の行は module の人数に数えない
+    fill_rows(&repo, MAX_TEMPLATES);
+    let mut last = Uuid::nil();
+    for i in 0..MAX_MODULE_RECORDS {
+        last = repo.add_employee(&format!("m{i}"));
+        assert_eq!(put_module(&repo, last, &record(8)).await.0, StatusCode::OK);
+    }
+    let over = repo.add_employee("92 人目");
+    let (status, v) = put_module(&repo, over, &record(8)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], "too_many_module_records");
+    assert!(v["message"].as_str().unwrap().contains("91"));
+    // 既に module の行がある乗務員の上書きは通る
+    assert_eq!(put_module(&repo, last, &record(9)).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn module_rows_stay_out_of_identify_and_the_chara_list() {
+    let repo = Arc::new(FakeRepo::default());
+    let chara_id = enroll(&repo, "山田", 1).await;
+    let id = repo.add_employee("鈴木");
+    let (_, put) = put_module(&repo, id, &record(64)).await;
+    assert_eq!(
+        approve(&repo, id, &put["updated_at"]).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // 承認済みの module 行は module の一覧にだけ出る (形式を問わない承認・一覧は両方を扱う)
+    let (status, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v,
+        json!({ "templates": [{
+            "employee_id": id,
+            "record": record(64),
+            "updated_at": put["updated_at"],
+        }] })
+    );
+    let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
+    assert_eq!(v["templates"].as_array().unwrap().len(), 1);
+    assert_eq!(v["templates"][0]["employee_id"], chara_id.to_string());
+    let (_, v) = call(&repo, "POST", "/vein/identify", json!({ "chara": hex(1) })).await;
+    assert_eq!(v["employee_id"], chara_id.to_string());
+    assert_eq!(repo.learned_calls.lock().unwrap().len(), 1);
+
+    // chara で登録し直すと chara に戻り、module の一覧から外れる
+    let body = json!({ "charas": [hex(2), hex(2)] });
+    assert_eq!(
+        call(&repo, "PUT", &format!("/vein/templates/{id}"), body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(repo.modules.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_module_templates_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }

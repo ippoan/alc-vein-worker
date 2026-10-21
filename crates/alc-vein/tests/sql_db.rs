@@ -33,7 +33,7 @@ use std::sync::Arc;
 use alc_core_wasm::{AuthUser, DbError, TenantId};
 use alc_vein::matcher::{self, synth};
 use alc_vein::pg::PgVeinTemplates;
-use alc_vein::repo::VeinTemplatesRepository;
+use alc_vein::repo::{VeinTemplatesRepository, FORMAT_CHARA, FORMAT_MODULE};
 use alc_vein::routes::tenant_router;
 use alc_vein::VeinState;
 use axum::body::Body;
@@ -281,7 +281,7 @@ async fn update_learned_discards_on_conflict() {
     let r = &repo.inner;
 
     assert_eq!(put_approved(r, t, yamada, 31).await.0, StatusCode::OK);
-    let read = r.list(t).await.unwrap().remove(0);
+    let read = r.list(t, FORMAT_CHARA).await.unwrap().remove(0);
 
     // 間に登録し直し (updated_at が進む)
     assert_eq!(put_approved(r, t, yamada, 32).await.0, StatusCode::OK);
@@ -290,7 +290,7 @@ async fn update_learned_discards_on_conflict() {
         .await
         .unwrap();
     assert!(!written);
-    let now = r.list(t).await.unwrap().remove(0);
+    let now = r.list(t, FORMAT_CHARA).await.unwrap().remove(0);
     assert_ne!(now.template, "stale");
 
     // 読んだ値のままなら書ける
@@ -299,7 +299,7 @@ async fn update_learned_discards_on_conflict() {
         .await
         .unwrap();
     assert!(written);
-    let fresh = r.list(t).await.unwrap().remove(0);
+    let fresh = r.list(t, FORMAT_CHARA).await.unwrap().remove(0);
     assert_eq!(fresh.template, "fresh");
     assert!(fresh.updated_at > now.updated_at);
     repo.close().await;
@@ -344,9 +344,9 @@ async fn tenant_isolation_and_deleted_employees() {
         StatusCode::NOT_FOUND
     );
     // PUT の上限判定の人数も削除済みを数えない (identify と同じ条件)
-    let counted = r.registration_count(a, yamada).await;
+    let counted = r.registration_count(a, yamada, FORMAT_CHARA).await;
     assert_eq!(counted.unwrap(), (1, true));
-    let counted = r.registration_count(a, tanaka).await;
+    let counted = r.registration_count(a, tanaka, FORMAT_CHARA).await;
     assert_eq!(counted.unwrap(), (1, false));
 
     // テンプレートの削除: 204 → 2 回目は 404。別テナントからは消せない
@@ -451,7 +451,10 @@ async fn registration_is_pending_until_an_admin_approves() {
         json!([{ "employee_id": yamada, "updated_at": put["updated_at"] }])
     );
     // 承認待ちも人数に数える (上限の判定)
-    assert_eq!(r.registration_count(a, yamada).await.unwrap(), (1, true));
+    assert_eq!(
+        r.registration_count(a, yamada, FORMAT_CHARA).await.unwrap(),
+        (1, true)
+    );
 
     // 管理者以外 (AuthUser 無し・admin 以外) は一覧も承認も 403 で、承認されない
     let approve_uri = format!("/vein/templates/{yamada}/approve");
@@ -524,6 +527,102 @@ async fn registration_is_pending_until_an_admin_approves() {
     db.shutdown();
 }
 
+/// モジュールの記録 (`template_format = 'module'`) は、形式の列で chara の行と分かれる:
+/// module の一覧にだけ出て (承認済みだけ)、identify・`GET /vein/templates`・chara の人数には載らない。
+/// 承認・承認待ちの一覧・削除は形式を問わず、chara で登録し直すと chara に戻る。
+#[tokio::test(flavor = "multi_thread")]
+async fn module_records_are_kept_apart_from_chara_rows() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Module Tenant A").await;
+    let b = tenant(&mut prep.inner, "Vein Module Tenant B").await;
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let suzuki = employee(&mut prep.inner, a, "鈴木").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    let rec = "AAECAw==";
+    let put_module = |employee_id: Uuid, record: &'static str| async move {
+        let uri = format!("/vein/templates/{employee_id}/module");
+        send(r, a, "PUT", &uri, Some(json!({ "record": record }))).await
+    };
+    let module_list = || async {
+        let (status, v) = send(r, a, "GET", "/vein/module-templates", None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        v
+    };
+
+    // chara の山田 (承認済み) と module の鈴木 (承認待ち)
+    assert_eq!(put_approved(r, a, yamada, 71).await.0, StatusCode::OK);
+    let (status, put) = put_module(suzuki, rec).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    // 承認待ちの module は module の一覧に出ず、承認待ちの一覧には形式を問わず出る
+    assert_eq!(module_list().await["templates"], json!([]));
+    assert_eq!(pending(r, a).await[0]["employee_id"], suzuki.to_string());
+    // 人数は形式ごと (承認待ちを含む)
+    assert_eq!(
+        r.registration_count(a, suzuki, FORMAT_MODULE)
+            .await
+            .unwrap(),
+        (1, true)
+    );
+    assert_eq!(
+        r.registration_count(a, yamada, FORMAT_MODULE)
+            .await
+            .unwrap(),
+        (1, false)
+    );
+    assert_eq!(
+        r.registration_count(a, suzuki, FORMAT_CHARA).await.unwrap(),
+        (1, false)
+    );
+
+    // 承認すると module の一覧に record をそのまま載せて出る。chara の一覧・identify には出ない
+    assert_eq!(
+        approve(r, a, suzuki, &put["updated_at"]).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        module_list().await,
+        json!({ "templates": [{
+            "employee_id": suzuki,
+            "record": rec,
+            "updated_at": put["updated_at"],
+        }] })
+    );
+    let chara_list = list(r, a).await;
+    assert_eq!(templates(&chara_list).len(), 1);
+    assert_eq!(templates(&chara_list)[0]["employee_id"], yamada.to_string());
+    assert_eq!(identify(r, a, 71).await["employee_id"], yamada.to_string());
+    assert_eq!(approved(r, a).await.as_array().unwrap().len(), 2);
+
+    // 別テナントには出ない
+    let (_, other) = send(r, b, "GET", "/vein/module-templates", None).await;
+    assert_eq!(other["templates"], json!([]));
+
+    // module の山田への登録し直しは module に変わり、承認待ちに戻って chara の一覧から外れる
+    let (status, _) = put_module(yamada, rec).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list(r, a).await["templates"], json!([]));
+    assert_eq!(identify(r, a, 71).await, json!({ "employee_id": null }));
+    // chara で登録し直すと chara に戻る
+    assert_eq!(put_approved(r, a, yamada, 72).await.0, StatusCode::OK);
+    assert_eq!(identify(r, a, 72).await["employee_id"], yamada.to_string());
+    assert_eq!(
+        module_list().await["templates"].as_array().unwrap().len(),
+        1
+    );
+
+    // 削除は形式を問わず管理者だけ
+    assert_eq!(
+        delete_as_admin(r, a, suzuki).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(module_list().await["templates"], json!([]));
+    repo.close().await;
+    db.shutdown();
+}
+
 /// `current_user` は繋いだロール (表の所有者でない方)。
 #[tokio::test(flavor = "multi_thread")]
 async fn current_user_is_the_app_role() {
@@ -546,16 +645,20 @@ async fn db_error_becomes_other_with_sqlstate() {
     let r = &repo.inner;
 
     // NUL バイト入りの template は DB が弾く (22021 character_not_in_repertoire)
-    let err = r.upsert(t, yamada, "a\0b").await.unwrap_err();
+    let err = r.upsert(t, yamada, "a\0b", FORMAT_CHARA).await.unwrap_err();
     assert!(
         matches!(&err, DbError::Other(m) if m.ends_with("(22021)")),
         "{err:?}"
     );
     // 同じ接続で次のメソッドが通る (ROLLBACK 済み)
-    assert_eq!(r.list(t).await.unwrap(), vec![]);
-    let at = r.upsert(t, yamada, "ok").await.unwrap().unwrap();
+    assert_eq!(r.list(t, FORMAT_CHARA).await.unwrap(), vec![]);
+    let at = r
+        .upsert(t, yamada, "ok", FORMAT_CHARA)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(r.approve(t, yamada, admin_id(), at).await.unwrap());
-    let row = r.list(t).await.unwrap().remove(0);
+    let row = r.list(t, FORMAT_CHARA).await.unwrap().remove(0);
     let err = r
         .update_learned(t, row.id, "a\0b", row.updated_at)
         .await
@@ -564,7 +667,7 @@ async fn db_error_becomes_other_with_sqlstate() {
         matches!(&err, DbError::Other(m) if m.ends_with("(22021)")),
         "{err:?}"
     );
-    assert_eq!(r.list(t).await.unwrap(), vec![row]);
+    assert_eq!(r.list(t, FORMAT_CHARA).await.unwrap(), vec![row]);
     repo.close().await;
 
     // 表の権限を持たないロールで繋いだ repo は、7 メソッドとも 42501
@@ -572,9 +675,15 @@ async fn db_error_becomes_other_with_sqlstate() {
     let r = &repo.inner;
     assert_eq!(r.current_user().await.as_deref(), Some("anon"));
     let denied = |e: DbError| matches!(&e, DbError::Other(m) if m.ends_with("(42501)"));
-    assert!(denied(r.list(t).await.unwrap_err()));
-    assert!(denied(r.registration_count(t, yamada).await.unwrap_err()));
-    assert!(denied(r.upsert(t, yamada, "x").await.unwrap_err()));
+    assert!(denied(r.list(t, FORMAT_CHARA).await.unwrap_err()));
+    assert!(denied(
+        r.registration_count(t, yamada, FORMAT_CHARA)
+            .await
+            .unwrap_err()
+    ));
+    assert!(denied(
+        r.upsert(t, yamada, "x", FORMAT_CHARA).await.unwrap_err()
+    ));
     assert!(denied(
         r.update_learned(t, Uuid::new_v4(), "x", chrono::Utc::now())
             .await
@@ -596,17 +705,17 @@ async fn closed_connection_becomes_other() {
     assert_eq!(repo.inner.current_user().await.as_deref(), Some(APP_ROLE));
     let repo = repo.sever().await;
     let t = Uuid::new_v4();
-    let err = repo.list(t).await.unwrap_err();
+    let err = repo.list(t, FORMAT_CHARA).await.unwrap_err();
     assert!(
         matches!(&err, DbError::Other(m) if m == "connection closed"),
         "{err:?}"
     );
     assert!(matches!(
-        repo.upsert(t, t, "x").await,
+        repo.upsert(t, t, "x", FORMAT_CHARA).await,
         Err(DbError::Other(_))
     ));
     assert!(matches!(
-        repo.registration_count(t, t).await,
+        repo.registration_count(t, t, FORMAT_CHARA).await,
         Err(DbError::Other(_))
     ));
     assert!(matches!(

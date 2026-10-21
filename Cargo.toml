@@ -9,7 +9,7 @@
 # ippoan/rust-alc-api#723)。
 [package]
 name = "alc-vein-worker"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 

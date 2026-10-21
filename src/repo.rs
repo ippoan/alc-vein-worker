@@ -95,13 +95,14 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         tenant_id: Uuid,
         employee_id: Uuid,
         template: &str,
+        format: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
-        self.timed(self.inner.upsert(tenant_id, employee_id, template))
+        self.timed(self.inner.upsert(tenant_id, employee_id, template, format))
             .await
     }
 
-    async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
-        self.timed(self.inner.list(tenant_id)).await
+    async fn list(&self, tenant_id: Uuid, format: &str) -> Result<Vec<VeinTemplateRow>, DbError> {
+        self.timed(self.inner.list(tenant_id, format)).await
     }
 
     async fn list_by_approval(
@@ -131,9 +132,13 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         &self,
         tenant_id: Uuid,
         employee_id: Uuid,
+        format: &str,
     ) -> Result<(i64, bool), DbError> {
-        self.timed(self.inner.registration_count(tenant_id, employee_id))
-            .await
+        self.timed(
+            self.inner
+                .registration_count(tenant_id, employee_id, format),
+        )
+        .await
     }
 
     async fn update_learned(
