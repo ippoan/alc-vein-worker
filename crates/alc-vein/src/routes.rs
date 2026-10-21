@@ -3,14 +3,15 @@
 //! - `PUT /vein/templates/{employee_id}` `{"charas": [hex, ...]}` → 登録し直す (キオスクからも)
 //! - `POST /vein/identify` `{"chara": hex}` → 1:N 照合 + 学習の書き戻し
 //! - `GET /vein/templates` → オフライン照合用の全件 (`logic_version` つき)
-//! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下もこれ)
+//! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下・承認済みの削除もこれ。管理者だけ)
 //! - `GET /vein/templates/pending` → 承認待ちの一覧 (管理者だけ)
+//! - `GET /vein/templates/approved` → 承認済みの一覧 (管理者だけ。テンプレートは返さない)
 //! - `POST /vein/templates/{employee_id}/approve` `{"updated_at": ...}` → 承認 (管理者だけ)
 //!
 //! 登録 (PUT) は経路によらず承認待ちで、照合 (identify) と `GET /vein/templates` は承認済みだけを使う
-//! (なりすまし対策。Refs ippoan/alc-app#436)。承認待ちの一覧と承認だけは `AuthUser` (`X-User-Role`) の
+//! (なりすまし対策。Refs ippoan/alc-app#436)。承認待ち・承認済みの一覧と承認と削除は `AuthUser` (`X-User-Role`) の
 //! `role == "admin"` を見る (`AuthUser` が無ければ 403)。他の口は `TenantId` の Extension だけを
-//! 見て、役割 (キオスクに DELETE を開かない等) は auth-worker の許可表が決める。
+//! 見て、役割 (キオスクに開く口) は auth-worker の許可表が決める。
 
 use axum::{
     extract::{Path, State},
@@ -34,6 +35,7 @@ pub fn tenant_router() -> Router<VeinState> {
     Router::new()
         .route("/vein/templates", get(list_templates))
         .route("/vein/templates/pending", get(list_pending))
+        .route("/vein/templates/approved", get(list_approved))
         .route(
             "/vein/templates/{employee_id}/approve",
             post(approve_template),
@@ -64,7 +66,7 @@ fn chara_error(e: CharaError) -> ApiError {
     unprocessable(e.code(), e.message())
 }
 
-/// 承認系の口の認可。`AuthUser` が無い (端末の鍵など) か `role != "admin"` なら 403。
+/// 管理者だけの口 (承認・一覧・削除) の認可。`AuthUser` が無い (端末の鍵など) か `role != "admin"` なら 403。
 /// 返すのは承認した管理者の user_id。
 fn require_admin(user: Option<Extension<AuthUser>>) -> Result<Uuid, ApiError> {
     match user {
@@ -176,17 +178,35 @@ async fn list_templates(
 }
 
 async fn list_pending(
+    state: State<VeinState>,
+    tenant: Extension<TenantId>,
+    user: Option<Extension<AuthUser>>,
+) -> Result<Json<Value>, ApiError> {
+    list_by_approval(state, tenant, user, false).await
+}
+
+async fn list_approved(
+    state: State<VeinState>,
+    tenant: Extension<TenantId>,
+    user: Option<Extension<AuthUser>>,
+) -> Result<Json<Value>, ApiError> {
+    list_by_approval(state, tenant, user, true).await
+}
+
+/// 承認待ち (`approved` = false) か承認済み (true) の一覧。管理者だけ。
+async fn list_by_approval(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     user: Option<Extension<AuthUser>>,
+    approved: bool,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(user)?;
-    let pending = state
+    let items = state
         .templates
-        .list_pending(tenant_id)
+        .list_by_approval(tenant_id, approved)
         .await
-        .map_err(|e| internal_error("vein list_pending", e))?;
-    Ok(Json(json!(pending)))
+        .map_err(|e| internal_error("vein list_by_approval", e))?;
+    Ok(Json(json!(items)))
 }
 
 async fn approve_template(
@@ -219,8 +239,10 @@ async fn approve_template(
 async fn delete_template(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
+    user: Option<Extension<AuthUser>>,
     Path(employee_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(user)?;
     let deleted = state
         .templates
         .delete(tenant_id, employee_id)

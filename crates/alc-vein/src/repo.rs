@@ -28,10 +28,10 @@ pub struct VeinTemplateItem {
     pub updated_at: DateTime<Utc>,
 }
 
-/// `GET /vein/templates/pending` の 1 件 (承認待ち。テンプレートは返さない)。
-/// `updated_at` は承認の版 (`POST .../approve` の body に同じ値を返す)。
+/// `GET /vein/templates/pending` と `GET /vein/templates/approved` の 1 件 (テンプレートは返さない)。
+/// 承認待ちの `updated_at` は承認の版 (`POST .../approve` の body に同じ値を返す)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PendingTemplate {
+pub struct ApprovalItem {
     pub employee_id: Uuid,
     pub updated_at: DateTime<Utc>,
 }
@@ -67,11 +67,12 @@ pub mod sql {
     WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NOT NULL
     ORDER BY v.created_at, v.id"#;
 
-    /// 承認待ちの一覧 (削除済みの乗務員を除く、古い順)。テンプレートは返さない。$1 tenant_id → employee_id, updated_at。
-    pub const LIST_PENDING: &str = r#"SELECT v.employee_id, v.updated_at
+    /// 承認待ち ($2 = false) か承認済み ($2 = true) の一覧 (削除済みの乗務員を除く、古い順)。テンプレートは返さない。
+    /// $1 tenant_id / $2 承認済みか → employee_id, updated_at。
+    pub const LIST_BY_APPROVAL: &str = r#"SELECT v.employee_id, v.updated_at
     FROM vein_templates v
     JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
-    WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NULL
+    WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND (v.approved_at IS NOT NULL) = $2
     ORDER BY v.updated_at, v.id"#;
 
     /// 承認する。$4 = 一覧で見た updated_at のままで、承認待ちのときだけ (版の固定)。
@@ -109,8 +110,12 @@ pub trait VeinTemplatesRepository: Send + Sync {
     /// テナントの承認済みのテンプレート (削除済みの乗務員を除く)。並びは登録順。
     async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError>;
 
-    /// 承認待ちの一覧 (古い順)。
-    async fn list_pending(&self, tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError>;
+    /// `approved` = false なら承認待ち、true なら承認済みの一覧 (古い順)。
+    async fn list_by_approval(
+        &self,
+        tenant_id: Uuid,
+        approved: bool,
+    ) -> Result<Vec<ApprovalItem>, DbError>;
 
     /// 承認する。`updated_at` が一致し承認待ちのときだけ承認して `Ok(true)`、そうでなければ `Ok(false)` (409 に写す)。
     async fn approve(

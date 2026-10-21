@@ -49,7 +49,7 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 - **DB の検査と coverage の gate を弱めない。** `crates/alc-vein/tests/sql_db.rs` は、テストの中で起こす組み込みの PostgreSQL
   (`pglite-oxide`) に流す。migration が未取得 (`container/.alc-migrations` が無い) なら失敗する作り
   (skip にしない・`#[ignore]` にしない)。`repo::sql` の定数・`pg.rs` の引数の型・`alc-worker-db` の rev を変えたら、このテストを通す。
-  CI は本数を固定して回す (`ci.yml` の `8 passed`。テストを減らさない)。CI がテストを走らせるのは coverage の計測の 1 回だけ
+  CI は本数を固定して回す (`ci.yml` の `9 passed`。テストを減らさない)。CI がテストを走らせるのは coverage の計測の 1 回だけ
   (素の `cargo test` の step は無い — dev-dependency を 2 回 compile しないため。step を分けて計測から外さない)。
   `coverage_100.toml` の 4 ファイル (`matcher.rs`・`routes.rs`・`repo.rs`・`pg.rs`) は行カバレッジ 100% (登録を外さない)。
   RLS が実際に行を止めることの確かめは ippoan/alc-migrations の CI (`ci/check_rls_rows.sql`) が持ち、この repo では確かめない

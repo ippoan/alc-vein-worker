@@ -17,7 +17,7 @@ use alc_core_wasm::{AuthUser, DbError, TenantId};
 
 use super::tenant_router;
 use crate::matcher::{synth, MAX_TEMPLATES};
-use crate::repo::{PendingTemplate, VeinTemplateRow, VeinTemplatesRepository};
+use crate::repo::{ApprovalItem, VeinTemplateRow, VeinTemplatesRepository};
 use crate::VeinState;
 
 /// fake の repo。`employees` に居る乗務員だけ登録でき、`fail` で全メソッドが DB エラー、
@@ -106,14 +106,18 @@ impl VeinTemplatesRepository for FakeRepo {
             .collect())
     }
 
-    async fn list_pending(&self, _tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError> {
+    async fn list_by_approval(
+        &self,
+        _tenant_id: Uuid,
+        approved: bool,
+    ) -> Result<Vec<ApprovalItem>, DbError> {
         self.check()?;
         let pending = self.pending.lock().unwrap();
         let rows = self.rows.lock().unwrap();
         Ok(rows
             .iter()
-            .filter(|r| pending.contains(&r.employee_id))
-            .map(|r| PendingTemplate {
+            .filter(|r| pending.contains(&r.employee_id) != approved)
+            .map(|r| ApprovalItem {
                 employee_id: r.employee_id,
                 updated_at: r.updated_at,
             })
@@ -412,14 +416,30 @@ async fn delete_removes_then_404_and_db_error_is_500() {
     let repo = Arc::new(FakeRepo::default());
     let id = enroll(&repo, "山田", 1).await;
     let uri = format!("/vein/templates/{id}");
-    let (status, _) = call(&repo, "DELETE", &uri, Value::Null).await;
+    let admin = Some("admin");
+    let (status, _) = call_as(&repo, admin, "DELETE", &uri, Value::Null).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, v) = call(&repo, "DELETE", &uri, Value::Null).await;
+    let (status, v) = call_as(&repo, admin, "DELETE", &uri, Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"], "vein_template_not_found");
     repo.fail.store(true, Ordering::SeqCst);
-    let (status, _) = call(&repo, "DELETE", &uri, Value::Null).await;
+    let (status, _) = call_as(&repo, admin, "DELETE", &uri, Value::Null).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn delete_is_admin_only() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enroll(&repo, "山田", 1).await;
+    let uri = format!("/vein/templates/{id}");
+    // AuthUser が無い (端末の鍵) / admin 以外の role は 403 で、消えない
+    for role in [None, Some("user"), Some("Admin"), Some("")] {
+        let (status, v) = call_as(&repo, role, "DELETE", &uri, Value::Null).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role:?}");
+        assert_eq!(v["error"], "forbidden");
+    }
+    let (_, v) = call(&repo, "POST", "/vein/identify", json!({ "chara": hex(1) })).await;
+    assert_eq!(v, json!({ "employee_id": id, "name": "山田" }));
 }
 
 /// 登録済みを `n` 人ぶん (テンプレートの中身は PUT の判定に関係しないので空) 並べる。
@@ -596,6 +616,63 @@ async fn pending_and_approve_are_admin_only() {
     let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
     assert_eq!(v["templates"], json!([]));
     assert!(repo.approved_by.lock().unwrap().is_empty());
+}
+
+/// 管理者として `GET /vein/templates/{which}` (pending / approved) を叩く。
+async fn list_as_admin(repo: &Arc<FakeRepo>, which: &str) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{which}");
+    call_as(repo, Some("admin"), "GET", &uri, Value::Null).await
+}
+
+#[tokio::test]
+async fn approved_lists_only_approved_without_templates() {
+    let repo = Arc::new(FakeRepo::default());
+    let (pending_id, pending_at) = enroll_pending(&repo, "山田", 1).await;
+    let (approved_id, approved_at) = enroll_pending(&repo, "鈴木", 2).await;
+    assert_eq!(
+        approve(&repo, approved_id, &approved_at).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // 承認済みだけが、employee_id と updated_at の 2 つだけで出る (テンプレートは返さない)
+    let (status, v) = list_as_admin(&repo, "approved").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v,
+        json!([{ "employee_id": approved_id, "updated_at": approved_at }])
+    );
+    // pending は今までどおり承認待ちだけ
+    let (status, v) = list_as_admin(&repo, "pending").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v,
+        json!([{ "employee_id": pending_id, "updated_at": pending_at }])
+    );
+
+    // 承認済みを消すと一覧から消える
+    let uri = format!("/vein/templates/{approved_id}");
+    let (status, _) = call_as(&repo, Some("admin"), "DELETE", &uri, Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(list_as_admin(&repo, "approved").await.1, json!([]));
+}
+
+#[tokio::test]
+async fn approved_is_admin_only_and_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enroll(&repo, "山田", 1).await;
+    for role in [None, Some("user"), Some("Admin"), Some("")] {
+        let (status, v) =
+            call_as(&repo, role, "GET", "/vein/templates/approved", Value::Null).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role:?}");
+        assert_eq!(v["error"], "forbidden");
+    }
+    assert_eq!(
+        list_as_admin(&repo, "approved").await.1[0]["employee_id"],
+        id.to_string()
+    );
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = list_as_admin(&repo, "approved").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
