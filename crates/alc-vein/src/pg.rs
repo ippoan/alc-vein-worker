@@ -21,10 +21,10 @@ use futures_util::lock::Mutex;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
-use crate::repo::{sql, PendingTemplate, VeinTemplateRow, VeinTemplatesRepository};
+use crate::repo::{sql, ApprovalItem, VeinTemplateRow, VeinTemplatesRepository};
 
 impl TxOutput for VeinTemplateRow {}
-impl TxOutput for PendingTemplate {}
+impl TxOutput for ApprovalItem {}
 
 /// [`sql::UPSERT`]。`Ok(None)` = そのテナントに生きている乗務員が居ない。
 pub async fn upsert(
@@ -66,17 +66,21 @@ pub async fn list(
         .collect())
 }
 
-/// [`sql::LIST_PENDING`]。
-pub async fn list_pending(
+/// [`sql::LIST_BY_APPROVAL`]。
+pub async fn list_by_approval(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
-) -> Result<Vec<PendingTemplate>, tokio_postgres::Error> {
+    approved: bool,
+) -> Result<Vec<ApprovalItem>, tokio_postgres::Error> {
     let rows = tx
-        .query_typed(sql::LIST_PENDING, &[(&tenant_id, Type::UUID)])
+        .query_typed(
+            sql::LIST_BY_APPROVAL,
+            &[(&tenant_id, Type::UUID), (&approved, Type::BOOL)],
+        )
         .await?;
     Ok(rows
         .into_iter()
-        .map(|r| PendingTemplate {
+        .map(|r| ApprovalItem {
             employee_id: r.get(0),
             updated_at: r.get(1),
         })
@@ -215,11 +219,15 @@ impl VeinTemplatesRepository for PgVeinTemplates {
             .map_err(db_err)
     }
 
-    async fn list_pending(&self, tenant_id: Uuid) -> Result<Vec<PendingTemplate>, DbError> {
+    async fn list_by_approval(
+        &self,
+        tenant_id: Uuid,
+        approved: bool,
+    ) -> Result<Vec<ApprovalItem>, DbError> {
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { list_pending(tx, tenant_id).await })
+                Box::pin(async move { list_by_approval(tx, tenant_id, approved).await })
             })
             .await
             .map_err(db_err)

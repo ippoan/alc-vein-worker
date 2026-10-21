@@ -152,6 +152,24 @@ async fn pending(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid) -> Value {
     v
 }
 
+/// 管理者として承認済みの一覧を読む。
+async fn approved(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid) -> Value {
+    let uri = "/vein/templates/approved";
+    let (status, v) = send_as(repo, tenant_id, Some("admin"), "GET", uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v
+}
+
+/// 管理者として登録を消す (DELETE は管理者だけ)。
+async fn delete_as_admin(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{employee_id}");
+    send_as(repo, tenant_id, Some("admin"), "DELETE", &uri, None).await
+}
+
 async fn identify(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid, seed: u64) -> Value {
     let body = json!({ "chara": hex(seed) });
     let (status, v) = send(repo, tenant_id, "POST", "/vein/identify", Some(body)).await;
@@ -332,21 +350,79 @@ async fn tenant_isolation_and_deleted_employees() {
     assert_eq!(counted.unwrap(), (1, false));
 
     // テンプレートの削除: 204 → 2 回目は 404。別テナントからは消せない
-    let path = format!("/vein/templates/{yamada}");
+    // (別テナントへは管理者でも 404。403 で先に止まると RLS を見なくなるので管理者を付ける)
+    assert_eq!(delete_as_admin(r, b, yamada).await.0, StatusCode::NOT_FOUND);
     assert_eq!(
-        send(r, b, "DELETE", &path, None).await.0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        send(r, a, "DELETE", &path, None).await.0,
+        delete_as_admin(r, a, yamada).await.0,
         StatusCode::NO_CONTENT
     );
-    let (status, v) = send(r, a, "DELETE", &path, None).await;
+    let (status, v) = delete_as_admin(r, a, yamada).await;
     assert_eq!(
         (status, v["error"].clone()),
         (StatusCode::NOT_FOUND, json!("vein_template_not_found"))
     );
     assert_eq!(list(r, a).await["templates"], json!([]));
+    repo.close().await;
+    db.shutdown();
+}
+
+/// 承認済みの一覧は承認済みだけを (テンプレートなしで) 返し、別テナント・削除済みの乗務員は載せない。
+/// 管理者以外は 403 で、DELETE も管理者だけ (承認済みの削除で一覧から消える)。
+#[tokio::test(flavor = "multi_thread")]
+async fn approved_list_and_admin_only_delete() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Approved Tenant A").await;
+    let b = tenant(&mut prep.inner, "Vein Approved Tenant B").await;
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let tanaka = employee(&mut prep.inner, a, "田中").await;
+    let sato = employee(&mut prep.inner, a, "佐藤").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+
+    // 承認済み 2 人 (山田・田中) と承認待ち 1 人 (佐藤)
+    let (_, yamada_put) = put_approved(r, a, yamada, 61).await;
+    assert_eq!(put_approved(r, a, tanaka, 62).await.0, StatusCode::OK);
+    assert_eq!(put_template(r, a, sato, 63).await.0, StatusCode::OK);
+
+    // 承認済みだけが employee_id と updated_at の 2 つで出る。承認待ちは pending のまま
+    let listed = approved(r, a).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(listed[0]["employee_id"], yamada.to_string());
+    assert_eq!(listed[0]["updated_at"], yamada_put["updated_at"]);
+    assert_eq!(listed[0].as_object().unwrap().len(), 2);
+    assert_eq!(pending(r, a).await[0]["employee_id"], sato.to_string());
+    assert_eq!(approved(r, b).await, json!([]));
+
+    // 管理者以外 (AuthUser 無し・admin 以外) は一覧も DELETE も 403 で、何も消えない
+    let path = format!("/vein/templates/{yamada}");
+    for role in [None, Some("user")] {
+        let uri = "/vein/templates/approved";
+        assert_eq!(
+            send_as(r, a, role, "GET", uri, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send_as(r, a, role, "DELETE", &path, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(approved(r, a).await.as_array().unwrap().len(), 2);
+
+    // 乗務員の削除 (soft delete) で一覧から消え、承認済みの DELETE でも消える
+    repo.close().await;
+    let mut prep = db.client(APP_ROLE).await;
+    soft_delete_employee(&mut prep.inner, a, tanaka).await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    assert_eq!(approved(r, a).await.as_array().unwrap().len(), 1);
+    assert_eq!(
+        delete_as_admin(r, a, yamada).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(approved(r, a).await, json!([]));
     repo.close().await;
     db.shutdown();
 }
@@ -420,9 +496,8 @@ async fn registration_is_pending_until_an_admin_approves() {
     assert_eq!(list(r, a).await["templates"], json!([]));
     assert_eq!(pending(r, a).await[0]["updated_at"], third["updated_at"]);
     // 承認待ちの却下は DELETE
-    let path = format!("/vein/templates/{yamada}");
     assert_eq!(
-        send(r, a, "DELETE", &path, None).await.0,
+        delete_as_admin(r, a, yamada).await.0,
         StatusCode::NO_CONTENT
     );
     assert_eq!(pending(r, a).await, json!([]));
@@ -506,7 +581,7 @@ async fn db_error_becomes_other_with_sqlstate() {
             .unwrap_err()
     ));
     assert!(denied(r.delete(t, yamada).await.unwrap_err()));
-    assert!(denied(r.list_pending(t).await.unwrap_err()));
+    assert!(denied(r.list_by_approval(t, false).await.unwrap_err()));
     let denied_approve = r.approve(t, yamada, admin_id(), chrono::Utc::now()).await;
     assert!(denied(denied_approve.unwrap_err()));
     repo.close().await;
@@ -539,7 +614,8 @@ async fn closed_connection_becomes_other() {
         Err(DbError::Other(_))
     ));
     assert!(matches!(repo.delete(t, t).await, Err(DbError::Other(_))));
-    assert!(matches!(repo.list_pending(t).await, Err(DbError::Other(_))));
+    let by_approval = repo.list_by_approval(t, true).await;
+    assert!(matches!(by_approval, Err(DbError::Other(_))));
     let approved = repo.approve(t, t, t, chrono::Utc::now()).await;
     assert!(matches!(approved, Err(DbError::Other(_))));
     assert_eq!(repo.current_user().await, None);

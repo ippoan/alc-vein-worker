@@ -179,7 +179,7 @@ for (const [name, t, other] of [
     count(`cross-tenant PUT ${name}→other (404)`, r.status === 404, r);
   });
   cross.push(async () => {
-    const r = await call("DELETE", `/vein/templates/${other.employees[0]}`, t.id);
+    const r = await call("DELETE", `/vein/templates/${other.employees[0]}`, t.id, undefined, ADMIN);
     count(`cross-tenant DELETE ${name}→other (404)`, r.status === 404, r);
   });
 }
