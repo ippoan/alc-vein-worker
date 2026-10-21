@@ -273,7 +273,7 @@ bash scripts/fetch-migrations.sh                # 先に要る (テストが con
 cargo test -p alc-vein --test sql_db
 ```
 
-確かめること (9 本。CI は `9 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
+確かめること (10 本。CI は `10 passed; 0 failed; 0 ignored` を固定で見るので、減らすと落ちる):
 
 - 登録 → 照合で当たる → 学習後のテンプレートが書き戻される / 同じ乗務員の登録は 1 行を上書き / 読んだ後に登録し直されていたら
   書き戻しは 0 行 / 別テナントから見えない・削除済みの乗務員の除外・DELETE の行数 (backend に在った `tests/vein_templates_test.rs` の代わり)
@@ -281,6 +281,9 @@ cargo test -p alc-vein --test sql_db
   版違い・承認済み・別テナントの承認は 409 / 管理者以外は 403 (Refs ippoan/alc-app#436)
 - 承認済みの一覧 `GET /vein/templates/approved` は承認済みだけを `employee_id` と `updated_at` で返し (テンプレートは返さない)、別テナント・
   削除済みの乗務員を載せない / 一覧と `DELETE /vein/templates/{employee_id}` は管理者だけ (管理者以外は 403)。管理者が付いた別テナントへの DELETE は 404
+- モジュールの記録 (`PUT /vein/templates/{employee_id}/module`、`template_format = 'module'`、alc-migrations 182) は形式の列で
+  chara の行と分かれる: 承認済みだけが `GET /vein/module-templates` に出て、identify・`GET /vein/templates`・chara の人数には載らない /
+  形式を問わず承認・削除でき、chara で登録し直すと chara に戻る / 人数は形式ごと (module は 91 人まで。口の 409 は `routes_tests.rs`) (Refs ippoan/alc-app#436)
 - `current_user` が繋いだロールであること / DB のエラーが `DbError::Other` (message と SQLSTATE) になり、失敗した transaction が
   残らないこと / 接続が切れているときの `DbError::Other`
 

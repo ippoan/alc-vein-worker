@@ -1,12 +1,18 @@
-//! 指静脈テンプレートの 4 本の口 (Refs ippoan/vein-match#20)。
+//! 指静脈テンプレートの口 (Refs ippoan/vein-match#20)。
 //!
 //! - `PUT /vein/templates/{employee_id}` `{"charas": [hex, ...]}` → 登録し直す (キオスクからも)
+//! - `PUT /vein/templates/{employee_id}/module` `{"record": base64}` → 端末のモジュールの記録全体を預かる
+//! - `GET /vein/module-templates` → 承認済みのモジュールの記録の一覧 (端末が書き戻して、モジュール自身に照合させる)
 //! - `POST /vein/identify` `{"chara": hex}` → 1:N 照合 + 学習の書き戻し
 //! - `GET /vein/templates` → オフライン照合用の全件 (`logic_version` つき)
 //! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下・承認済みの削除もこれ。管理者だけ)
 //! - `GET /vein/templates/pending` → 承認待ちの一覧 (管理者だけ)
 //! - `GET /vein/templates/approved` → 承認済みの一覧 (管理者だけ。テンプレートは返さない)
 //! - `POST /vein/templates/{employee_id}/approve` `{"updated_at": ...}` → 承認 (管理者だけ)
+//!
+//! モジュールの記録 (`template_format = 'module'`) はサーバーで作り直さず・照合もしない: 検査は base64 と長さだけで、
+//! 中身は解釈しない (生体データなのでログにも出さない)。`chara` の行 (identify・`GET /vein/templates`) とは
+//! 形式の列で分け、identify の候補・学習の書き戻し・旧一覧には載せない。
 //!
 //! 登録 (PUT) は経路によらず承認待ちで、照合 (identify) と `GET /vein/templates` は承認済みだけを使う
 //! (なりすまし対策。Refs ippoan/alc-app#436)。承認待ち・承認済みの一覧と承認と削除は `AuthUser` (`X-User-Role`) の
@@ -27,18 +33,31 @@ use uuid::Uuid;
 use alc_core_wasm::api_error::{internal_error, not_found, unprocessable, ApiError};
 use alc_core_wasm::{AuthUser, TenantId};
 
+use base64::{engine::general_purpose::STANDARD, Engine};
+
 use crate::matcher::{self, CharaError, MAX_TEMPLATES};
-use crate::repo::VeinTemplateItem;
+use crate::repo::{ModuleRecordItem, VeinTemplateItem, FORMAT_CHARA, FORMAT_MODULE};
 use crate::VeinState;
+
+/// モジュールの記録 1 件の大きさの上限 (バイト。モジュールの READ_ENROLL の全体は実機で 8156 バイト)。
+pub const MAX_MODULE_RECORD_BYTES: usize = 0x2000;
+
+/// テナントのモジュールの記録の人数の上限 (端末のモジュールの本番の ID は 10〜100 の 91 個)。
+pub const MAX_MODULE_RECORDS: usize = 91;
 
 pub fn tenant_router() -> Router<VeinState> {
     Router::new()
         .route("/vein/templates", get(list_templates))
+        .route("/vein/module-templates", get(list_module_templates))
         .route("/vein/templates/pending", get(list_pending))
         .route("/vein/templates/approved", get(list_approved))
         .route(
             "/vein/templates/{employee_id}/approve",
             post(approve_template),
+        )
+        .route(
+            "/vein/templates/{employee_id}/module",
+            put(upsert_module_record),
         )
         .route(
             "/vein/templates/{employee_id}",
@@ -50,6 +69,11 @@ pub fn tenant_router() -> Router<VeinState> {
 #[derive(Deserialize)]
 struct UpsertBody {
     charas: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ModuleRecordBody {
+    record: String,
 }
 
 #[derive(Deserialize)]
@@ -102,7 +126,7 @@ async fn upsert_template(
     // 新規登録で上限を超えさせない (上書きは人数が増えないので通す)
     let (registered, enrolled) = state
         .templates
-        .registration_count(tenant_id, employee_id)
+        .registration_count(tenant_id, employee_id, FORMAT_CHARA)
         .await
         .map_err(|e| internal_error("vein registration_count", e))?;
     matcher::check_capacity(registered as usize + usize::from(!enrolled)).map_err(|_| {
@@ -111,9 +135,51 @@ async fn upsert_template(
     })?;
     let updated_at = state
         .templates
-        .upsert(tenant_id, employee_id, &template)
+        .upsert(tenant_id, employee_id, &template, FORMAT_CHARA)
         .await
         .map_err(|e| internal_error("vein upsert_template", e))?
+        .ok_or_else(|| not_found("employee_not_found"))?;
+    Ok(Json(
+        json!({ "employee_id": employee_id, "updated_at": updated_at }),
+    ))
+}
+
+/// 端末のモジュールの記録を base64 のまま預かる。検査は base64 として読めることと長さ (1〜[`MAX_MODULE_RECORD_BYTES`]
+/// バイト) だけ。新規の登録 (その乗務員がまだ module の行を持たない) で [`MAX_MODULE_RECORDS`] 人を超えるなら 409。
+async fn upsert_module_record(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(employee_id): Path<Uuid>,
+    Json(body): Json<ModuleRecordBody>,
+) -> Result<Json<Value>, ApiError> {
+    let len = STANDARD
+        .decode(&body.record)
+        .map_err(|_| unprocessable("invalid_module_record", "記録が base64 として読めません"))?
+        .len();
+    if len == 0 {
+        return Err(unprocessable("invalid_module_record", "記録が空です"));
+    }
+    if len > MAX_MODULE_RECORD_BYTES {
+        let message = format!("記録が大きすぎます ({MAX_MODULE_RECORD_BYTES} バイトまで)");
+        return Err(unprocessable("module_record_too_long", &message));
+    }
+    let (registered, enrolled) = state
+        .templates
+        .registration_count(tenant_id, employee_id, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein module registration_count", e))?;
+    if !enrolled && registered as usize >= MAX_MODULE_RECORDS {
+        let message = format!("モジュールの記録が上限の {MAX_MODULE_RECORDS} 人に達しています");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "too_many_module_records", "message": message })),
+        ));
+    }
+    let updated_at = state
+        .templates
+        .upsert(tenant_id, employee_id, &body.record, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein upsert_module_record", e))?
         .ok_or_else(|| not_found("employee_not_found"))?;
     Ok(Json(
         json!({ "employee_id": employee_id, "updated_at": updated_at }),
@@ -128,7 +194,7 @@ async fn identify(
     let chara = matcher::decode_chara(&body.chara).map_err(chara_error)?;
     let rows = state
         .templates
-        .list(tenant_id)
+        .list(tenant_id, FORMAT_CHARA)
         .await
         .map_err(|e| internal_error("vein identify list", e))?;
     let templates: Vec<&str> = rows.iter().map(|r| r.template.as_str()).collect();
@@ -167,7 +233,7 @@ async fn list_templates(
 ) -> Result<Json<Value>, ApiError> {
     let rows = state
         .templates
-        .list(tenant_id)
+        .list(tenant_id, FORMAT_CHARA)
         .await
         .map_err(|e| internal_error("vein list_templates", e))?;
     let templates: Vec<VeinTemplateItem> = rows.into_iter().map(Into::into).collect();
@@ -175,6 +241,20 @@ async fn list_templates(
         "logic_version": vein_match_search::VERSION,
         "templates": templates,
     })))
+}
+
+/// 承認済みのモジュールの記録の一覧 (端末のモジュールへ書き戻す元)。
+async fn list_module_templates(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+) -> Result<Json<Value>, ApiError> {
+    let rows = state
+        .templates
+        .list(tenant_id, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein list_module_templates", e))?;
+    let templates: Vec<ModuleRecordItem> = rows.into_iter().map(Into::into).collect();
+    Ok(Json(json!({ "templates": templates })))
 }
 
 async fn list_pending(

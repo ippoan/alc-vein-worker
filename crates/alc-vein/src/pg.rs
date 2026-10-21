@@ -32,6 +32,7 @@ pub async fn upsert(
     tenant_id: Uuid,
     employee_id: Uuid,
     template: &str,
+    format: &str,
 ) -> Result<Option<DateTime<Utc>>, tokio_postgres::Error> {
     let row = tx
         .query_typed_opt(
@@ -40,6 +41,7 @@ pub async fn upsert(
                 (&tenant_id, Type::UUID),
                 (&employee_id, Type::UUID),
                 (&template, Type::TEXT),
+                (&format, Type::TEXT),
             ],
         )
         .await?;
@@ -50,9 +52,13 @@ pub async fn upsert(
 pub async fn list(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
+    format: &str,
 ) -> Result<Vec<VeinTemplateRow>, tokio_postgres::Error> {
     let rows = tx
-        .query_typed(sql::LIST, &[(&tenant_id, Type::UUID)])
+        .query_typed(
+            sql::LIST,
+            &[(&tenant_id, Type::UUID), (&format, Type::TEXT)],
+        )
         .await?;
     Ok(rows
         .into_iter()
@@ -114,11 +120,16 @@ pub async fn registration_count(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
     employee_id: Uuid,
+    format: &str,
 ) -> Result<(i64, bool), tokio_postgres::Error> {
     let row = tx
         .query_typed_one(
             sql::REGISTRATION_COUNT,
-            &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID)],
+            &[
+                (&tenant_id, Type::UUID),
+                (&employee_id, Type::UUID),
+                (&format, Type::TEXT),
+            ],
         )
         .await?;
     Ok((row.get(0), row.get(1)))
@@ -198,22 +209,27 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         tenant_id: Uuid,
         employee_id: Uuid,
         template: &str,
+        format: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         let template = template.to_owned();
+        let format = format.to_owned();
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { upsert(tx, tenant_id, employee_id, &template).await })
+                Box::pin(
+                    async move { upsert(tx, tenant_id, employee_id, &template, &format).await },
+                )
             })
             .await
             .map_err(db_err)
     }
 
-    async fn list(&self, tenant_id: Uuid) -> Result<Vec<VeinTemplateRow>, DbError> {
+    async fn list(&self, tenant_id: Uuid, format: &str) -> Result<Vec<VeinTemplateRow>, DbError> {
+        let format = format.to_owned();
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { list(tx, tenant_id).await })
+                Box::pin(async move { list(tx, tenant_id, &format).await })
             })
             .await
             .map_err(db_err)
@@ -255,11 +271,15 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         &self,
         tenant_id: Uuid,
         employee_id: Uuid,
+        format: &str,
     ) -> Result<(i64, bool), DbError> {
+        let format = format.to_owned();
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { registration_count(tx, tenant_id, employee_id).await })
+                Box::pin(
+                    async move { registration_count(tx, tenant_id, employee_id, &format).await },
+                )
             })
             .await
             .map_err(db_err)
