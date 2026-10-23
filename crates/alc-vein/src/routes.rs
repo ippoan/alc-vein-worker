@@ -21,7 +21,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post, put},
     Extension, Json, Router,
 };
@@ -135,7 +135,7 @@ async fn upsert_template(
     })?;
     let updated_at = state
         .templates
-        .upsert(tenant_id, employee_id, &template, FORMAT_CHARA)
+        .upsert(tenant_id, employee_id, &template, FORMAT_CHARA, None)
         .await
         .map_err(|e| internal_error("vein upsert_template", e))?
         .ok_or_else(|| not_found("employee_not_found"))?;
@@ -144,14 +144,38 @@ async fn upsert_template(
     ))
 }
 
+/// 登録した端末の id を載せるヘッダ。auth-worker が端末の token で来た要求にだけ付ける (token の sub)。
+const DEVICE_ID_HEADER: &str = "x-device-id";
+const MAX_DEVICE_ID_LEN: usize = 64;
+
+/// `X-Device-Id` を読む。無ければ `None`。1〜64 文字の `[A-Za-z0-9:_-]` 以外は 422 `invalid_device_id`。
+fn registered_device_id(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(DEVICE_ID_HEADER) else {
+        return Ok(None);
+    };
+    let valid = value.to_str().ok().filter(|s| {
+        (1..=MAX_DEVICE_ID_LEN).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+    });
+    valid.map(|s| Some(s.to_owned())).ok_or_else(|| {
+        unprocessable(
+            "invalid_device_id",
+            "X-Device-Id は 1〜64 文字の英数字と : _ - だけで送ってください",
+        )
+    })
+}
+
 /// 端末のモジュールの記録を base64 のまま預かる。検査は base64 として読めることと長さ (1〜[`MAX_MODULE_RECORD_BYTES`]
 /// バイト) だけ。新規の登録 (その乗務員がまだ module の行を持たない) で [`MAX_MODULE_RECORDS`] 人を超えるなら 409。
 async fn upsert_module_record(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Path(employee_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<ModuleRecordBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let device_id = registered_device_id(&headers)?;
     let len = STANDARD
         .decode(&body.record)
         .map_err(|_| unprocessable("invalid_module_record", "記録が base64 として読めません"))?
@@ -177,7 +201,13 @@ async fn upsert_module_record(
     }
     let updated_at = state
         .templates
-        .upsert(tenant_id, employee_id, &body.record, FORMAT_MODULE)
+        .upsert(
+            tenant_id,
+            employee_id,
+            &body.record,
+            FORMAT_MODULE,
+            device_id.as_deref(),
+        )
         .await
         .map_err(|e| internal_error("vein upsert_module_record", e))?
         .ok_or_else(|| not_found("employee_not_found"))?;

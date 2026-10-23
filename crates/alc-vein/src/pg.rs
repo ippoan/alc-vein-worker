@@ -33,6 +33,7 @@ pub async fn upsert(
     employee_id: Uuid,
     template: &str,
     format: &str,
+    registered_device_id: Option<&str>,
 ) -> Result<Option<DateTime<Utc>>, tokio_postgres::Error> {
     let row = tx
         .query_typed_opt(
@@ -42,6 +43,7 @@ pub async fn upsert(
                 (&employee_id, Type::UUID),
                 (&template, Type::TEXT),
                 (&format, Type::TEXT),
+                (&registered_device_id, Type::TEXT),
             ],
         )
         .await?;
@@ -68,6 +70,7 @@ pub async fn list(
             name: r.get(2),
             template: r.get(3),
             updated_at: r.get(4),
+            registered_device_id: r.get(5),
         })
         .collect())
 }
@@ -210,15 +213,25 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         employee_id: Uuid,
         template: &str,
         format: &str,
+        registered_device_id: Option<&str>,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         let template = template.to_owned();
         let format = format.to_owned();
+        let registered_device_id = registered_device_id.map(str::to_owned);
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(
-                    async move { upsert(tx, tenant_id, employee_id, &template, &format).await },
-                )
+                Box::pin(async move {
+                    upsert(
+                        tx,
+                        tenant_id,
+                        employee_id,
+                        &template,
+                        &format,
+                        registered_device_id.as_deref(),
+                    )
+                    .await
+                })
             })
             .await
             .map_err(db_err)
