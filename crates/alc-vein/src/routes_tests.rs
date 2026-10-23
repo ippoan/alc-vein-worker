@@ -19,7 +19,10 @@ use alc_core_wasm::{AuthUser, DbError, TenantId};
 use super::tenant_router;
 use super::{MAX_MODULE_RECORDS, MAX_MODULE_RECORD_BYTES};
 use crate::matcher::{synth, MAX_TEMPLATES};
-use crate::repo::{ApprovalItem, VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE};
+use crate::repo::{
+    ApprovalItem, ApproveByEmployee, PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository,
+    FORMAT_MODULE,
+};
 use crate::VeinState;
 
 /// fake の repo。`employees` に居る乗務員だけ登録でき、`fail` で全メソッドが DB エラー、
@@ -34,6 +37,10 @@ struct FakeRepo {
     modules: Mutex<Vec<Uuid>>,
     /// 承認した管理者の user_id (承認した順)。
     approved_by: Mutex<Vec<Uuid>>,
+    /// role に manager か admin を持つ乗務員。
+    managers: Mutex<Vec<Uuid>>,
+    /// 運行管理者として承認された (対象, 承認者)。
+    approved_by_employee: Mutex<Vec<(Uuid, Uuid)>>,
     fail: AtomicBool,
     /// upsert だけを DB エラーにする (人数の数えは通す)。
     fail_upsert: AtomicBool,
@@ -160,6 +167,65 @@ impl VeinTemplatesRepository for FakeRepo {
         pending.retain(|e| *e != employee_id);
         self.approved_by.lock().unwrap().push(approved_by);
         Ok(true)
+    }
+
+    async fn list_pending_modules(
+        &self,
+        _tenant_id: Uuid,
+    ) -> Result<Vec<PendingModuleItem>, DbError> {
+        self.check()?;
+        let pending = self.pending.lock().unwrap();
+        let modules = self.modules.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .iter()
+            .filter(|r| pending.contains(&r.employee_id) && modules.contains(&r.employee_id))
+            .map(|r| PendingModuleItem {
+                employee_id: r.employee_id,
+                name: r.name.clone(),
+                updated_at: r.updated_at,
+                registered_device_id: r.registered_device_id.clone(),
+            })
+            .collect())
+    }
+
+    async fn approve_by_employee(
+        &self,
+        _tenant_id: Uuid,
+        employee_id: Uuid,
+        approver_employee_id: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<ApproveByEmployee, DbError> {
+        self.check()?;
+        if !self
+            .managers
+            .lock()
+            .unwrap()
+            .contains(&approver_employee_id)
+        {
+            return Ok(ApproveByEmployee::ApproverNotManager);
+        }
+        let mut pending = self.pending.lock().unwrap();
+        let modules = self.modules.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
+        let enrolled = rows.iter().any(|r| r.employee_id == approver_employee_id)
+            && modules.contains(&approver_employee_id)
+            && !pending.contains(&approver_employee_id);
+        if !enrolled {
+            return Ok(ApproveByEmployee::ApproverNotEnrolled);
+        }
+        let version_matches = rows
+            .iter()
+            .any(|r| r.employee_id == employee_id && r.updated_at == updated_at);
+        if !version_matches || !pending.contains(&employee_id) {
+            return Ok(ApproveByEmployee::Conflict);
+        }
+        pending.retain(|e| *e != employee_id);
+        self.approved_by_employee
+            .lock()
+            .unwrap()
+            .push((employee_id, approver_employee_id));
+        Ok(ApproveByEmployee::Approved)
     }
 
     async fn registration_count(
@@ -942,5 +1008,149 @@ async fn list_module_templates_db_error_is_500() {
     let repo = Arc::new(FakeRepo::default());
     repo.fail.store(true, Ordering::SeqCst);
     let (status, _) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// module の記録を登録して `updated_at` を返す (承認待ちのまま)。
+async fn pending_module(repo: &Arc<FakeRepo>, id: Uuid) -> Value {
+    let (status, v) = put_module(repo, id, &record(8)).await;
+    assert_eq!(status, StatusCode::OK);
+    v["updated_at"].clone()
+}
+
+/// 運行管理者 (社員) の承認を端末の token (`AuthUser` 無し) で叩く。
+async fn approve_by_employee(
+    repo: &Arc<FakeRepo>,
+    id: Uuid,
+    approver: Uuid,
+    updated_at: &Value,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/approve-by-employee");
+    let body = json!({ "approver_employee_id": approver, "updated_at": updated_at });
+    call(repo, "POST", &uri, body).await
+}
+
+/// 承認済みの module の記録を持つ運行管理者を作る。
+async fn approved_manager(repo: &Arc<FakeRepo>, name: &str) -> Uuid {
+    let id = repo.add_employee(name);
+    let updated_at = pending_module(repo, id).await;
+    assert_eq!(approve(repo, id, &updated_at).await, StatusCode::NO_CONTENT);
+    repo.managers.lock().unwrap().push(id);
+    id
+}
+
+#[tokio::test]
+async fn pending_modules_lists_only_pending_module_rows_without_records() {
+    let repo = Arc::new(FakeRepo::default());
+    let target = repo.add_employee("山田");
+    let updated_at = pending_module(&repo, target).await;
+    // chara の承認待ち・承認済みの module は載らない
+    enroll_pending(&repo, "鈴木", 1).await;
+    approved_manager(&repo, "佐藤").await;
+    let (status, v) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v,
+        json!({ "templates": [{
+            "employee_id": target,
+            "name": "山田",
+            "updated_at": updated_at,
+            "registered_device_id": null,
+        }] })
+    );
+}
+
+#[tokio::test]
+async fn pending_modules_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn approve_by_employee_approves_and_records_the_approver() {
+    let repo = Arc::new(FakeRepo::default());
+    let manager = approved_manager(&repo, "管理者").await;
+    let target = repo.add_employee("山田");
+    let updated_at = pending_module(&repo, target).await;
+    let (status, _) = approve_by_employee(&repo, target, manager, &updated_at).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        *repo.approved_by_employee.lock().unwrap(),
+        vec![(target, manager)]
+    );
+    // 承認済みなので module の一覧に載り、もう一度は 409
+    let (_, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(v["templates"].as_array().unwrap().len(), 2);
+    let (status, v) = approve_by_employee(&repo, target, manager, &updated_at).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], "approve_conflict");
+}
+
+#[tokio::test]
+async fn approve_by_employee_conflicts_on_stale_version() {
+    let repo = Arc::new(FakeRepo::default());
+    let manager = approved_manager(&repo, "管理者").await;
+    let target = repo.add_employee("山田");
+    let stale = pending_module(&repo, target).await;
+    let _fresh = pending_module(&repo, target).await;
+    let (status, v) = approve_by_employee(&repo, target, manager, &stale).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], "approve_conflict");
+    assert!(repo.approved_by_employee.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approve_by_employee_rejects_non_manager_unenrolled_and_self() {
+    let repo = Arc::new(FakeRepo::default());
+    let target = repo.add_employee("山田");
+    let updated_at = pending_module(&repo, target).await;
+    // 運行管理者でない (承認済みの記録は持つ)
+    let driver = repo.add_employee("乗務員");
+    let driver_at = pending_module(&repo, driver).await;
+    assert_eq!(
+        approve(&repo, driver, &driver_at).await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, v) = approve_by_employee(&repo, target, driver, &updated_at).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("approver_not_manager"))
+    );
+    // 運行管理者だが、自分の記録が承認待ち / 無い
+    let waiting = repo.add_employee("待ち");
+    pending_module(&repo, waiting).await;
+    let none = repo.add_employee("未登録");
+    for approver in [waiting, none] {
+        repo.managers.lock().unwrap().push(approver);
+        let (status, v) = approve_by_employee(&repo, target, approver, &updated_at).await;
+        assert_eq!(
+            (status, v["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("approver_not_enrolled"))
+        );
+    }
+    // 自己承認
+    let manager = approved_manager(&repo, "管理者").await;
+    let own = json!("2026-01-01T00:00:00Z");
+    let (status, v) = approve_by_employee(&repo, manager, manager, &own).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("self_approval"))
+    );
+    assert!(repo.approved_by_employee.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approve_by_employee_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = approve_by_employee(
+        &repo,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        &json!("2026-01-01T00:00:00Z"),
+    )
+    .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }

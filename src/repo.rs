@@ -31,7 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alc_core_wasm::DbError;
 use alc_vein::pg::PgVeinTemplates;
-use alc_vein::repo::{ApprovalItem, VeinTemplateRow, VeinTemplatesRepository};
+use alc_vein::repo::{
+    ApprovalItem, ApproveByEmployee, PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository,
+};
 use alc_worker_db::PgClient;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -132,6 +134,29 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
             self.inner
                 .approve(tenant_id, employee_id, approved_by, updated_at),
         )
+        .await
+    }
+
+    async fn list_pending_modules(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<PendingModuleItem>, DbError> {
+        self.timed(self.inner.list_pending_modules(tenant_id)).await
+    }
+
+    async fn approve_by_employee(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        approver_employee_id: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<ApproveByEmployee, DbError> {
+        self.timed(self.inner.approve_by_employee(
+            tenant_id,
+            employee_id,
+            approver_employee_id,
+            updated_at,
+        ))
         .await
     }
 

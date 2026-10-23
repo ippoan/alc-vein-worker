@@ -294,3 +294,25 @@ pub async fn soft_delete_employee(db: &mut PgClient, tenant_id: Uuid, id: Uuid) 
         .unwrap();
     assert_eq!(n, 1, "UPDATE employees");
 }
+
+/// 社員の `role` を差し替える (manager / admin / driver)。
+pub async fn set_roles(db: &mut PgClient, tenant_id: Uuid, id: Uuid, roles: &[&str]) {
+    let roles: Vec<String> = roles.iter().map(|r| (*r).to_owned()).collect();
+    let n = db
+        .tenant_tx(tenant_id, move |tx| {
+            Box::pin(async move {
+                tx.execute_typed(
+                    "UPDATE employees SET role = $3 WHERE tenant_id = $1 AND id = $2",
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&id, Type::UUID),
+                        (&roles, Type::TEXT_ARRAY),
+                    ],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "UPDATE employees SET role");
+}
