@@ -96,9 +96,16 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         employee_id: Uuid,
         template: &str,
         format: &str,
+        registered_device_id: Option<&str>,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
-        self.timed(self.inner.upsert(tenant_id, employee_id, template, format))
-            .await
+        self.timed(self.inner.upsert(
+            tenant_id,
+            employee_id,
+            template,
+            format,
+            registered_device_id,
+        ))
+        .await
     }
 
     async fn list(&self, tenant_id: Uuid, format: &str) -> Result<Vec<VeinTemplateRow>, DbError> {

@@ -59,6 +59,38 @@ async fn send(
     send_as(repo, tenant_id, None, method, uri, body).await
 }
 
+/// `send` に、追加のリクエストヘッダ (`X-Device-Id`) を付けたもの。
+async fn send_with_device(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    device: &str,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let state = VeinState {
+        templates: repo.clone(),
+    };
+    let app = tenant_router()
+        .with_state(state)
+        .layer(Extension(TenantId(tenant_id)));
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-device-id", device)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// `role` が `Some` なら、tenant_header が復元する `AuthUser` を付けて叩く (user_id は `admin_id()`)。
 async fn send_as(
     repo: &Arc<PgVeinTemplates>,
@@ -554,7 +586,11 @@ async fn module_records_are_kept_apart_from_chara_rows() {
 
     // chara の山田 (承認済み) と module の鈴木 (承認待ち)
     assert_eq!(put_approved(r, a, yamada, 71).await.0, StatusCode::OK);
-    let (status, put) = put_module(suzuki, rec).await;
+    // 登録した端末 (X-Device-Id) つきで登録する
+    let device = "alarm:0123456789abcdef";
+    let uri = format!("/vein/templates/{suzuki}/module");
+    let body = json!({ "record": rec });
+    let (status, put) = send_with_device(r, a, device, &uri, body).await;
     assert_eq!(status, StatusCode::OK, "{put}");
     // 承認待ちの module は module の一覧に出ず、承認待ちの一覧には形式を問わず出る
     assert_eq!(module_list().await["templates"], json!([]));
@@ -588,6 +624,7 @@ async fn module_records_are_kept_apart_from_chara_rows() {
             "employee_id": suzuki,
             "record": rec,
             "updated_at": put["updated_at"],
+            "registered_device_id": device,
         }] })
     );
     let chara_list = list(r, a).await;
@@ -605,6 +642,27 @@ async fn module_records_are_kept_apart_from_chara_rows() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list(r, a).await["templates"], json!([]));
     assert_eq!(identify(r, a, 71).await, json!({ "employee_id": null }));
+    // ヘッダ無しの登録し直しは端末を NULL に戻し、別の端末で登録し直すと上書きする
+    let (status, put) = put_module(suzuki, rec).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(
+        approve(r, a, suzuki, &put["updated_at"]).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        module_list().await["templates"][0]["registered_device_id"],
+        Value::Null
+    );
+    let (status, put) = send_with_device(r, a, "kiosk-2", &uri, json!({ "record": rec })).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(
+        approve(r, a, suzuki, &put["updated_at"]).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        module_list().await["templates"][0]["registered_device_id"],
+        "kiosk-2"
+    );
     // chara で登録し直すと chara に戻る
     assert_eq!(put_approved(r, a, yamada, 72).await.0, StatusCode::OK);
     assert_eq!(identify(r, a, 72).await["employee_id"], yamada.to_string());
@@ -645,7 +703,10 @@ async fn db_error_becomes_other_with_sqlstate() {
     let r = &repo.inner;
 
     // NUL バイト入りの template は DB が弾く (22021 character_not_in_repertoire)
-    let err = r.upsert(t, yamada, "a\0b", FORMAT_CHARA).await.unwrap_err();
+    let err = r
+        .upsert(t, yamada, "a\0b", FORMAT_CHARA, None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(&err, DbError::Other(m) if m.ends_with("(22021)")),
         "{err:?}"
@@ -653,7 +714,7 @@ async fn db_error_becomes_other_with_sqlstate() {
     // 同じ接続で次のメソッドが通る (ROLLBACK 済み)
     assert_eq!(r.list(t, FORMAT_CHARA).await.unwrap(), vec![]);
     let at = r
-        .upsert(t, yamada, "ok", FORMAT_CHARA)
+        .upsert(t, yamada, "ok", FORMAT_CHARA, None)
         .await
         .unwrap()
         .unwrap();
@@ -682,7 +743,9 @@ async fn db_error_becomes_other_with_sqlstate() {
             .unwrap_err()
     ));
     assert!(denied(
-        r.upsert(t, yamada, "x", FORMAT_CHARA).await.unwrap_err()
+        r.upsert(t, yamada, "x", FORMAT_CHARA, None)
+            .await
+            .unwrap_err()
     ));
     assert!(denied(
         r.update_learned(t, Uuid::new_v4(), "x", chrono::Utc::now())
@@ -711,7 +774,7 @@ async fn closed_connection_becomes_other() {
         "{err:?}"
     );
     assert!(matches!(
-        repo.upsert(t, t, "x", FORMAT_CHARA).await,
+        repo.upsert(t, t, "x", FORMAT_CHARA, None).await,
         Err(DbError::Other(_))
     ));
     assert!(matches!(

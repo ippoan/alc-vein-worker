@@ -18,6 +18,8 @@ pub struct VeinTemplateRow {
     pub name: String,
     pub template: String,
     pub updated_at: DateTime<Utc>,
+    /// 記録を登録した端末の id (alc-migrations 183。登録した端末が分からない行は None)。
+    pub registered_device_id: Option<String>,
 }
 
 /// `vein_templates.template_format` (alc-migrations 182)。`chara` = 特徴量から作ったテンプレート (サーバーが照合する)、
@@ -47,6 +49,8 @@ pub struct ModuleRecordItem {
     pub employee_id: Uuid,
     pub record: String,
     pub updated_at: DateTime<Utc>,
+    /// 登録した端末の id (JSON では null か文字列)。
+    pub registered_device_id: Option<String>,
 }
 
 impl From<VeinTemplateRow> for ModuleRecordItem {
@@ -55,6 +59,7 @@ impl From<VeinTemplateRow> for ModuleRecordItem {
             employee_id: r.employee_id,
             record: r.template,
             updated_at: r.updated_at,
+            registered_device_id: r.registered_device_id,
         }
     }
 }
@@ -74,21 +79,22 @@ impl From<VeinTemplateRow> for VeinTemplateItem {
 /// RLS に加えて `WHERE tenant_id` を明示する。
 pub mod sql {
     /// 乗務員のテンプレートを登録し直す。$1 tenant_id / $2 employee_id / $3 template / $4 template_format
-    /// (`chara` か `module`) → updated_at (乗務員が居なければ 0 行)。
+    /// (`chara` か `module`) / $5 registered_device_id (登録した端末の id。無ければ NULL) → updated_at (乗務員が居なければ 0 行)。
     /// 登録は常に承認待ち (`approved_at` / `approved_by` = NULL)。上書きも承認待ちに戻す (migration 181)。
+    /// 登録した端末も上書きする (登録し直しで $5 が NULL なら NULL に戻る。migration 183)。
     /// 形式も上書きする (module の行を chara で登録し直したら chara に戻る。逆も同じ。migration 182)。
-    pub const UPSERT: &str = r#"INSERT INTO vein_templates (tenant_id, employee_id, template, template_format, approved_at, approved_by)
-    SELECT e.tenant_id, e.id, $3, $4, NULL::timestamptz, NULL::uuid FROM employees e
+    pub const UPSERT: &str = r#"INSERT INTO vein_templates (tenant_id, employee_id, template, template_format, registered_device_id, approved_at, approved_by)
+    SELECT e.tenant_id, e.id, $3, $4, $5, NULL::timestamptz, NULL::uuid FROM employees e
     WHERE e.tenant_id = $1 AND e.id = $2 AND e.deleted_at IS NULL
     ON CONFLICT (tenant_id, employee_id)
     DO UPDATE SET template = EXCLUDED.template, template_format = EXCLUDED.template_format,
-        updated_at = NOW(), approved_at = NULL, approved_by = NULL
+        registered_device_id = EXCLUDED.registered_device_id, updated_at = NOW(), approved_at = NULL, approved_by = NULL
     RETURNING updated_at"#;
 
     /// テナントの承認済みの、$2 の形式のテンプレート (削除済みの乗務員を除く、登録順)。照合 (identify) と
     /// `GET /vein/templates` は `chara`、`GET /vein/module-templates` は `module`。承認待ちは載せない。
-    /// $1 tenant_id / $2 template_format → id, employee_id, name, template, updated_at。
-    pub const LIST: &str = r#"SELECT v.id, v.employee_id, e.name, v.template, v.updated_at
+    /// $1 tenant_id / $2 template_format → id, employee_id, name, template, updated_at, registered_device_id。
+    pub const LIST: &str = r#"SELECT v.id, v.employee_id, e.name, v.template, v.updated_at, v.registered_device_id
     FROM vein_templates v
     JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
     WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NOT NULL AND v.template_format = $2
@@ -134,6 +140,7 @@ pub trait VeinTemplatesRepository: Send + Sync {
         employee_id: Uuid,
         template: &str,
         format: &str,
+        registered_device_id: Option<&str>,
     ) -> Result<Option<DateTime<Utc>>, DbError>;
 
     /// テナントの承認済みの `format` のテンプレート (削除済みの乗務員を除く)。並びは登録順。

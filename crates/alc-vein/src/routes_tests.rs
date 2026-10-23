@@ -74,6 +74,7 @@ impl VeinTemplatesRepository for FakeRepo {
         employee_id: Uuid,
         template: &str,
         format: &str,
+        registered_device_id: Option<&str>,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         self.check()?;
         if self.fail_upsert.load(Ordering::SeqCst) {
@@ -92,6 +93,7 @@ impl VeinTemplatesRepository for FakeRepo {
             name: name.clone(),
             template: template.to_string(),
             updated_at: now,
+            registered_device_id: registered_device_id.map(str::to_owned),
         });
         // 形式も上書きする
         let mut modules = self.modules.lock().unwrap();
@@ -226,6 +228,18 @@ async fn call_as(
     uri: &str,
     body: Value,
 ) -> (StatusCode, Value) {
+    call_full(repo, role, &[], method, uri, body).await
+}
+
+/// `call_as` に、追加のリクエストヘッダ (`X-Device-Id` など) を付けられるようにしたもの。
+async fn call_full(
+    repo: &Arc<FakeRepo>,
+    role: Option<&str>,
+    extra_headers: &[(&str, &[u8])],
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
     };
@@ -242,12 +256,14 @@ async fn call_as(
             role: role.to_string(),
         }));
     }
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method(method)
         .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
+        .header("content-type", "application/json");
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let req = req.body(Body::from(body.to_string())).unwrap();
     let res = app.oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
@@ -473,6 +489,7 @@ fn fill_rows(repo: &FakeRepo, n: usize) {
             name: "既存".to_string(),
             template: String::new(),
             updated_at: Utc::now(),
+            registered_device_id: None,
         });
     }
 }
@@ -743,6 +760,89 @@ async fn put_module_stores_the_record_as_is_and_is_pending() {
     assert_eq!(v["templates"], json!([]));
 }
 
+/// `X-Device-Id` を付けて `PUT /vein/templates/{id}/module` を叩く。
+async fn put_module_from(repo: &Arc<FakeRepo>, id: Uuid, device: &[u8]) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/module");
+    let body = json!({ "record": record(4) });
+    call_full(repo, None, &[("x-device-id", device)], "PUT", &uri, body).await
+}
+
+fn stored_device(repo: &FakeRepo, id: Uuid) -> Option<String> {
+    let rows = repo.rows.lock().unwrap();
+    rows.iter()
+        .find(|r| r.employee_id == id)
+        .unwrap()
+        .registered_device_id
+        .clone()
+}
+
+#[tokio::test]
+async fn put_module_saves_x_device_id_and_get_returns_it() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = repo.add_employee("山田");
+    let other = repo.add_employee("鈴木");
+    let max = "a".repeat(64);
+    // ヘッダ無し = NULL。ヘッダ有りは保存され、登録し直すと上書き (ヘッダ無しなら NULL に戻る)
+    assert_eq!(put_module(&repo, id, &record(4)).await.0, StatusCode::OK);
+    assert_eq!(stored_device(&repo, id), None);
+    for device in ["alarm:0123456789abcdef", "dev-1_X", "a", max.as_str()] {
+        let (status, _) = put_module_from(&repo, id, device.as_bytes()).await;
+        assert_eq!(status, StatusCode::OK, "{device}");
+        assert_eq!(stored_device(&repo, id).as_deref(), Some(device));
+    }
+    assert_eq!(put_module(&repo, id, &record(4)).await.0, StatusCode::OK);
+    assert_eq!(stored_device(&repo, id), None);
+    // chara の PUT は端末を持たない
+    let (status, _) = call(
+        &repo,
+        "PUT",
+        &format!("/vein/templates/{other}"),
+        json!({ "charas": [hex(1)] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored_device(&repo, other), None);
+
+    // 承認済みの一覧は registered_device_id を null か文字列で返す
+    assert_eq!(
+        put_module_from(&repo, id, b"alarm:0123456789abcdef")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    repo.pending.lock().unwrap().clear();
+    let (_, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(
+        v["templates"][0]["registered_device_id"],
+        "alarm:0123456789abcdef"
+    );
+    assert_eq!(put_module(&repo, id, &record(4)).await.0, StatusCode::OK);
+    repo.pending.lock().unwrap().clear();
+    let (_, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert!(v["templates"][0]["registered_device_id"].is_null());
+}
+
+#[tokio::test]
+async fn put_module_rejects_invalid_x_device_id() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = repo.add_employee("山田");
+    let too_long = "a".repeat(65);
+    let bad: [&[u8]; 6] = [
+        b"",
+        too_long.as_bytes(),
+        b"a b",
+        b"a/b",
+        "端末".as_bytes(),
+        &[0xff, 0xfe],
+    ];
+    for device in bad {
+        let (status, v) = put_module_from(&repo, id, device).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{device:?}");
+        assert_eq!(v["error"], "invalid_device_id");
+    }
+    assert!(repo.rows.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn put_module_rejects_bad_base64_empty_and_too_long() {
     let repo = Arc::new(FakeRepo::default());
@@ -816,6 +916,7 @@ async fn module_rows_stay_out_of_identify_and_the_chara_list() {
             "employee_id": id,
             "record": record(64),
             "updated_at": put["updated_at"],
+            "registered_device_id": null,
         }] })
     );
     let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
