@@ -31,7 +31,8 @@ impl TxOutput for ApprovalItem {}
 impl TxOutput for PendingModuleItem {}
 impl TxOutput for ApproveByEmployee {}
 
-/// [`sql::UPSERT`]。`Ok(None)` = そのテナントに生きている乗務員が居ない。
+/// [`sql::UPSERT`] → (行を返したときだけ) [`sql::INSERT_ENROLL_EVENT`] を、渡された 1 つの transaction の中で
+/// 続けて流す (テンプレートと登録の履歴がずれない)。`Ok(None)` = そのテナントに生きている乗務員が居ない (履歴も書かない)。
 pub async fn upsert(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
@@ -52,7 +53,19 @@ pub async fn upsert(
             ],
         )
         .await?;
-    Ok(row.map(|r| r.get(0)))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    tx.execute_typed(
+        sql::INSERT_ENROLL_EVENT,
+        &[
+            (&tenant_id, Type::UUID),
+            (&employee_id, Type::UUID),
+            (&registered_device_id, Type::TEXT),
+        ],
+    )
+    .await?;
+    Ok(Some(row.get(0)))
 }
 
 /// [`sql::LIST`]。
