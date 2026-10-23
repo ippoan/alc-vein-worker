@@ -4,7 +4,7 @@
 //! SQL は [`crate::repo::sql`] の定数だけを、共通 crate `alc-worker-db` の [`TenantTx`] が出す
 //! **型付きの名前なしの文** (`query_typed` 系・`execute_typed`) で流す。名前付き prepared statement は
 //! Hyperdrive 経由で接続が切れるので使わない (`TenantTx` に口が無い)。引数の型の並びが書かれるのは、
-//! 下の自由関数 7 つの 1 か所だけ (`$n` の意味は `repo::sql` の各定数の doc)。
+//! 下の自由関数 9 つの 1 か所だけ (`$n` の意味は `repo::sql` の各定数の doc)。
 //!
 //! ## RLS (trait のメソッド 1 回 = 1 トランザクション)
 //!
@@ -21,10 +21,15 @@ use futures_util::lock::Mutex;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
-use crate::repo::{sql, ApprovalItem, VeinTemplateRow, VeinTemplatesRepository};
+use crate::repo::{
+    sql, ApprovalItem, ApproveByEmployee, PendingModuleItem, VeinTemplateRow,
+    VeinTemplatesRepository,
+};
 
 impl TxOutput for VeinTemplateRow {}
 impl TxOutput for ApprovalItem {}
+impl TxOutput for PendingModuleItem {}
+impl TxOutput for ApproveByEmployee {}
 
 /// [`sql::UPSERT`]。`Ok(None)` = そのテナントに生きている乗務員が居ない。
 pub async fn upsert(
@@ -116,6 +121,70 @@ pub async fn approve(
         )
         .await?;
     Ok(n == 1)
+}
+
+/// [`sql::LIST_PENDING_MODULE`]。
+pub async fn list_pending_modules(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+) -> Result<Vec<PendingModuleItem>, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(sql::LIST_PENDING_MODULE, &[(&tenant_id, Type::UUID)])
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingModuleItem {
+            employee_id: r.get(0),
+            name: r.get(1),
+            updated_at: r.get(2),
+            registered_device_id: r.get(3),
+        })
+        .collect())
+}
+
+/// [`sql::APPROVER_CHECK`] → [`sql::APPROVE_BY_EMPLOYEE`] を、渡された 1 つの transaction の中で続けて流す。
+pub async fn approve_by_employee(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    approver_employee_id: Uuid,
+    updated_at: DateTime<Utc>,
+) -> Result<ApproveByEmployee, tokio_postgres::Error> {
+    let check = tx
+        .query_typed_opt(
+            sql::APPROVER_CHECK,
+            &[
+                (&tenant_id, Type::UUID),
+                (&approver_employee_id, Type::UUID),
+            ],
+        )
+        .await?;
+    let (is_manager, enrolled): (bool, bool) = match check {
+        Some(r) => (r.get(0), r.get(1)),
+        None => (false, false),
+    };
+    if !is_manager {
+        return Ok(ApproveByEmployee::ApproverNotManager);
+    }
+    if !enrolled {
+        return Ok(ApproveByEmployee::ApproverNotEnrolled);
+    }
+    let n = tx
+        .execute_typed(
+            sql::APPROVE_BY_EMPLOYEE,
+            &[
+                (&tenant_id, Type::UUID),
+                (&employee_id, Type::UUID),
+                (&approver_employee_id, Type::UUID),
+                (&updated_at, Type::TIMESTAMPTZ),
+            ],
+        )
+        .await?;
+    Ok(if n == 1 {
+        ApproveByEmployee::Approved
+    } else {
+        ApproveByEmployee::Conflict
+    })
 }
 
 /// [`sql::REGISTRATION_COUNT`]。
@@ -274,6 +343,44 @@ impl VeinTemplatesRepository for PgVeinTemplates {
             .tenant_tx(tenant_id, move |tx| {
                 Box::pin(async move {
                     approve(tx, tenant_id, employee_id, approved_by, updated_at).await
+                })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn list_pending_modules(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<PendingModuleItem>, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { list_pending_modules(tx, tenant_id).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn approve_by_employee(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        approver_employee_id: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<ApproveByEmployee, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move {
+                    approve_by_employee(
+                        tx,
+                        tenant_id,
+                        employee_id,
+                        approver_employee_id,
+                        updated_at,
+                    )
+                    .await
                 })
             })
             .await

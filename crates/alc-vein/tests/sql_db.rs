@@ -36,11 +36,13 @@ use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::{VeinTemplatesRepository, FORMAT_CHARA, FORMAT_MODULE};
 use alc_vein::routes::tenant_router;
 use alc_vein::VeinState;
+use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
-use embedded::{employee, soft_delete_employee, tenant, Embedded, APP_ROLE};
+use embedded::{employee, set_roles, soft_delete_employee, tenant, Embedded, APP_ROLE};
 use serde_json::{json, Value};
+use tokio_postgres::types::Type;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -678,6 +680,160 @@ async fn module_records_are_kept_apart_from_chara_rows() {
     );
     assert_eq!(module_list().await["templates"], json!([]));
     repo.close().await;
+    db.shutdown();
+}
+
+/// module の記録を端末の鍵で登録する (承認待ちのまま)。`updated_at` を返す。
+async fn put_module_record(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid, id: Uuid) -> Value {
+    let uri = format!("/vein/templates/{id}/module");
+    let body = json!({ "record": "AAECAw==" });
+    let (status, v) = send(repo, tenant_id, "PUT", &uri, Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v["updated_at"].clone()
+}
+
+/// 運行管理者 (社員) の承認を端末の鍵で叩く。`(status, error の code)`。
+async fn approve_by_employee(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    id: Uuid,
+    approver: Uuid,
+    updated_at: Value,
+) -> (StatusCode, Option<String>) {
+    let uri = format!("/vein/templates/{id}/approve-by-employee");
+    let body = json!({ "approver_employee_id": approver, "updated_at": updated_at });
+    let (status, v) = send(repo, tenant_id, "POST", &uri, Some(body)).await;
+    (status, v["error"].as_str().map(str::to_owned))
+}
+
+fn rejected(status: StatusCode, code: &str) -> (StatusCode, Option<String>) {
+    (status, Some(code.to_owned()))
+}
+
+async fn pending_modules(repo: &Arc<PgVeinTemplates>, tenant_id: Uuid) -> Vec<Value> {
+    let (status, v) = send(
+        repo,
+        tenant_id,
+        "GET",
+        "/vein/module-templates/pending",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v["templates"].as_array().unwrap().clone()
+}
+
+/// 行の `(approved_by, approved_by_employee_id)`。
+async fn approver_columns(
+    db: &mut PgClient,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+) -> (Option<Uuid>, Option<Uuid>) {
+    db.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_one(
+                    "SELECT approved_by, approved_by_employee_id FROM vein_templates WHERE tenant_id = $1 AND employee_id = $2",
+                    &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID)],
+                )
+                .await?;
+            Ok((row.get(0), row.get(1)))
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// 運行管理者 (社員) による承認: 承認待ちの module の一覧・承認者の検査 (役割・登録・自己承認)・版の固定・
+/// `approved_by` が NULL で `approved_by_employee_id` に承認者が入ること・登録し直しで承認待ちに戻ること。
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_by_employee_checks_the_approver_and_pins_the_version() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Approve Tenant A").await;
+    let b = tenant(&mut prep.inner, "Vein Approve Tenant B").await;
+    let target = employee(&mut prep.inner, a, "山田").await;
+    let manager = employee(&mut prep.inner, a, "管理者").await;
+    let driver = employee(&mut prep.inner, a, "乗務員").await;
+    let waiting = employee(&mut prep.inner, a, "待ち").await;
+    let gone = employee(&mut prep.inner, a, "削除済み").await;
+    let chara = employee(&mut prep.inner, a, "旧形式").await;
+    let foreign = employee(&mut prep.inner, b, "別テナント").await;
+    set_roles(&mut prep.inner, a, manager, &["driver", "manager"]).await;
+    set_roles(&mut prep.inner, a, waiting, &["admin"]).await;
+    set_roles(&mut prep.inner, a, gone, &["manager"]).await;
+    set_roles(&mut prep.inner, b, foreign, &["manager"]).await;
+    soft_delete_employee(&mut prep.inner, a, gone).await;
+    prep.close().await;
+
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    // 管理者・運行者・別テナントの管理者は承認済み (管理画面の admin が承認した)。待ちと山田は承認待ち
+    for (t, id) in [(a, manager), (a, driver), (b, foreign)] {
+        let at = put_module_record(r, t, id).await;
+        assert_eq!(approve(r, t, id, &at).await.0, StatusCode::NO_CONTENT);
+    }
+    let waiting_at = put_module_record(r, a, waiting).await;
+    let target_at = put_module_record(r, a, target).await;
+    // chara の承認待ちは module の一覧に載らない
+    assert_eq!(put_template(r, a, chara, 5).await.0, StatusCode::OK);
+
+    // 承認待ちの一覧は module だけ・古い順・記録の中身は無い・別テナントは出ない
+    assert_eq!(
+        pending_modules(r, a).await,
+        vec![
+            json!({ "employee_id": waiting, "name": "待ち", "updated_at": waiting_at, "registered_device_id": null }),
+            json!({ "employee_id": target, "name": "山田", "updated_at": target_at, "registered_device_id": null }),
+        ]
+    );
+    assert!(pending_modules(r, b).await.is_empty());
+
+    // 承認者の検査: 運行者 / 居ない / 削除済み / 別テナント / 自分の記録が承認待ち / 自己承認
+    let not_manager = rejected(StatusCode::FORBIDDEN, "approver_not_manager");
+    for approver in [driver, Uuid::new_v4(), gone, foreign] {
+        let got = approve_by_employee(r, a, target, approver, target_at.clone()).await;
+        assert_eq!(got, not_manager);
+    }
+    let got = approve_by_employee(r, a, target, waiting, target_at.clone()).await;
+    assert_eq!(
+        got,
+        rejected(StatusCode::FORBIDDEN, "approver_not_enrolled")
+    );
+    let got = approve_by_employee(r, a, manager, manager, json!("2026-01-01T00:00:00Z")).await;
+    assert_eq!(got, rejected(StatusCode::FORBIDDEN, "self_approval"));
+
+    // 版が違えば 409、合えば 204、もう一度は 409
+    let conflict = rejected(StatusCode::CONFLICT, "approve_conflict");
+    let got = approve_by_employee(r, a, target, manager, json!("2000-01-01T00:00:00Z")).await;
+    assert_eq!(got, conflict);
+    let got = approve_by_employee(r, a, target, manager, target_at.clone()).await;
+    assert_eq!(got, (StatusCode::NO_CONTENT, None));
+    let got = approve_by_employee(r, a, target, manager, target_at.clone()).await;
+    assert_eq!(got, conflict);
+    repo.close().await;
+
+    // approved_by は NULL・approved_by_employee_id は承認者。削除済みの乗務員は承認待ちの一覧から外れる
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(
+        approver_columns(&mut prep.inner, a, target).await,
+        (None, Some(manager))
+    );
+    soft_delete_employee(&mut prep.inner, a, waiting).await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    assert!(pending_modules(r, a).await.is_empty());
+
+    // 登録し直すと承認待ちに戻り、approved_by_employee_id も NULL に戻る
+    put_module_record(r, a, target).await;
+    assert_eq!(pending_modules(r, a).await.len(), 1);
+    repo.close().await;
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(
+        approver_columns(&mut prep.inner, a, target).await,
+        (None, None)
+    );
+    prep.close().await;
     db.shutdown();
 }
 

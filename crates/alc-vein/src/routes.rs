@@ -3,6 +3,9 @@
 //! - `PUT /vein/templates/{employee_id}` `{"charas": [hex, ...]}` → 登録し直す (キオスクからも)
 //! - `PUT /vein/templates/{employee_id}/module` `{"record": base64}` → 端末のモジュールの記録全体を預かる
 //! - `GET /vein/module-templates` → 承認済みのモジュールの記録の一覧 (端末が書き戻して、モジュール自身に照合させる)
+//! - `GET /vein/module-templates/pending` → 承認待ちのモジュールの記録の一覧 (端末の token で。中身は返さない)
+//! - `POST /vein/templates/{employee_id}/approve-by-employee` `{"approver_employee_id", "updated_at"}` → 運行管理者
+//!   (社員) による承認 (端末の token で。承認者は端末の照合で決まり、ここで役割・登録・自己承認を検査する)
 //! - `POST /vein/identify` `{"chara": hex}` → 1:N 照合 + 学習の書き戻し
 //! - `GET /vein/templates` → オフライン照合用の全件 (`logic_version` つき)
 //! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下・承認済みの削除もこれ。管理者だけ)
@@ -36,7 +39,9 @@ use alc_core_wasm::{AuthUser, TenantId};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
 use crate::matcher::{self, CharaError, MAX_TEMPLATES};
-use crate::repo::{ModuleRecordItem, VeinTemplateItem, FORMAT_CHARA, FORMAT_MODULE};
+use crate::repo::{
+    ApproveByEmployee, ModuleRecordItem, VeinTemplateItem, FORMAT_CHARA, FORMAT_MODULE,
+};
 use crate::VeinState;
 
 /// モジュールの記録 1 件の大きさの上限 (バイト。モジュールの READ_ENROLL の全体は実機で 8156 バイト)。
@@ -49,11 +54,16 @@ pub fn tenant_router() -> Router<VeinState> {
     Router::new()
         .route("/vein/templates", get(list_templates))
         .route("/vein/module-templates", get(list_module_templates))
+        .route("/vein/module-templates/pending", get(list_pending_modules))
         .route("/vein/templates/pending", get(list_pending))
         .route("/vein/templates/approved", get(list_approved))
         .route(
             "/vein/templates/{employee_id}/approve",
             post(approve_template),
+        )
+        .route(
+            "/vein/templates/{employee_id}/approve-by-employee",
+            post(approve_by_employee),
         )
         .route(
             "/vein/templates/{employee_id}/module",
@@ -78,6 +88,12 @@ struct ModuleRecordBody {
 
 #[derive(Deserialize)]
 struct ApproveBody {
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct ApproveByEmployeeBody {
+    approver_employee_id: Uuid,
     updated_at: DateTime<Utc>,
 }
 
@@ -343,6 +359,70 @@ async fn approve_template(
                 "message": "承認待ちの登録が変わっています。一覧を読み直してください",
             })),
         ))
+    }
+}
+
+/// 承認待ちのモジュールの記録の一覧 (端末の画面で承認する 1 人を選ぶ元)。管理者でなくてよい。
+async fn list_pending_modules(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+) -> Result<Json<Value>, ApiError> {
+    let templates = state
+        .templates
+        .list_pending_modules(tenant_id)
+        .await
+        .map_err(|e| internal_error("vein list_pending_modules", e))?;
+    Ok(Json(json!({ "templates": templates })))
+}
+
+fn forbidden(code: &str, message: &str) -> ApiError {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": code, "message": message })),
+    )
+}
+
+/// 運行管理者 (社員) による承認。端末の token で呼ばれ、利用者 (`AuthUser`) は見ない。承認者は端末の 1:N 照合で
+/// 決まった社員で、ここでは承認者の役割 (manager か admin)・承認者自身の登録・自己承認でないことを検査する。
+async fn approve_by_employee(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(employee_id): Path<Uuid>,
+    Json(body): Json<ApproveByEmployeeBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.approver_employee_id == employee_id {
+        return Err(forbidden(
+            "self_approval",
+            "自分の登録は自分で承認できません",
+        ));
+    }
+    let outcome = state
+        .templates
+        .approve_by_employee(
+            tenant_id,
+            employee_id,
+            body.approver_employee_id,
+            body.updated_at,
+        )
+        .await
+        .map_err(|e| internal_error("vein approve_by_employee", e))?;
+    match outcome {
+        ApproveByEmployee::Approved => Ok(StatusCode::NO_CONTENT),
+        ApproveByEmployee::ApproverNotManager => Err(forbidden(
+            "approver_not_manager",
+            "承認できるのは運行管理者だけです",
+        )),
+        ApproveByEmployee::ApproverNotEnrolled => Err(forbidden(
+            "approver_not_enrolled",
+            "承認者の指静脈が承認済みで登録されていません",
+        )),
+        ApproveByEmployee::Conflict => Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "approve_conflict",
+                "message": "承認待ちの登録が変わっています。一覧を読み直してください",
+            })),
+        )),
     }
 }
 

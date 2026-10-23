@@ -43,6 +43,28 @@ pub struct ApprovalItem {
     pub updated_at: DateTime<Utc>,
 }
 
+/// `GET /vein/module-templates/pending` の 1 件 (記録の中身は返さない)。`updated_at` は承認の版
+/// (`POST .../approve-by-employee` の body に同じ値を返す)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingModuleItem {
+    pub employee_id: Uuid,
+    pub name: String,
+    pub updated_at: DateTime<Utc>,
+    pub registered_device_id: Option<String>,
+}
+
+/// 運行管理者 (社員) による承認の結果。`Approved` 以外は書き込んでいない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveByEmployee {
+    Approved,
+    /// 承認者が居ない・削除済み・`role` に manager も admin も無い。
+    ApproverNotManager,
+    /// 承認者自身の module の記録が承認済みでない。
+    ApproverNotEnrolled,
+    /// 版が違う (登録し直された) か、承認待ちでない (承認済み・登録が無い)。
+    Conflict,
+}
+
 /// `GET /vein/module-templates` の 1 件。`record` は端末のモジュールの記録を base64 のまま (中身は解釈しない)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModuleRecordItem {
@@ -80,7 +102,7 @@ impl From<VeinTemplateRow> for VeinTemplateItem {
 pub mod sql {
     /// 乗務員のテンプレートを登録し直す。$1 tenant_id / $2 employee_id / $3 template / $4 template_format
     /// (`chara` か `module`) / $5 registered_device_id (登録した端末の id。無ければ NULL) → updated_at (乗務員が居なければ 0 行)。
-    /// 登録は常に承認待ち (`approved_at` / `approved_by` = NULL)。上書きも承認待ちに戻す (migration 181)。
+    /// 登録は常に承認待ち (`approved_at` / `approved_by` / `approved_by_employee_id` = NULL)。上書きも承認待ちに戻す (migration 181 / 185)。
     /// 登録した端末も上書きする (登録し直しで $5 が NULL なら NULL に戻る。migration 183)。
     /// 形式も上書きする (module の行を chara で登録し直したら chara に戻る。逆も同じ。migration 182)。
     pub const UPSERT: &str = r#"INSERT INTO vein_templates (tenant_id, employee_id, template, template_format, registered_device_id, approved_at, approved_by)
@@ -88,7 +110,8 @@ pub mod sql {
     WHERE e.tenant_id = $1 AND e.id = $2 AND e.deleted_at IS NULL
     ON CONFLICT (tenant_id, employee_id)
     DO UPDATE SET template = EXCLUDED.template, template_format = EXCLUDED.template_format,
-        registered_device_id = EXCLUDED.registered_device_id, updated_at = NOW(), approved_at = NULL, approved_by = NULL
+        registered_device_id = EXCLUDED.registered_device_id, updated_at = NOW(), approved_at = NULL, approved_by = NULL,
+        approved_by_employee_id = NULL
     RETURNING updated_at"#;
 
     /// テナントの承認済みの、$2 の形式のテンプレート (削除済みの乗務員を除く、登録順)。照合 (identify) と
@@ -112,6 +135,30 @@ pub mod sql {
     /// $1 tenant_id / $2 employee_id / $3 approved_by (承認した管理者の user_id) / $4 updated_at。0 行 = 409。
     pub const APPROVE: &str = r#"UPDATE vein_templates SET approved_at = NOW(), approved_by = $3
     WHERE tenant_id = $1 AND employee_id = $2 AND updated_at = $4 AND approved_at IS NULL"#;
+
+    /// テナントの承認待ちの module の記録の一覧 (削除済みの乗務員を除く、古い順)。記録の中身は返さない。
+    /// $1 tenant_id → employee_id, name, updated_at, registered_device_id。
+    pub const LIST_PENDING_MODULE: &str = r#"SELECT v.employee_id, e.name, v.updated_at, v.registered_device_id
+    FROM vein_templates v
+    JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
+    WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NULL AND v.template_format = 'module'
+    ORDER BY v.updated_at, v.id"#;
+
+    /// 承認者 $2 の検査。生きている社員が居なければ 0 行。居れば (`role` に manager か admin を含むか,
+    /// 自分の module の記録が承認済みか)。$1 tenant_id / $2 approver_employee_id → (BOOL, BOOL)。
+    pub const APPROVER_CHECK: &str = r#"SELECT COALESCE(e.role && ARRAY['manager', 'admin']::TEXT[], FALSE),
+        EXISTS (SELECT 1 FROM vein_templates v
+            WHERE v.tenant_id = e.tenant_id AND v.employee_id = e.id
+            AND v.template_format = 'module' AND v.approved_at IS NOT NULL)
+    FROM employees e
+    WHERE e.tenant_id = $1 AND e.id = $2 AND e.deleted_at IS NULL"#;
+
+    /// 運行管理者 (社員) として承認する。`approved_by` (利用者) は NULL のまま、`approved_by_employee_id` に承認者を書く。
+    /// $4 = 一覧で見た updated_at のままで、承認待ちの module の記録のときだけ (版の固定)。
+    /// $1 tenant_id / $2 employee_id / $3 approver_employee_id / $4 updated_at。0 行 = 409。
+    pub const APPROVE_BY_EMPLOYEE: &str = r#"UPDATE vein_templates
+    SET approved_at = NOW(), approved_by = NULL, approved_by_employee_id = $3
+    WHERE tenant_id = $1 AND employee_id = $2 AND updated_at = $4 AND approved_at IS NULL AND template_format = 'module'"#;
 
     /// $3 の形式の登録の人数 (承認待ちを含む、削除済みの乗務員を除く) と、$2 employee_id がその中に既に居るか。
     /// $1 tenant_id / $2 employee_id / $3 template_format → (COUNT, BOOL)。
@@ -161,6 +208,22 @@ pub trait VeinTemplatesRepository: Send + Sync {
         approved_by: Uuid,
         updated_at: DateTime<Utc>,
     ) -> Result<bool, DbError>;
+
+    /// テナントの承認待ちの module の記録の一覧 (古い順。記録の中身は含めない)。
+    async fn list_pending_modules(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<PendingModuleItem>, DbError>;
+
+    /// 運行管理者 (社員) として承認する。承認者の検査 (生きている社員・manager か admin・自分の module の記録が承認済み)
+    /// と書き込みを 1 つの transaction で行う。`employee_id == approver_employee_id` の拒否は呼び手の仕事。
+    async fn approve_by_employee(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        approver_employee_id: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> Result<ApproveByEmployee, DbError>;
 
     /// `format` の登録の人数 (承認待ちを含み、削除済みの乗務員を除く) と、
     /// `employee_id` がその中に既に居るか (居れば PUT は上書きで人数が増えない)。
