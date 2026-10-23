@@ -837,6 +837,133 @@ async fn approve_by_employee_checks_the_approver_and_pins_the_version() {
     db.shutdown();
 }
 
+/// テナントの登録の履歴 (`vein_enroll_events`) の `(employee_id, registered_device_id, is_dev)`、古い順。
+async fn enroll_events(db: &mut PgClient, tenant_id: Uuid) -> Vec<(Uuid, Option<String>, bool)> {
+    db.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    "SELECT employee_id, registered_device_id, is_dev FROM vein_enroll_events WHERE tenant_id = $1 ORDER BY created_at, id",
+                    &[(&tenant_id, Type::UUID)],
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect::<Vec<_>>())
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// module の記録の登録は、履歴に 1 行と登録した端末 (X-Device-Id) を残す (Refs ippoan/alc-cam#2)。
+#[tokio::test(flavor = "multi_thread")]
+async fn module_enroll_writes_an_event_with_the_device() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let t = tenant(&mut prep.inner, "Vein Event Module Tenant").await;
+    let yamada = employee(&mut prep.inner, t, "山田").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let uri = format!("/vein/templates/{yamada}/module");
+    let body = json!({ "record": "AAECAw==" });
+    let (status, put) = send_with_device(&repo.inner, t, "kiosk-1", &uri, body).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    repo.close().await;
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(
+        enroll_events(&mut prep.inner, t).await,
+        vec![(yamada, Some("kiosk-1".to_owned()), false)]
+    );
+    prep.close().await;
+    db.shutdown();
+}
+
+/// chara のテンプレートの登録は、履歴に 1 行 (端末は NULL) を残す。
+#[tokio::test(flavor = "multi_thread")]
+async fn template_enroll_writes_an_event_without_a_device() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let t = tenant(&mut prep.inner, "Vein Event Template Tenant").await;
+    let yamada = employee(&mut prep.inner, t, "山田").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let (status, put) = put_template(&repo.inner, t, yamada, 81).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    repo.close().await;
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(
+        enroll_events(&mut prep.inner, t).await,
+        vec![(yamada, None, false)]
+    );
+    prep.close().await;
+    db.shutdown();
+}
+
+/// 乗務員が居ない (別テナント・削除済み・存在しない) 登録は 404 で、履歴を書かない。
+#[tokio::test(flavor = "multi_thread")]
+async fn enroll_without_an_employee_writes_no_event() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Event Missing Tenant A").await;
+    let b = tenant(&mut prep.inner, "Vein Event Missing Tenant B").await;
+    let foreign = employee(&mut prep.inner, b, "他社").await;
+    let gone = employee(&mut prep.inner, a, "削除済み").await;
+    soft_delete_employee(&mut prep.inner, a, gone).await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    for id in [foreign, gone, Uuid::new_v4()] {
+        assert_eq!(put_template(r, a, id, 82).await.0, StatusCode::NOT_FOUND);
+        let uri = format!("/vein/templates/{id}/module");
+        let body = json!({ "record": "AAECAw==" });
+        let (status, _) = send_with_device(r, a, "kiosk-1", &uri, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    repo.close().await;
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(enroll_events(&mut prep.inner, a).await, vec![]);
+    assert_eq!(enroll_events(&mut prep.inner, b).await, vec![]);
+    prep.close().await;
+    db.shutdown();
+}
+
+/// 登録し直しはテンプレートを上書きするが、履歴は上書きせず 1 回ごとに 1 行足す。
+#[tokio::test(flavor = "multi_thread")]
+async fn re_enroll_appends_events() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let t = tenant(&mut prep.inner, "Vein Event Append Tenant").await;
+    let yamada = employee(&mut prep.inner, t, "山田").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    let uri = format!("/vein/templates/{yamada}/module");
+    let body = json!({ "record": "AAECAw==" });
+    assert_eq!(
+        send_with_device(r, t, "kiosk-1", &uri, body.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_with_device(r, t, "kiosk-2", &uri, body).await.0,
+        StatusCode::OK
+    );
+    repo.close().await;
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(
+        enroll_events(&mut prep.inner, t).await,
+        vec![
+            (yamada, Some("kiosk-1".to_owned()), false),
+            (yamada, Some("kiosk-2".to_owned()), false),
+        ]
+    );
+    prep.close().await;
+    db.shutdown();
+}
+
 /// `current_user` は繋いだロール (表の所有者でない方)。
 #[tokio::test(flavor = "multi_thread")]
 async fn current_user_is_the_app_role() {

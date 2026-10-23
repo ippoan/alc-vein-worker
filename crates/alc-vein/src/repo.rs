@@ -114,6 +114,13 @@ pub mod sql {
         approved_by_employee_id = NULL
     RETURNING updated_at"#;
 
+    /// 登録の履歴を 1 行足す ([`UPSERT`] が行を返したときだけ、同じ transaction で)。拠点カメラの録画から
+    /// 登録の前後を切り出す cron が読む (ippoan/alc-cam#2、migration 187)。上書きしない。
+    /// $1 tenant_id / $2 employee_id / $3 registered_device_id (無ければ NULL)。is_dev は列の DEFAULT
+    /// (`app.device_dev` の設定値) で決まるので書かない。
+    pub const INSERT_ENROLL_EVENT: &str =
+        "INSERT INTO alc_api.vein_enroll_events (tenant_id, employee_id, registered_device_id) VALUES ($1, $2, $3)";
+
     /// テナントの承認済みの、$2 の形式のテンプレート (削除済みの乗務員を除く、登録順)。照合 (identify) と
     /// `GET /vein/templates` は `chara`、`GET /vein/module-templates` は `module`。承認待ちは載せない。
     /// $1 tenant_id / $2 template_format → id, employee_id, name, template, updated_at, registered_device_id。
