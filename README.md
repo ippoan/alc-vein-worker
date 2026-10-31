@@ -284,6 +284,10 @@ cargo test -p alc-vein --test sql_db
 - モジュールの記録 (`PUT /vein/templates/{employee_id}/module`、`template_format = 'module'`、alc-migrations 182) は形式の列で
   chara の行と分かれる: 承認済みだけが `GET /vein/module-templates` に出て、identify・`GET /vein/templates`・chara の人数には載らない /
   形式を問わず承認・削除でき、chara で登録し直すと chara に戻る / 人数は形式ごと (module は 91 人まで。口の 409 は `routes_tests.rs`) (Refs ippoan/alc-app#436)
+- 端末ごとの記録 (`PUT /vein/templates/{employee_id}/module/devices`、`vein_device_records`、alc-migrations 196): 承認済みの module の行が在る
+  乗務員にだけ足せる (無ければ 409) / 同じ端末は差し替え / `X-Device-Id` つきの `GET /vein/module-templates` が端末向けに
+  「その端末の 3 件 + 他の端末の最新 3 件」へ混ぜる (`composed: true`。ヘッダ無しは元の行のまま) / 別テナントに出ない /
+  元の行が承認待ちに戻ると一覧から外れ、`DELETE` で一緒に消える (Refs ippoan/alc-app#558)
 - `current_user` が繋いだロールであること / DB のエラーが `DbError::Other` (message と SQLSTATE) になり、失敗した transaction が
   残らないこと / 接続が切れているときの `DbError::Other`
 

@@ -627,6 +627,7 @@ async fn module_records_are_kept_apart_from_chara_rows() {
             "record": rec,
             "updated_at": put["updated_at"],
             "registered_device_id": device,
+            "composed": false,
         }] })
     );
     let chara_list = list(r, a).await;
@@ -680,6 +681,200 @@ async fn module_records_are_kept_apart_from_chara_rows() {
     );
     assert_eq!(module_list().await["templates"], json!([]));
     repo.close().await;
+    db.shutdown();
+}
+
+/// 端末 `device` の `X-Device-Id` つきで口を叩く。
+async fn send_from(
+    repo: &Arc<PgVeinTemplates>,
+    tenant_id: Uuid,
+    device: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let state = VeinState {
+        templates: repo.clone(),
+    };
+    let app = tenant_router()
+        .with_state(state)
+        .layer(Extension(TenantId(tenant_id)));
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-device-id", device)
+        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// 同じ種の特徴量 3 件から組んだ mode 1 のテンプレート (base64)。
+fn template3(seed: u64) -> String {
+    matcher::enroll_template(&vec![synth::chara(seed); 3]).unwrap()
+}
+
+/// `a` の 3 件の後ろに `b` の 3 件を並べた記録 (base64)。
+fn mixed(a: &str, b: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let (a, b) = (STANDARD.decode(a).unwrap(), STANDARD.decode(b).unwrap());
+    STANDARD.encode(vein_match_search::mix_templates(&[(&a, 3), (&b, 3)]).unwrap())
+}
+
+/// テナントの `vein_device_records` の行数 (乗務員 `employee_id` の分)。
+async fn device_record_count(db: &mut PgClient, tenant_id: Uuid, employee_id: Uuid) -> i64 {
+    db.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_one(
+                    "SELECT count(*) FROM vein_device_records WHERE tenant_id = $1 AND employee_id = $2",
+                    &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID)],
+                )
+                .await?;
+            Ok(row.get::<_, i64>(0))
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// 端末ごとの記録 (`vein_device_records`、alc-migrations 196): 承認済みの module の行が在る乗務員にだけ足せて
+/// (同じ端末は差し替え)、`X-Device-Id` つきの一覧がその端末向けに混ざり、テナントを越えず、消すと一緒に消える。
+#[tokio::test(flavor = "multi_thread")]
+async fn device_records_are_composed_per_device_and_follow_the_base_row() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Device Tenant A").await;
+    let b = tenant(&mut prep.inner, "Vein Device Tenant B").await;
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let suzuki = employee(&mut prep.inner, a, "鈴木").await;
+    let sato = employee(&mut prep.inner, a, "佐藤").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    let (base, rec2, rec2b, rec3) = (template3(1), template3(2), template3(4), template3(3));
+    let put_device = |device: &'static str, id: Uuid, record: String| async move {
+        let uri = format!("/vein/templates/{id}/module/devices");
+        send_from(r, a, device, "PUT", &uri, Some(json!({ "record": record }))).await
+    };
+    let list_from = |device: Option<&'static str>| async move {
+        let (status, v) = match device {
+            Some(d) => send_from(r, a, d, "GET", "/vein/module-templates", None).await,
+            None => send(r, a, "GET", "/vein/module-templates", None).await,
+        };
+        assert_eq!(status, StatusCode::OK, "{v}");
+        v["templates"].as_array().unwrap().clone()
+    };
+
+    // 山田: kiosk-1 で登録した module (承認済み)。鈴木: 承認待ちの module。佐藤: chara (承認済み)
+    let uri = format!("/vein/templates/{yamada}/module");
+    let (status, put) = send_with_device(r, a, "kiosk-1", &uri, json!({ "record": base })).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(
+        approve(r, a, yamada, &put["updated_at"]).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let uri = format!("/vein/templates/{suzuki}/module");
+    let (status, _) = send_with_device(r, a, "kiosk-1", &uri, json!({ "record": base })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(put_approved(r, a, sato, 7).await.0, StatusCode::OK);
+
+    // 承認済みの module の行が無い乗務員 (承認待ち・chara・居ない人・別テナント) には足せない
+    for id in [suzuki, sato, Uuid::new_v4()] {
+        let (status, v) = put_device("kiosk-2", id, rec2.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "no_approved_module_record");
+    }
+    let uri = format!("/vein/templates/{yamada}/module/devices");
+    let body = Some(json!({ "record": rec2 }));
+    let (status, v) = send_from(r, b, "kiosk-2", "PUT", &uri, body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+
+    // 端末ごとの記録が無い間は元の行のまま (composed = false)
+    let before = list_from(Some("kiosk-1")).await;
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["composed"], false);
+    assert_eq!(before[0]["record"], base);
+
+    // 足す。承認には触らない。同じ端末は差し替え (updated_at が進む)
+    let (status, first) = put_device("kiosk-2", yamada, rec2.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["employee_id"], yamada.to_string());
+    let (status, second) = put_device("kiosk-2", yamada, rec2b.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_ne!(first["updated_at"], second["updated_at"]);
+    assert_eq!(
+        r.list_device_records(a).await.unwrap().len(),
+        1,
+        "同じ端末は 1 行"
+    );
+    assert_eq!(approved(r, a).await.as_array().unwrap().len(), 2);
+
+    // ヘッダ無し (管理者) は元の行のまま。kiosk-1 は 自分 3 + 他 (kiosk-2) 3、kiosk-2 は 自分 3 + 他 (元の行) 3
+    let plain = list_from(None).await;
+    assert_eq!(plain[0]["composed"], false);
+    assert_eq!(plain[0]["record"], base);
+    let from1 = list_from(Some("kiosk-1")).await;
+    assert_eq!(from1[0]["composed"], true);
+    assert_eq!(from1[0]["record"], mixed(&base, &rec2b));
+    assert_eq!(from1[0]["updated_at"], second["updated_at"]);
+    assert_eq!(from1[0]["registered_device_id"], "kiosk-1");
+    let from2 = list_from(Some("kiosk-2")).await;
+    assert_eq!(from2[0]["record"], mixed(&rec2b, &base));
+    // 自分の記録が無い端末には新しい順の 2 つ
+    let from9 = list_from(Some("kiosk-9")).await;
+    assert_eq!(from9[0]["record"], mixed(&rec2b, &base));
+
+    // 3 台目を足すと、他は最新の kiosk-3 になる
+    assert_eq!(
+        put_device("kiosk-3", yamada, rec3.clone()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_from(Some("kiosk-1")).await[0]["record"],
+        mixed(&base, &rec3)
+    );
+    assert_eq!(
+        list_from(Some("kiosk-2")).await[0]["record"],
+        mixed(&rec2b, &rec3)
+    );
+
+    // 別テナントには出ない
+    assert_eq!(r.list_device_records(b).await.unwrap(), vec![]);
+    // 元の行が承認待ちに戻る (登録し直し) と一覧から外れる (端末ごとの記録は残る)
+    let uri = format!("/vein/templates/{yamada}/module");
+    let (status, put) = send_with_device(r, a, "kiosk-1", &uri, json!({ "record": base })).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(list_from(Some("kiosk-1")).await, Vec::<Value>::new());
+    assert_eq!(r.list_device_records(a).await.unwrap(), vec![]);
+    assert_eq!(
+        approve(r, a, yamada, &put["updated_at"]).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r.list_device_records(a).await.unwrap().len(), 2);
+
+    // 削除は端末ごとの記録も一緒に消す
+    repo.close().await;
+    let mut chk = db.client(APP_ROLE).await;
+    assert_eq!(device_record_count(&mut chk.inner, a, yamada).await, 2);
+    chk.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    assert_eq!(
+        delete_as_admin(&repo.inner, a, yamada).await.0,
+        StatusCode::NO_CONTENT
+    );
+    repo.close().await;
+    let mut chk = db.client(APP_ROLE).await;
+    assert_eq!(device_record_count(&mut chk.inner, a, yamada).await, 0);
+    chk.close().await;
     db.shutdown();
 }
 

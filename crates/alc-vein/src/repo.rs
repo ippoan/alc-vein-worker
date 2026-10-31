@@ -65,14 +65,26 @@ pub enum ApproveByEmployee {
     Conflict,
 }
 
+/// 端末ごとに預かった module の記録 1 行 (`vein_device_records`、alc-migrations 196。Refs ippoan/alc-app#558)。
+/// `device_id` はその記録を撮った端末 (`vein_templates.registered_device_id` と同じ id)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRecordRow {
+    pub employee_id: Uuid,
+    pub device_id: String,
+    pub record: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// `GET /vein/module-templates` の 1 件。`record` は端末のモジュールの記録を base64 のまま (中身は解釈しない)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModuleRecordItem {
     pub employee_id: Uuid,
     pub record: String,
     pub updated_at: DateTime<Utc>,
-    /// 登録した端末の id (JSON では null か文字列)。
+    /// 登録した端末の id (JSON では null か文字列)。常に元の行 (vein_templates) のもの。
     pub registered_device_id: Option<String>,
+    /// 要求した端末のために、端末ごとの記録を混ぜて組んだ記録なら true。
+    pub composed: bool,
 }
 
 impl From<VeinTemplateRow> for ModuleRecordItem {
@@ -82,6 +94,7 @@ impl From<VeinTemplateRow> for ModuleRecordItem {
             record: r.template,
             updated_at: r.updated_at,
             registered_device_id: r.registered_device_id,
+            composed: false,
         }
     }
 }
@@ -178,6 +191,31 @@ pub mod sql {
     pub const UPDATE_LEARNED: &str = r#"UPDATE vein_templates SET template = $3, updated_at = NOW()
     WHERE tenant_id = $1 AND id = $2 AND updated_at = $4"#;
 
+    /// 端末ごとの記録を預かる (同じ端末なら差し替え)。承認済みの module の行が在る生きている乗務員にだけ足せる
+    /// (無ければ 0 行)。vein_templates の承認には触らない。
+    /// $1 tenant_id / $2 employee_id / $3 device_id / $4 record (base64) → updated_at。
+    pub const UPSERT_DEVICE_RECORD: &str = r#"INSERT INTO vein_device_records (tenant_id, employee_id, device_id, record)
+    SELECT v.tenant_id, v.employee_id, $3, $4 FROM vein_templates v
+    JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
+    WHERE v.tenant_id = $1 AND v.employee_id = $2 AND e.deleted_at IS NULL
+        AND v.approved_at IS NOT NULL AND v.template_format = 'module'
+    ON CONFLICT (tenant_id, employee_id, device_id)
+    DO UPDATE SET record = EXCLUDED.record, updated_at = NOW()
+    RETURNING updated_at"#;
+
+    /// テナントの、承認済みの module の行が在る生きている乗務員の端末ごとの記録 (1 回で全員分)。
+    /// $1 tenant_id → employee_id, device_id, record, updated_at。
+    pub const LIST_DEVICE_RECORDS: &str = r#"SELECT d.employee_id, d.device_id, d.record, d.updated_at
+    FROM vein_device_records d
+    JOIN vein_templates v ON v.tenant_id = d.tenant_id AND v.employee_id = d.employee_id
+    JOIN employees e ON e.id = d.employee_id AND e.tenant_id = d.tenant_id
+    WHERE d.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NOT NULL AND v.template_format = 'module'
+    ORDER BY d.updated_at, d.id"#;
+
+    /// 乗務員の端末ごとの記録を消す ([`DELETE`] と同じ transaction で)。$1 tenant_id / $2 employee_id。
+    pub const DELETE_DEVICE_RECORDS: &str =
+        "DELETE FROM vein_device_records WHERE tenant_id = $1 AND employee_id = $2";
+
     /// 乗務員のテンプレートを消す。$1 tenant_id / $2 employee_id。
     pub const DELETE: &str = "DELETE FROM vein_templates WHERE tenant_id = $1 AND employee_id = $2";
 }
@@ -251,6 +289,19 @@ pub trait VeinTemplatesRepository: Send + Sync {
         read_updated_at: DateTime<Utc>,
     ) -> Result<bool, DbError>;
 
-    /// 乗務員のテンプレートを消す。`Ok(false)` = 登録が無い。
+    /// 端末 `device_id` で撮った module の記録を預かる (1 乗務員 1 端末 1 行、同じ端末なら差し替え)。
+    /// `Ok(None)` = 承認済みの module の行が在る生きている乗務員が居ない (409 に写す)。
+    async fn upsert_device_record(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        device_id: &str,
+        record: &str,
+    ) -> Result<Option<DateTime<Utc>>, DbError>;
+
+    /// テナントの端末ごとの記録 (承認済みの module の行が在る乗務員の分。古い順)。
+    async fn list_device_records(&self, tenant_id: Uuid) -> Result<Vec<DeviceRecordRow>, DbError>;
+
+    /// 乗務員のテンプレート (と端末ごとの記録) を消す。`Ok(false)` = 登録が無い。
     async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError>;
 }
