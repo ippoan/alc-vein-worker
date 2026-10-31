@@ -4,7 +4,7 @@
 //! SQL は [`crate::repo::sql`] の定数だけを、共通 crate `alc-worker-db` の [`TenantTx`] が出す
 //! **型付きの名前なしの文** (`query_typed` 系・`execute_typed`) で流す。名前付き prepared statement は
 //! Hyperdrive 経由で接続が切れるので使わない (`TenantTx` に口が無い)。引数の型の並びが書かれるのは、
-//! 下の自由関数 9 つの 1 か所だけ (`$n` の意味は `repo::sql` の各定数の doc)。
+//! 下の自由関数 11 の 1 か所だけ (`$n` の意味は `repo::sql` の各定数の doc)。
 //!
 //! ## RLS (trait のメソッド 1 回 = 1 トランザクション)
 //!
@@ -22,7 +22,7 @@ use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use crate::repo::{
-    sql, ApprovalItem, ApproveByEmployee, PendingModuleItem, VeinTemplateRow,
+    sql, ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
     VeinTemplatesRepository,
 };
 
@@ -30,6 +30,7 @@ impl TxOutput for VeinTemplateRow {}
 impl TxOutput for ApprovalItem {}
 impl TxOutput for PendingModuleItem {}
 impl TxOutput for ApproveByEmployee {}
+impl TxOutput for DeviceRecordRow {}
 
 /// [`sql::UPSERT`] → (行を返したときだけ) [`sql::INSERT_ENROLL_EVENT`] を、渡された 1 つの transaction の中で
 /// 続けて流す (テンプレートと登録の履歴がずれない)。`Ok(None)` = そのテナントに生きている乗務員が居ない (履歴も書かない)。
@@ -242,12 +243,59 @@ pub async fn update_learned(
     Ok(n == 1)
 }
 
-/// [`sql::DELETE`]。`Ok(true)` = 1 行消した。
+/// [`sql::UPSERT_DEVICE_RECORD`]。`Ok(None)` = 承認済みの module の行が在る乗務員が居ない。
+pub async fn upsert_device_record(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    device_id: &str,
+    record: &str,
+) -> Result<Option<DateTime<Utc>>, tokio_postgres::Error> {
+    let row = tx
+        .query_typed_opt(
+            sql::UPSERT_DEVICE_RECORD,
+            &[
+                (&tenant_id, Type::UUID),
+                (&employee_id, Type::UUID),
+                (&device_id, Type::TEXT),
+                (&record, Type::TEXT),
+            ],
+        )
+        .await?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+/// [`sql::LIST_DEVICE_RECORDS`]。
+pub async fn list_device_records(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+) -> Result<Vec<DeviceRecordRow>, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(sql::LIST_DEVICE_RECORDS, &[(&tenant_id, Type::UUID)])
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| DeviceRecordRow {
+            employee_id: r.get(0),
+            device_id: r.get(1),
+            record: r.get(2),
+            updated_at: r.get(3),
+        })
+        .collect())
+}
+
+/// [`sql::DELETE_DEVICE_RECORDS`] → [`sql::DELETE`] を、渡された 1 つの transaction の中で続けて流す。
+/// `Ok(true)` = テンプレートの行を 1 行消した。
 pub async fn delete(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
     employee_id: Uuid,
 ) -> Result<bool, tokio_postgres::Error> {
+    tx.execute_typed(
+        sql::DELETE_DEVICE_RECORDS,
+        &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID)],
+    )
+    .await?;
     let n = tx
         .execute_typed(
             sql::DELETE,
@@ -432,6 +480,36 @@ impl VeinTemplatesRepository for PgVeinTemplates {
                 Box::pin(async move {
                     update_learned(tx, tenant_id, id, &template, read_updated_at).await
                 })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn upsert_device_record(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        device_id: &str,
+        record: &str,
+    ) -> Result<Option<DateTime<Utc>>, DbError> {
+        let device_id = device_id.to_owned();
+        let record = record.to_owned();
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move {
+                    upsert_device_record(tx, tenant_id, employee_id, &device_id, &record).await
+                })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn list_device_records(&self, tenant_id: Uuid) -> Result<Vec<DeviceRecordRow>, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { list_device_records(tx, tenant_id).await })
             })
             .await
             .map_err(db_err)

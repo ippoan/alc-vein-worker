@@ -18,10 +18,10 @@ use alc_core_wasm::{AuthUser, DbError, TenantId};
 
 use super::tenant_router;
 use super::{MAX_MODULE_RECORDS, MAX_MODULE_RECORD_BYTES};
-use crate::matcher::{synth, MAX_TEMPLATES};
+use crate::matcher::{self, synth, MAX_TEMPLATES};
 use crate::repo::{
-    ApprovalItem, ApproveByEmployee, PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository,
-    FORMAT_MODULE,
+    ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
+    VeinTemplatesRepository, FORMAT_MODULE,
 };
 use crate::VeinState;
 
@@ -41,10 +41,14 @@ struct FakeRepo {
     managers: Mutex<Vec<Uuid>>,
     /// 運行管理者として承認された (対象, 承認者)。
     approved_by_employee: Mutex<Vec<(Uuid, Uuid)>>,
+    /// 端末ごとの記録 (`vein_device_records`)。
+    device_records: Mutex<Vec<DeviceRecordRow>>,
     fail: AtomicBool,
     /// upsert だけを DB エラーにする (人数の数えは通す)。
     fail_upsert: AtomicBool,
     conflict: AtomicBool,
+    /// list_device_records だけを DB エラーにする。
+    fail_device_list: AtomicBool,
     /// update_learned の呼び出し (id, 読んだ updated_at)。
     learned_calls: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
 }
@@ -269,8 +273,51 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(true)
     }
 
+    async fn upsert_device_record(
+        &self,
+        _tenant_id: Uuid,
+        employee_id: Uuid,
+        device_id: &str,
+        record: &str,
+    ) -> Result<Option<DateTime<Utc>>, DbError> {
+        self.check()?;
+        let approved_module = self.modules.lock().unwrap().contains(&employee_id)
+            && !self.pending.lock().unwrap().contains(&employee_id)
+            && self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.employee_id == employee_id);
+        if !approved_module {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let mut devices = self.device_records.lock().unwrap();
+        devices.retain(|d| !(d.employee_id == employee_id && d.device_id == device_id));
+        devices.push(DeviceRecordRow {
+            employee_id,
+            device_id: device_id.to_string(),
+            record: record.to_string(),
+            updated_at: now,
+        });
+        Ok(Some(now))
+    }
+
+    async fn list_device_records(&self, _tenant_id: Uuid) -> Result<Vec<DeviceRecordRow>, DbError> {
+        self.check()?;
+        if self.fail_device_list.load(Ordering::SeqCst) {
+            return Err(DbError::Other("pool timed out".into()));
+        }
+        Ok(self.device_records.lock().unwrap().clone())
+    }
+
     async fn delete(&self, _tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
         self.check()?;
+        self.device_records
+            .lock()
+            .unwrap()
+            .retain(|d| d.employee_id != employee_id);
         let mut rows = self.rows.lock().unwrap();
         let before = rows.len();
         rows.retain(|r| r.employee_id != employee_id);
@@ -983,6 +1030,7 @@ async fn module_rows_stay_out_of_identify_and_the_chara_list() {
             "record": record(64),
             "updated_at": put["updated_at"],
             "registered_device_id": null,
+            "composed": false,
         }] })
     );
     let (_, v) = call(&repo, "GET", "/vein/templates", Value::Null).await;
@@ -1153,4 +1201,322 @@ async fn approve_by_employee_db_error_is_500() {
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+// --- 端末ごとの記録 (Refs ippoan/alc-app#558) ---
+
+/// 同じ種の特徴量 `n` 件から組んだ mode 1 のテンプレート (base64)。
+fn template_of_seed(seed: u64, n: usize) -> String {
+    matcher::enroll_template(&vec![synth::chara(seed); n]).unwrap()
+}
+
+/// base64 のテンプレートの件数。
+fn count_of(b64: &str) -> u8 {
+    let t = STANDARD.decode(b64).unwrap();
+    vein_match_search::parse_template(&t).unwrap().0.count
+}
+
+/// 期待値: `a` の 3 件の後ろに `b` の 3 件を並べた記録 (base64)。
+fn mixed_of(a: &str, b: &str) -> String {
+    let (a, b) = (STANDARD.decode(a).unwrap(), STANDARD.decode(b).unwrap());
+    STANDARD.encode(vein_match_search::mix_templates(&[(&a, 3), (&b, 3)]).unwrap())
+}
+
+/// 承認済みの module の行を作る (`device` はその行の登録した端末)。
+fn approved_module(repo: &FakeRepo, name: &str, record: &str, device: Option<&str>) -> Uuid {
+    let id = repo.add_employee(name);
+    repo.rows.lock().unwrap().push(VeinTemplateRow {
+        id: Uuid::new_v4(),
+        employee_id: id,
+        name: name.to_string(),
+        template: record.to_string(),
+        updated_at: ts(100),
+        registered_device_id: device.map(str::to_owned),
+    });
+    repo.modules.lock().unwrap().push(id);
+    id
+}
+
+/// 基準の時刻から `n` 秒後。
+fn ts(n: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp(1_700_000_000 + n, 0).unwrap()
+}
+
+fn add_device_record(repo: &FakeRepo, id: Uuid, device: &str, record: &str, at: i64) {
+    repo.device_records.lock().unwrap().push(DeviceRecordRow {
+        employee_id: id,
+        device_id: device.to_string(),
+        record: record.to_string(),
+        updated_at: ts(at),
+    });
+}
+
+async fn put_device(
+    repo: &Arc<FakeRepo>,
+    id: Uuid,
+    device: Option<&[u8]>,
+    record: &str,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/module/devices");
+    let headers: Vec<(&str, &[u8])> = device.map(|d| ("x-device-id", d)).into_iter().collect();
+    call_full(
+        repo,
+        None,
+        &headers,
+        "PUT",
+        &uri,
+        json!({ "record": record }),
+    )
+    .await
+}
+
+/// `X-Device-Id` つきで `GET /vein/module-templates`。
+async fn get_modules_as(repo: &Arc<FakeRepo>, device: &[u8]) -> (StatusCode, Value) {
+    let h: [(&str, &[u8]); 1] = [("x-device-id", device)];
+    call_full(repo, None, &h, "GET", "/vein/module-templates", Value::Null).await
+}
+
+#[tokio::test]
+async fn put_device_record_requires_device_id_and_a_valid_record() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = approved_module(&repo, "山田", &record(4), Some("kiosk-1"));
+    let rec = record(4);
+    let (status, v) = put_device(&repo, id, None, &rec).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "device_id_required");
+    let (status, v) = put_device(&repo, id, Some(b"a b"), &rec).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "invalid_device_id");
+    for (bad, code) in [
+        ("!!!".to_string(), "invalid_module_record"),
+        (String::new(), "invalid_module_record"),
+        (
+            record(MAX_MODULE_RECORD_BYTES + 1),
+            "module_record_too_long",
+        ),
+    ] {
+        let (status, v) = put_device(&repo, id, Some(b"kiosk-2"), &bad).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["error"], code);
+    }
+    assert!(repo.device_records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn put_device_record_needs_an_approved_module_row() {
+    let repo = Arc::new(FakeRepo::default());
+    let rec = record(4);
+    // 登録が無い・chara の行・承認待ちの module の行はどれも 409
+    let nobody = Uuid::new_v4();
+    let (status, v) = put_device(&repo, nobody, Some(b"kiosk-2"), &rec).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], "no_approved_module_record");
+    let chara = enroll(&repo, "鈴木", 1).await;
+    assert_eq!(
+        put_device(&repo, chara, Some(b"kiosk-2"), &rec).await.0,
+        StatusCode::CONFLICT
+    );
+    let pending = repo.add_employee("佐藤");
+    assert_eq!(put_module(&repo, pending, &rec).await.0, StatusCode::OK);
+    assert_eq!(
+        put_device(&repo, pending, Some(b"kiosk-2"), &rec).await.0,
+        StatusCode::CONFLICT
+    );
+    assert!(repo.device_records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn put_device_record_upserts_per_device_without_touching_approval() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = approved_module(&repo, "山田", &record(4), Some("kiosk-1"));
+    let (status, v) = put_device(&repo, id, Some(b"kiosk-2"), "AAEC").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["employee_id"], id.to_string());
+    assert!(v["updated_at"].is_string());
+    // 同じ端末は差し替え、別の端末は別の行
+    assert_eq!(
+        put_device(&repo, id, Some(b"kiosk-2"), "AAED").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_device(&repo, id, Some(b"kiosk-3"), "AAEC").await.0,
+        StatusCode::OK
+    );
+    let devices = repo.device_records.lock().unwrap().clone();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(
+        devices
+            .iter()
+            .find(|d| d.device_id == "kiosk-2")
+            .unwrap()
+            .record,
+        "AAED"
+    );
+    // 元の行は承認済みのまま・record もそのまま
+    assert!(!repo.pending.lock().unwrap().contains(&id));
+    assert_eq!(repo.template_of(id), record(4));
+}
+
+#[tokio::test]
+async fn put_device_record_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = approved_module(&repo, "山田", &record(4), None);
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = put_device(&repo, id, Some(b"kiosk-2"), &record(4)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn module_list_without_device_id_or_device_records_is_unchanged() {
+    let repo = Arc::new(FakeRepo::default());
+    let base = template_of_seed(1, 3);
+    let id = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    let before = json!({ "templates": [{
+        "employee_id": id, "record": base, "updated_at": ts(100),
+        "registered_device_id": "kiosk-1", "composed": false,
+    }] });
+    // ヘッダ無し (管理者のログイン) はそのまま。端末ごとの記録が無い乗務員もそのまま
+    let (_, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(v, before);
+    assert_eq!(get_modules_as(&repo, b"kiosk-1").await.1, before);
+    assert_eq!(get_modules_as(&repo, b"kiosk-2").await.1, before);
+    // ヘッダ無しは端末ごとの記録が在っても混ぜない
+    add_device_record(&repo, id, "kiosk-2", &template_of_seed(2, 3), 200);
+    let (_, v) = call(&repo, "GET", "/vein/module-templates", Value::Null).await;
+    assert_eq!(v, before);
+}
+
+#[tokio::test]
+async fn module_list_rejects_invalid_device_id_and_db_errors() {
+    let repo = Arc::new(FakeRepo::default());
+    let (status, v) = get_modules_as(&repo, b"a b").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "invalid_device_id");
+    repo.fail_device_list.store(true, Ordering::SeqCst);
+    assert_eq!(
+        get_modules_as(&repo, b"kiosk-1").await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn module_list_mixes_own_and_the_newest_other_for_the_requester() {
+    let repo = Arc::new(FakeRepo::default());
+    // 元の行 = kiosk-1 の 3 件。kiosk-2 (古い) と kiosk-3 (新しい) の端末ごとの記録
+    let base = template_of_seed(1, 3);
+    let id = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    add_device_record(&repo, id, "kiosk-2", &template_of_seed(2, 3), 200);
+    add_device_record(&repo, id, "kiosk-3", &template_of_seed(3, 3), 300);
+    // 別の乗務員 (端末ごとの記録が無い) はそのまま
+    let alone = approved_module(&repo, "鈴木", &template_of_seed(9, 3), Some("kiosk-1"));
+
+    // kiosk-1 向け: 自分 = 元の行の 3 件、他 = 最新の kiosk-3 の 3 件
+    let (status, v) = get_modules_as(&repo, b"kiosk-1").await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &v["templates"][0];
+    assert_eq!(item["employee_id"], id.to_string());
+    assert_eq!(item["composed"], true);
+    assert_eq!(item["registered_device_id"], "kiosk-1");
+    assert_eq!(item["updated_at"], json!(ts(300)));
+    let mixed = item["record"].as_str().unwrap();
+    assert_eq!(count_of(mixed), 6);
+    let expect = mixed_of(&base, &template_of_seed(3, 3));
+    assert_eq!(mixed, expect);
+    assert_eq!(v["templates"][1]["employee_id"], alone.to_string());
+    assert_eq!(v["templates"][1]["composed"], false);
+
+    // kiosk-2 向け: 自分 = kiosk-2 の端末ごとの記録、他 = 自分でない最新 = kiosk-3
+    let (_, v) = get_modules_as(&repo, b"kiosk-2").await;
+    let item = &v["templates"][0];
+    assert_eq!(item["composed"], true);
+    assert_eq!(item["updated_at"], json!(ts(300)));
+    assert_eq!(
+        item["record"],
+        mixed_of(&template_of_seed(2, 3), &template_of_seed(3, 3))
+    );
+    // kiosk-3 向け: 他 = 自分でない最新 = kiosk-2 (200) より新しい元の行 (100) ではなく kiosk-2
+    let (_, v) = get_modules_as(&repo, b"kiosk-3").await;
+    let item = &v["templates"][0];
+    assert_eq!(item["updated_at"], json!(ts(300)));
+    assert_eq!(
+        item["record"],
+        mixed_of(&template_of_seed(3, 3), &template_of_seed(2, 3))
+    );
+}
+
+#[tokio::test]
+async fn module_list_without_an_own_record_mixes_the_two_newest() {
+    let repo = Arc::new(FakeRepo::default());
+    let base = template_of_seed(1, 3);
+    let id = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    add_device_record(&repo, id, "kiosk-2", &template_of_seed(2, 3), 200);
+    add_device_record(&repo, id, "kiosk-3", &template_of_seed(3, 3), 300);
+    // 元の行が登録した端末が分からなくても同じ
+    let unknown = approved_module(&repo, "鈴木", &base, None);
+    add_device_record(&repo, unknown, "kiosk-2", &template_of_seed(2, 3), 150);
+
+    let (_, v) = get_modules_as(&repo, b"kiosk-9").await;
+    let item = &v["templates"][0];
+    assert_eq!(item["composed"], true);
+    assert_eq!(item["updated_at"], json!(ts(300)));
+    assert_eq!(
+        item["record"],
+        mixed_of(&template_of_seed(3, 3), &template_of_seed(2, 3))
+    );
+    let item = &v["templates"][1];
+    assert_eq!(item["composed"], true);
+    assert_eq!(item["updated_at"], json!(ts(150)));
+    assert_eq!(item["record"], mixed_of(&template_of_seed(2, 3), &base));
+}
+
+#[tokio::test]
+async fn module_list_with_only_the_requesters_own_records_is_unchanged() {
+    let repo = Arc::new(FakeRepo::default());
+    // 元の行も端末ごとの記録も kiosk-1 のもの = 他が無い
+    let base = template_of_seed(1, 3);
+    let id = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    add_device_record(&repo, id, "kiosk-1", &template_of_seed(2, 3), 200);
+    let (_, v) = get_modules_as(&repo, b"kiosk-1").await;
+    let item = &v["templates"][0];
+    assert_eq!(item["composed"], false);
+    assert_eq!(item["record"], base);
+}
+
+#[tokio::test]
+async fn module_list_falls_back_to_the_base_when_mixing_fails() {
+    let repo = Arc::new(FakeRepo::default());
+    // base64 として読めない記録 / テンプレートとして読めない記録
+    let base = template_of_seed(1, 3);
+    let a = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    add_device_record(&repo, a, "kiosk-2", "!!!", 200);
+    let b = approved_module(&repo, "鈴木", &base, Some("kiosk-1"));
+    add_device_record(&repo, b, "kiosk-2", &record(8), 200);
+    let (status, v) = get_modules_as(&repo, b"kiosk-1").await;
+    assert_eq!(status, StatusCode::OK);
+    for item in v["templates"].as_array().unwrap() {
+        assert_eq!(item["composed"], false);
+        assert_eq!(item["record"], base);
+        assert_eq!(item["updated_at"], json!(ts(100)));
+    }
+}
+
+#[tokio::test]
+async fn delete_also_removes_the_device_records_of_that_employee() {
+    let repo = Arc::new(FakeRepo::default());
+    let a = approved_module(&repo, "山田", &record(4), Some("kiosk-1"));
+    let b = approved_module(&repo, "鈴木", &record(4), Some("kiosk-1"));
+    add_device_record(&repo, a, "kiosk-2", &record(4), 200);
+    add_device_record(&repo, b, "kiosk-2", &record(4), 200);
+    let (status, _) = call_as(
+        &repo,
+        Some("admin"),
+        "DELETE",
+        &format!("/vein/templates/{a}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let devices = repo.device_records.lock().unwrap().clone();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].employee_id, b);
 }

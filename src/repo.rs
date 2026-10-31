@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alc_core_wasm::DbError;
 use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::{
-    ApprovalItem, ApproveByEmployee, PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository,
+    ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
+    VeinTemplatesRepository,
 };
 use alc_worker_db::PgClient;
 use chrono::{DateTime, Utc};
@@ -185,6 +186,24 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
                 .update_learned(tenant_id, id, template, read_updated_at),
         )
         .await
+    }
+
+    async fn upsert_device_record(
+        &self,
+        tenant_id: Uuid,
+        employee_id: Uuid,
+        device_id: &str,
+        record: &str,
+    ) -> Result<Option<DateTime<Utc>>, DbError> {
+        self.timed(
+            self.inner
+                .upsert_device_record(tenant_id, employee_id, device_id, record),
+        )
+        .await
+    }
+
+    async fn list_device_records(&self, tenant_id: Uuid) -> Result<Vec<DeviceRecordRow>, DbError> {
+        self.timed(self.inner.list_device_records(tenant_id)).await
     }
 
     async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
