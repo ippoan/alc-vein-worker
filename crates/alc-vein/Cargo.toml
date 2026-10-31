@@ -30,8 +30,8 @@ serde_json = "1"
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-vein-match = { git = "https://github.com/ippoan/vein-match", rev = "b654fe21d33dddb279320585514da5127c8a7d85" }
-vein-match-search = { git = "https://github.com/ippoan/vein-match", rev = "b654fe21d33dddb279320585514da5127c8a7d85" }
+vein-match = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.3" }
+vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.3" }
 
 # trait・型・matcher・routes と repo の実装 (`pg`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
 # (接続は持たない。張るのは直下の worker と tests/sql_db.rs、Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#723)。
