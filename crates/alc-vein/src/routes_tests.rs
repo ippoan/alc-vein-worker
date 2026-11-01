@@ -1520,3 +1520,98 @@ async fn delete_also_removes_the_device_records_of_that_employee() {
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].employee_id, b);
 }
+
+/// `X-Device-Id` つきで `GET /vein/module-templates?<query>`。
+async fn get_modules_query(
+    repo: &Arc<FakeRepo>,
+    device: &[u8],
+    query: &str,
+) -> (StatusCode, Value) {
+    let h: [(&str, &[u8]); 1] = [("x-device-id", device)];
+    let uri = format!("/vein/module-templates?{query}");
+    call_full(repo, None, &h, "GET", &uri, Value::Null).await
+}
+
+#[tokio::test]
+async fn module_list_pick_own_returns_the_requesters_record_unmixed() {
+    let repo = Arc::new(FakeRepo::default());
+    let base = template_of_seed(1, 6);
+    let id = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    add_device_record(&repo, id, "kiosk-2", &template_of_seed(2, 6), 200);
+    add_device_record(&repo, id, "kiosk-2", &template_of_seed(4, 6), 250);
+    add_device_record(&repo, id, "kiosk-3", &template_of_seed(3, 6), 300);
+
+    // kiosk-2 向け: kiosk-2 の端末ごとの記録の新しいほう (他の端末のほうが新しくても混ぜない)
+    let (status, v) = get_modules_query(&repo, b"kiosk-2", "pick=own").await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &v["templates"][0];
+    assert_eq!(item["record"], template_of_seed(4, 6));
+    assert_eq!(item["updated_at"], json!(ts(250)));
+    assert_eq!(item["composed"], false);
+    assert_eq!(item["source"], "own");
+    assert_eq!(item["registered_device_id"], "kiosk-1");
+
+    // kiosk-1 向け: 端末ごとの記録は無いが元の行が kiosk-1 で撮ったもの
+    let (_, v) = get_modules_query(&repo, b"kiosk-1", "pick=own").await;
+    let item = &v["templates"][0];
+    assert_eq!(item["record"], base);
+    assert_eq!(item["updated_at"], json!(ts(100)));
+    assert_eq!(item["source"], "own");
+}
+
+#[tokio::test]
+async fn module_list_pick_own_without_an_own_record_takes_the_newest_other() {
+    let repo = Arc::new(FakeRepo::default());
+    let base = template_of_seed(1, 6);
+    // 端末ごとの記録のほうが新しい
+    let a = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    add_device_record(&repo, a, "kiosk-2", &template_of_seed(2, 6), 200);
+    add_device_record(&repo, a, "kiosk-3", &template_of_seed(3, 6), 300);
+    // 元の行と同時刻 = 元の行
+    let b = approved_module(&repo, "鈴木", &base, None);
+    add_device_record(&repo, b, "kiosk-2", &template_of_seed(2, 6), 100);
+    // 端末ごとの記録が無い
+    approved_module(&repo, "佐藤", &base, Some("kiosk-1"));
+
+    let (_, v) = get_modules_query(&repo, b"kiosk-9", "pick=own").await;
+    let items = v["templates"].as_array().unwrap();
+    assert_eq!(items[0]["record"], template_of_seed(3, 6));
+    assert_eq!(items[0]["updated_at"], json!(ts(300)));
+    for item in items {
+        assert_eq!(item["source"], "other");
+        assert_eq!(item["composed"], false);
+    }
+    assert_eq!(items[1]["record"], base);
+    assert_eq!(items[2]["record"], base);
+}
+
+#[tokio::test]
+async fn module_list_filters_by_employee_and_rejects_an_unknown_pick() {
+    let repo = Arc::new(FakeRepo::default());
+    let base = template_of_seed(1, 6);
+    approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    let b = approved_module(&repo, "鈴木", &template_of_seed(2, 6), Some("kiosk-1"));
+
+    let (status, v) =
+        get_modules_query(&repo, b"kiosk-1", &format!("pick=own&employee_id={b}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = v["templates"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["employee_id"], b.to_string());
+    // 居ない人は空の一覧。ヘッダ無しでも絞れる (source は出さない)
+    let (_, v) = get_modules_query(
+        &repo,
+        b"kiosk-1",
+        &format!("employee_id={}", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(v["templates"], json!([]));
+    let uri = format!("/vein/module-templates?employee_id={b}");
+    let (_, v) = call(&repo, "GET", &uri, Value::Null).await;
+    assert_eq!(v["templates"].as_array().unwrap().len(), 1);
+    assert!(v["templates"][0].get("source").is_none());
+
+    let (status, v) = get_modules_query(&repo, b"kiosk-1", "pick=mixed").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "invalid_pick");
+}

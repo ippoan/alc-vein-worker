@@ -5,7 +5,9 @@
 //! - `PUT /vein/templates/{employee_id}/module/devices` `{"record": base64}` → その端末で撮った記録を端末ごとに足す
 //!   (`X-Device-Id` 必須。承認済みの module の行が在る乗務員だけ。承認は要らない。Refs ippoan/alc-app#558)
 //! - `GET /vein/module-templates` → 承認済みのモジュールの記録の一覧 (端末が書き戻して、モジュール自身に照合させる)。
-//!   `X-Device-Id` があれば、その端末向けに「その端末の 3 件 + 他の端末の最新の 3 件」へ混ぜて返す
+//!   `X-Device-Id` があれば、その端末向けに「その端末の 3 件 + 他の端末の最新の 3 件」へ混ぜて返す。
+//!   `?pick=own` なら混ぜずに 1 件を選ぶ (その端末で撮った記録、無ければ他の端末の最新。`source` = `own` / `other`)。
+//!   `?employee_id=<uuid>` でその 1 人だけに絞る (端末が免許証で決まった人の版を確かめる)
 //! - `GET /vein/module-templates/pending` → 承認待ちのモジュールの記録の一覧 (端末の token で。中身は返さない)
 //! - `POST /vein/templates/{employee_id}/approve-by-employee` `{"approver_employee_id", "updated_at"}` → 運行管理者
 //!   (社員) による承認 (端末の token で。承認者は端末の照合で決まり、ここで役割・登録・自己承認を検査する)
@@ -26,7 +28,7 @@
 //! 見て、役割 (キオスクに開く口) は auth-worker の許可表が決める。
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post, put},
     Extension, Json, Router,
@@ -402,6 +404,7 @@ fn compose_for_device(
             updated_at,
             registered_device_id: base.registered_device_id,
             composed: true,
+            source: None,
         },
         None => {
             let employee_id = base.employee_id;
@@ -409,6 +412,42 @@ fn compose_for_device(
             base.into()
         }
     }
+}
+
+/// `pick=own` の 1 件 (Refs ippoan/alc-app-s3#352): 混ぜずに、`requester` で撮った記録 (端末ごとの記録、無ければ
+/// 元の行がその端末のもの) を選ぶ。無ければ出どころのうち最新 (`updated_at`) のもの。
+fn pick_for_device(
+    base: VeinTemplateRow,
+    devices: &[&DeviceRecordRow],
+    requester: &str,
+) -> ModuleRecordItem {
+    let own = devices
+        .iter()
+        .filter(|d| d.device_id == requester)
+        .max_by_key(|d| d.updated_at);
+    // 自分が無ければ、元の行と端末ごとの記録のうち最新 (同時刻は元の行。[`compose_for_device`] の並べ方と同じ)
+    let newest = devices
+        .iter()
+        .max_by_key(|d| d.updated_at)
+        .filter(|d| d.updated_at > base.updated_at);
+    let (chosen, source) = match own {
+        Some(d) => (Some(d), "own"),
+        None if base.registered_device_id.as_deref() == Some(requester) => (None, "own"),
+        None => (newest, "other"),
+    };
+    let mut item: ModuleRecordItem = match chosen {
+        Some(d) => ModuleRecordItem {
+            employee_id: base.employee_id,
+            record: d.record.clone(),
+            updated_at: d.updated_at,
+            registered_device_id: base.registered_device_id,
+            composed: false,
+            source: None,
+        },
+        None => base.into(),
+    };
+    item.source = Some(source);
+    item
 }
 
 /// base64 の記録 2 つから先頭 [`MIX_TAKE`] 件ずつを取り、混ぜた記録を base64 で返す。読めなければ `None`。
@@ -419,19 +458,42 @@ fn mix_records(a: &str, b: &str) -> Option<String> {
     Some(STANDARD.encode(mixed))
 }
 
+#[derive(Debug, Deserialize)]
+struct ModuleTemplatesQuery {
+    /// `own` だけ受ける (混ぜずに 1 件を選ぶ。[`pick_for_device`])
+    pick: Option<String>,
+    /// この乗務員だけに絞る
+    employee_id: Option<Uuid>,
+}
+
 /// 承認済みのモジュールの記録の一覧 (端末のモジュールへ書き戻す元)。`X-Device-Id` があれば、その端末向けに
-/// [`compose_for_device`] で組む (端末ごとの記録は 1 回の問い合わせで全員分)。無ければ (管理者のログイン) 元の行のまま。
+/// [`compose_for_device`] で組む (`?pick=own` なら [`pick_for_device`] で選ぶ。端末ごとの記録は 1 回の問い合わせで
+/// 全員分)。無ければ (管理者のログイン) 元の行のまま。`?employee_id=` はその 1 人に絞る (居なければ空の一覧)。
 async fn list_module_templates(
     State(state): State<VeinState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(query): Query<ModuleTemplatesQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    let pick_own = match query.pick.as_deref() {
+        None => false,
+        Some("own") => true,
+        Some(_) => {
+            return Err(unprocessable(
+                "invalid_pick",
+                "pick は own だけ指定できます",
+            ))
+        }
+    };
     let requester = registered_device_id(&headers)?;
-    let rows = state
+    let mut rows = state
         .templates
         .list(tenant_id, FORMAT_MODULE)
         .await
         .map_err(|e| internal_error("vein list_module_templates", e))?;
+    if let Some(employee_id) = query.employee_id {
+        rows.retain(|r| r.employee_id == employee_id);
+    }
     let Some(requester) = requester else {
         let templates: Vec<ModuleRecordItem> = rows.into_iter().map(Into::into).collect();
         return Ok(Json(json!({ "templates": templates })));
@@ -448,7 +510,11 @@ async fn list_module_templates(
                 .iter()
                 .filter(|d| d.employee_id == base.employee_id)
                 .collect();
-            compose_for_device(base, &own, &requester)
+            if pick_own {
+                pick_for_device(base, &own, &requester)
+            } else {
+                compose_for_device(base, &own, &requester)
+            }
         })
         .collect();
     Ok(Json(json!({ "templates": templates })))

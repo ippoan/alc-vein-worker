@@ -18,7 +18,7 @@ alc-core-wasm = { workspace = true }
 # テナントの transaction の部品 (`PgClient`・`TenantTx`・`TxOutput`)。`pg` (repo の実装) が使う
 alc-worker-db = { workspace = true }
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["json"] }
+axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 # `pg` の Mutex と、`tenant_tx` の閉包が返す BoxFuture
