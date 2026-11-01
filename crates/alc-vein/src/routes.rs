@@ -53,8 +53,10 @@ use crate::VeinState;
 /// モジュールの記録 1 件の大きさの上限 (バイト。モジュールの READ_ENROLL の全体は実機で 8156 バイト)。
 pub const MAX_MODULE_RECORD_BYTES: usize = 0x2000;
 
-/// テナントのモジュールの記録の人数の上限 (端末のモジュールの本番の ID は 10〜100 の 91 個)。
-pub const MAX_MODULE_RECORDS: usize = 91;
+/// テナントのモジュールの記録の人数の上限。端末のモジュールの枠 (本番の ID は 10〜100 の 91 個) より多くてよい:
+/// 端末は免許証で決まった人だけを枠に書き、埋まったら一番長く使っていない人の枠を使い回す
+/// (Refs ippoan/alc-app-s3#352)。数は chara の行の 1:N の上限 [`MAX_TEMPLATES`] に揃える。
+pub const MAX_MODULE_RECORDS: usize = MAX_TEMPLATES;
 
 /// 端末向けに混ぜる記録の、1 つの出どころから取る件数 (自分の 3 件 + 他の端末の 3 件 = 記録の上限の 6 件)。
 const MIX_TAKE: usize = 3;
