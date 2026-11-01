@@ -991,7 +991,7 @@ async fn put_module_unknown_employee_is_404_and_db_error_is_500() {
 }
 
 #[tokio::test]
-async fn put_module_new_employee_at_91_is_409_but_overwrite_and_chara_rows_pass() {
+async fn put_module_new_employee_at_500_is_409_but_overwrite_and_chara_rows_pass() {
     let repo = Arc::new(FakeRepo::default());
     // chara の行は module の人数に数えない
     fill_rows(&repo, MAX_TEMPLATES);
@@ -1000,11 +1000,11 @@ async fn put_module_new_employee_at_91_is_409_but_overwrite_and_chara_rows_pass(
         last = repo.add_employee(&format!("m{i}"));
         assert_eq!(put_module(&repo, last, &record(8)).await.0, StatusCode::OK);
     }
-    let over = repo.add_employee("92 人目");
+    let over = repo.add_employee("501 人目");
     let (status, v) = put_module(&repo, over, &record(8)).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(v["error"], "too_many_module_records");
-    assert!(v["message"].as_str().unwrap().contains("91"));
+    assert!(v["message"].as_str().unwrap().contains("500"));
     // 既に module の行がある乗務員の上書きは通る
     assert_eq!(put_module(&repo, last, &record(9)).await.0, StatusCode::OK);
 }
