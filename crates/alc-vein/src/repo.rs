@@ -85,6 +85,10 @@ pub struct ModuleRecordItem {
     pub registered_device_id: Option<String>,
     /// 要求した端末のために、端末ごとの記録を混ぜて組んだ記録なら true。
     pub composed: bool,
+    /// `pick=own` で選んだ出どころ (`own` = 要求した端末で撮った記録 / `other` = 他の端末の最新)。
+    /// `pick` を付けない要求では JSON に出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 impl From<VeinTemplateRow> for ModuleRecordItem {
@@ -95,6 +99,7 @@ impl From<VeinTemplateRow> for ModuleRecordItem {
             updated_at: r.updated_at,
             registered_device_id: r.registered_device_id,
             composed: false,
+            source: None,
         }
     }
 }
