@@ -49,6 +49,8 @@ struct FakeRepo {
     conflict: AtomicBool,
     /// list_device_records だけを DB エラーにする。
     fail_device_list: AtomicBool,
+    /// upsert_device_record だけを DB エラーにする。
+    fail_device_upsert: AtomicBool,
     /// update_learned の呼び出し (id, 読んだ updated_at)。
     learned_calls: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
 }
@@ -281,6 +283,9 @@ impl VeinTemplatesRepository for FakeRepo {
         record: &str,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         self.check()?;
+        if self.fail_device_upsert.load(Ordering::SeqCst) {
+            return Err(DbError::Other("pool timed out".into()));
+        }
         let approved_module = self.modules.lock().unwrap().contains(&employee_id)
             && !self.pending.lock().unwrap().contains(&employee_id)
             && self
@@ -1614,4 +1619,197 @@ async fn module_list_filters_by_employee_and_rejects_an_unknown_pick() {
     let (status, v) = get_modules_query(&repo, b"kiosk-1", "pick=mixed").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(v["error"], "invalid_pick");
+}
+
+/// `X-Device-Id` つきで `POST …/module/devices/rotate`。
+async fn rotate(
+    repo: &Arc<FakeRepo>,
+    id: Uuid,
+    device: Option<&[u8]>,
+    body: Value,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/module/devices/rotate");
+    let headers: Vec<(&str, &[u8])> = device.map(|d| ("x-device-id", d)).into_iter().collect();
+    call_full(repo, None, &headers, "POST", &uri, body).await
+}
+
+/// base64 のテンプレートの各件の特徴量。
+fn charas_of(b64: &str) -> Vec<Vec<u8>> {
+    let t = STANDARD.decode(b64).unwrap();
+    vein_match_search::template_to_charas(&t)
+        .unwrap()
+        .iter()
+        .map(|c| c.to_vec())
+        .collect()
+}
+
+/// 1 件ずつ違う特徴量を並べたテンプレート (`seeds` の順)。
+fn template_of_seeds(seeds: &[u64]) -> String {
+    let charas: Vec<_> = seeds.iter().map(|s| synth::chara(*s)).collect();
+    matcher::enroll_template(&charas).unwrap()
+}
+
+#[tokio::test]
+async fn rotate_requires_device_id_valid_input_and_an_approved_row() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = approved_module(
+        &repo,
+        "山田",
+        &template_of_seeds(&[1, 2, 3, 4]),
+        Some("kiosk-1"),
+    );
+    let fresh = template_of_seeds(&[9]);
+    let (status, v) = rotate(&repo, id, None, json!({ "record": fresh })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "device_id_required");
+    let (status, v) = rotate(
+        &repo,
+        id,
+        Some(b"kiosk-9"),
+        json!({ "record": fresh, "pick": "mixed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["error"], "invalid_pick");
+    for bad in ["!!!".to_string(), String::new(), record(8)] {
+        let (status, v) = rotate(&repo, id, Some(b"kiosk-9"), json!({ "record": bad })).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["error"], "invalid_module_record");
+    }
+    // 承認済みの module の行が無い (登録が無い・承認待ち) は 409
+    let (status, v) = rotate(
+        &repo,
+        Uuid::new_v4(),
+        Some(b"kiosk-9"),
+        json!({ "record": fresh }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"], "no_approved_module_record");
+    let pending = repo.add_employee("佐藤");
+    assert_eq!(put_module(&repo, pending, &fresh).await.0, StatusCode::OK);
+    assert_eq!(
+        rotate(&repo, pending, Some(b"kiosk-9"), json!({ "record": fresh }))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert!(repo.device_records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rotate_puts_the_fresh_one_first_and_drops_the_oldest_once_full() {
+    let repo = Arc::new(FakeRepo::default());
+    // 他の端末 (kiosk-1) で登録した 4 件。kiosk-9 には自分の記録が無い
+    let base = template_of_seeds(&[1, 2, 3, 4]);
+    let id = approved_module(&repo, "山田", &base, Some("kiosk-1"));
+    let pick = json!("own");
+
+    // 1 回目: 撮った 1 件 + 配っている元の行の 4 件 = 5 件 (まだ落とさない)
+    let (status, v) = rotate(
+        &repo,
+        id,
+        Some(b"kiosk-9"),
+        json!({ "record": template_of_seeds(&[11, 99]), "pick": pick }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["employee_id"], id.to_string());
+    let first = v["record"].as_str().unwrap().to_string();
+    let c = |s: u64| charas_of(&template_of_seeds(&[s])).remove(0);
+    // 撮った記録は先頭の 1 件だけを使う
+    assert_eq!(charas_of(&first), vec![c(11), c(1), c(2), c(3), c(4)]);
+    // その端末の記録として預かり、pick=own はそれを返す
+    let (_, listed) = get_modules_query(&repo, b"kiosk-9", "pick=own").await;
+    assert_eq!(listed["templates"][0]["record"], first);
+    assert_eq!(listed["templates"][0]["source"], "own");
+    assert_eq!(listed["templates"][0]["updated_at"], v["updated_at"]);
+
+    // 2 回目で 6 件、3 回目からは一番古い (末尾の) 1 件が落ちる
+    for (seed, expect) in [
+        (12, vec![12, 11, 1, 2, 3, 4]),
+        (13, vec![13, 12, 11, 1, 2, 3]),
+    ] {
+        let (status, v) = rotate(
+            &repo,
+            id,
+            Some(b"kiosk-9"),
+            json!({ "record": template_of_seeds(&[seed]), "pick": pick }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let want: Vec<_> = expect.into_iter().map(c).collect();
+        assert_eq!(charas_of(v["record"].as_str().unwrap()), want);
+    }
+    // 元の行と他の端末の記録には触らない
+    assert_eq!(repo.template_of(id), base);
+    assert_eq!(repo.device_records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rotate_without_pick_starts_from_the_composed_record_and_compose_keeps_a_full_own_record() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = approved_module(
+        &repo,
+        "山田",
+        &template_of_seeds(&[1, 2, 3]),
+        Some("kiosk-1"),
+    );
+    add_device_record(&repo, id, "kiosk-2", &template_of_seeds(&[4, 5, 6]), 200);
+    let c = |s: u64| charas_of(&template_of_seeds(&[s])).remove(0);
+
+    // kiosk-9 に配っているのは新しい 2 つを混ぜた記録 (kiosk-2 の 3 件 + 元の行の 3 件)
+    let (status, v) = rotate(
+        &repo,
+        id,
+        Some(b"kiosk-9"),
+        json!({ "record": template_of_seeds(&[11]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rotated = v["record"].as_str().unwrap().to_string();
+    assert_eq!(
+        charas_of(&rotated),
+        vec![c(11), c(4), c(5), c(6), c(1), c(2)]
+    );
+
+    // 6 件揃った自分の記録は混ぜ直さずに返す (混ぜると入れ替えた件を捨てる)
+    let (_, listed) = get_modules_as(&repo, b"kiosk-9").await;
+    let item = &listed["templates"][0];
+    assert_eq!(item["record"], rotated);
+    assert_eq!(item["composed"], false);
+    assert_eq!(item["updated_at"], v["updated_at"]);
+    assert_eq!(item["registered_device_id"], "kiosk-1");
+    // 他の端末向けは今までどおり混ぜる (kiosk-1 = 自分の元の行 3 件 + 他の最新 = kiosk-9 の先頭 3 件)
+    let (_, listed) = get_modules_as(&repo, b"kiosk-1").await;
+    let item = &listed["templates"][0];
+    assert_eq!(item["composed"], true);
+    assert_eq!(
+        charas_of(item["record"].as_str().unwrap()),
+        vec![c(1), c(2), c(3), c(11), c(4), c(5)]
+    );
+}
+
+#[tokio::test]
+async fn rotate_db_errors_are_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = approved_module(&repo, "山田", &template_of_seeds(&[1, 2, 3]), None);
+    let body = json!({ "record": template_of_seeds(&[11]) });
+    repo.fail_device_list.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rotate(&repo, id, Some(b"kiosk-9"), body.clone()).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail_device_list.store(false, Ordering::SeqCst);
+    repo.fail_device_upsert.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rotate(&repo, id, Some(b"kiosk-9"), body.clone()).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail_device_upsert.store(false, Ordering::SeqCst);
+    repo.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rotate(&repo, id, Some(b"kiosk-9"), body).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
