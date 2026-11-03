@@ -42,6 +42,7 @@ use alc_core_wasm::api_error::{internal_error, not_found, unprocessable, ApiErro
 use alc_core_wasm::{AuthUser, TenantId};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use vein_match_search::MAXREG;
 
 use crate::matcher::{self, CharaError, MAX_TEMPLATES};
 use crate::repo::{
@@ -85,6 +86,10 @@ pub fn tenant_router() -> Router<VeinState> {
             put(upsert_device_record),
         )
         .route(
+            "/vein/templates/{employee_id}/module/devices/rotate",
+            post(rotate_device_record),
+        )
+        .route(
             "/vein/templates/{employee_id}",
             put(upsert_template).delete(delete_template),
         )
@@ -99,6 +104,14 @@ struct UpsertBody {
 #[derive(Deserialize)]
 struct ModuleRecordBody {
     record: String,
+}
+
+#[derive(Deserialize)]
+struct RotateBody {
+    /// 照合が通った直後にその端末で撮った記録 (先頭の 1 件だけを使う)
+    record: String,
+    /// 端末が今どちらの組み方で取っているか (`own` なら [`pick_for_device`]、無ければ [`compose_for_device`])
+    pick: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -364,6 +377,8 @@ struct MixSource<'a> {
 /// - 自分が無く端末ごとの記録が在れば、新しい順の 2 つを 3 件 + 3 件に混ぜる。
 /// - 端末ごとの記録が無い・自分だけで他が無いときは `base` のまま。
 /// - 読めない・混ぜられないときは warn を出して `base` のまま。
+/// - ただし自分の端末ごとの記録が [`MAXREG`] 件揃っていれば、それ自体を混ぜずに返す (照合のたびに入れ替えた記録
+///   [`rotate_device_record`] は、もう他の端末の件を含む。混ぜ直すと入れ替えた件を捨てる)。
 fn compose_for_device(
     base: VeinTemplateRow,
     devices: &[&DeviceRecordRow],
@@ -395,6 +410,18 @@ fn compose_for_device(
             .map(|o| (m, o)),
         None => (!devices.is_empty()).then_some((0, 1)),
     };
+    if let Some(m) = mine.filter(|&m| !sources[m].is_base) {
+        if record_count(sources[m].record) == Some(MAXREG) {
+            return ModuleRecordItem {
+                employee_id: base.employee_id,
+                record: sources[m].record.to_owned(),
+                updated_at: sources[m].updated_at,
+                registered_device_id: base.registered_device_id.clone(),
+                composed: false,
+                source: None,
+            };
+        }
+    }
     let Some((a, b)) = pair else {
         return base.into();
     };
@@ -477,16 +504,7 @@ async fn list_module_templates(
     Query(query): Query<ModuleTemplatesQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let pick_own = match query.pick.as_deref() {
-        None => false,
-        Some("own") => true,
-        Some(_) => {
-            return Err(unprocessable(
-                "invalid_pick",
-                "pick は own だけ指定できます",
-            ))
-        }
-    };
+    let pick_own = parse_pick(query.pick.as_deref())?;
     let requester = registered_device_id(&headers)?;
     let mut rows = state
         .templates
@@ -512,14 +530,115 @@ async fn list_module_templates(
                 .iter()
                 .filter(|d| d.employee_id == base.employee_id)
                 .collect();
-            if pick_own {
-                pick_for_device(base, &own, &requester)
-            } else {
-                compose_for_device(base, &own, &requester)
-            }
+            serve_for_device(base, &own, &requester, pick_own)
         })
         .collect();
     Ok(Json(json!({ "templates": templates })))
+}
+
+/// `pick` の値: 無し = 混ぜる、`own` = 混ぜずに選ぶ。他は 422 `invalid_pick`
+fn parse_pick(pick: Option<&str>) -> Result<bool, ApiError> {
+    match pick {
+        None => Ok(false),
+        Some("own") => Ok(true),
+        Some(_) => Err(unprocessable(
+            "invalid_pick",
+            "pick は own だけ指定できます",
+        )),
+    }
+}
+
+/// 端末 `requester` へ配る 1 件 (`pick_own` なら [`pick_for_device`]、でなければ [`compose_for_device`])
+fn serve_for_device(
+    base: VeinTemplateRow,
+    devices: &[&DeviceRecordRow],
+    requester: &str,
+    pick_own: bool,
+) -> ModuleRecordItem {
+    if pick_own {
+        pick_for_device(base, devices, requester)
+    } else {
+        compose_for_device(base, devices, requester)
+    }
+}
+
+/// 照合が通った端末の 1 本で、その端末へ配っている記録の一番古い 1 本を入れ替え、その端末の記録として預かる
+///。記録の件は新しい順に並べる約束: 撮った 1 件を先頭に置き、配っている記録の
+/// 先頭から [`MAXREG`] - 1 件を続ける (= 末尾の一番古い 1 件が落ちる。6 件に満たなければ落とさず増える)。
+/// 通るたびに呼ばれ、その端末の記録はだんだんその端末で撮った件に入れ替わる。
+/// `X-Device-Id` 必須 (422 `device_id_required`)。承認済みの module の行が無ければ 409 `no_approved_module_record`。
+/// 撮った記録・配っている記録が読めなければ 422 `invalid_module_record`。返すのは組んだ記録と版
+async fn rotate_device_record(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(employee_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<RotateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(requester) = registered_device_id(&headers)? else {
+        return Err(unprocessable(
+            "device_id_required",
+            "X-Device-Id (端末の token) が要ります",
+        ));
+    };
+    let pick_own = parse_pick(body.pick.as_deref())?;
+    validate_module_record(&body.record)?;
+    let no_record = || {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "no_approved_module_record",
+                "message": "承認済みの module の記録が在る乗務員だけ、端末の記録を入れ替えられます",
+            })),
+        )
+    };
+    let base = state
+        .templates
+        .list(tenant_id, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein rotate list", e))?
+        .into_iter()
+        .find(|r| r.employee_id == employee_id)
+        .ok_or_else(no_record)?;
+    let devices = state
+        .templates
+        .list_device_records(tenant_id)
+        .await
+        .map_err(|e| internal_error("vein rotate list_device_records", e))?;
+    let own: Vec<&DeviceRecordRow> = devices
+        .iter()
+        .filter(|d| d.employee_id == employee_id)
+        .collect();
+    let served = serve_for_device(base, &own, &requester, pick_own);
+    let record = rotate_records(&body.record, &served.record)
+        .ok_or_else(|| unprocessable("invalid_module_record", "記録を組み直せません"))?;
+    let updated_at = state
+        .templates
+        .upsert_device_record(tenant_id, employee_id, &requester, &record)
+        .await
+        .map_err(|e| internal_error("vein rotate upsert_device_record", e))?
+        .ok_or_else(no_record)?;
+    Ok(Json(json!({
+        "employee_id": employee_id,
+        "record": record,
+        "updated_at": updated_at,
+    })))
+}
+
+/// 撮った記録 `fresh` の先頭 1 件 + 配っている記録 `served` の先頭 [`MAXREG`] - 1 件 (base64)。読めなければ `None`
+fn rotate_records(fresh: &str, served: &str) -> Option<String> {
+    let fresh = STANDARD.decode(fresh).ok()?;
+    let served = STANDARD.decode(served).ok()?;
+    let rotated = vein_match_search::mix_templates(&[(&fresh, 1), (&served, MAXREG - 1)]).ok()?;
+    Some(STANDARD.encode(rotated))
+}
+
+/// base64 の記録の件数。読めなければ `None`
+fn record_count(b64: &str) -> Option<usize> {
+    let t = STANDARD.decode(b64).ok()?;
+    Some(usize::from(
+        vein_match_search::parse_template(&t).ok()?.0.count,
+    ))
 }
 
 async fn list_pending(
