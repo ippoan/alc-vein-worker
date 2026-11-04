@@ -340,7 +340,7 @@ impl VeinTemplatesRepository for FakeRepo {
         &self,
         _tenant_id: Uuid,
         shot: &NewAuthShot,
-        judgment: &Judgment,
+        judgments: &[Judgment],
     ) -> Result<bool, DbError> {
         self.check_shots("insert_auth_shot")?;
         if !self
@@ -358,7 +358,7 @@ impl VeinTemplatesRepository for FakeRepo {
         self.judgments
             .lock()
             .unwrap()
-            .push((shot.id, judgment.clone()));
+            .extend(judgments.iter().map(|j| (shot.id, j.clone())));
         Ok(true)
     }
 
@@ -412,6 +412,8 @@ impl VeinTemplatesRepository for FakeRepo {
             .rev()
             .take(limit as usize)
             .map(|(s, at)| AuthShotStatus {
+                judgment: latest(&judgments, s.id, "self", *at),
+                judgment_top10: latest(&judgments, s.id, "top10", *at),
                 id: s.id,
                 employee_id: s.employee_id,
                 device_id: s.device_id.clone(),
@@ -425,12 +427,6 @@ impl VeinTemplatesRepository for FakeRepo {
                 shot_kind: s.shot_kind.to_string(),
                 captured_at: s.captured_at,
                 created_at: *at,
-                judgment: judgments.iter().rfind(|(id, _)| *id == s.id).map(|(_, j)| {
-                    StoredJudgment {
-                        judgment: j.clone(),
-                        created_at: *at,
-                    }
-                }),
             })
             .collect())
     }
@@ -451,6 +447,22 @@ impl VeinTemplatesRepository for FakeRepo {
         rows.retain(|r| r.employee_id != employee_id);
         Ok(rows.len() < before)
     }
+}
+
+/// 撮影 `shot_id` の `method` の最新の判定 (fake の保存時刻つき)。
+fn latest(
+    judgments: &[(Uuid, Judgment)],
+    shot_id: Uuid,
+    method: &str,
+    at: DateTime<Utc>,
+) -> Option<StoredJudgment> {
+    judgments
+        .iter()
+        .rfind(|(id, j)| *id == shot_id && j.method == method)
+        .map(|(_, j)| StoredJudgment {
+            judgment: j.clone(),
+            created_at: at,
+        })
 }
 
 /// 撮影の暗号化に使うテストの鍵 (本物の鍵ではない)。
@@ -2051,7 +2063,8 @@ async fn auth_shot_is_judged_against_the_served_record_and_stored_encrypted() {
         shot
     );
     assert_eq!(shots[1].0.shot_kind, "chara");
-    assert_eq!(repo.judgments.lock().unwrap().len(), 3);
+    // 撮影 1 件に判定 2 行 (self と top10)
+    assert_eq!(repo.judgments.lock().unwrap().len(), 6);
 }
 
 #[tokio::test]
@@ -2299,7 +2312,7 @@ async fn rejudge_adds_judgments_for_stored_shots_and_keeps_the_old_ones() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = call(&repo, "POST", uri, json!({})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(repo.judgments.lock().unwrap().len(), 2);
+    assert_eq!(repo.judgments.lock().unwrap().len(), 4);
 
     let (status, v) = as_developer(&repo, "POST", uri, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{v}");
@@ -2308,14 +2321,32 @@ async fn rejudge_adds_judgments_for_stored_shots_and_keeps_the_old_ones() {
     assert_eq!(v.get("more"), None);
     {
         let judgments = repo.judgments.lock().unwrap();
-        assert_eq!(judgments.len(), 5);
-        let results: Vec<&str> = judgments[2..]
+        assert_eq!(judgments.len(), 10);
+        // 撮影ごとに self → top10 の順で足す
+        let results: Vec<(&str, &str)> = judgments[4..]
             .iter()
-            .map(|(_, j)| j.result.as_str())
+            .map(|(_, j)| (j.method.as_str(), j.result.as_str()))
             .collect();
-        assert_eq!(results, ["match", "nomatch", "error"]);
-        assert_eq!(judgments[4].1.error.as_deref(), Some("unreadable_shot"));
+        assert_eq!(
+            results,
+            [
+                ("self", "match"),
+                ("top10", "match"),
+                ("self", "nomatch"),
+                ("top10", "nomatch"),
+                ("self", "error"),
+                ("top10", "error"),
+            ]
+        );
+        assert_eq!(judgments[8].1.error.as_deref(), Some("unreadable_shot"));
+        assert_eq!(judgments[9].1.error.as_deref(), Some("unreadable_shot"));
+        assert_eq!(
+            judgments[5].1.logic_version,
+            auth_shots::logic_version_top10()
+        );
     }
+    assert_eq!(v["methods"], json!({ "self": 3, "top10": 3 }));
+    {}
 
     // since 以降だけ (保存時刻 ts(1) 以降の 2 件)
     let (_, v) = as_developer(&repo, "POST", uri, json!({ "since": ts(1) })).await;
@@ -2410,7 +2441,7 @@ async fn rejudge_needs_the_key_and_db_errors_are_500() {
         );
         repo.fail_shot_methods.lock().unwrap().clear();
     }
-    assert_eq!(repo.judgments.lock().unwrap().len(), 1);
+    assert_eq!(repo.judgments.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -2488,4 +2519,125 @@ async fn purge_is_part_of_the_repo_contract() {
         .unwrap()
         .push("purge_auth_shots");
     assert!(repo.purge_auth_shots().await.is_err());
+}
+
+// ---- 認証ログの 1:N (method = top10) ----
+
+/// 種 `seeds` それぞれの記録 (3 件) を承認済みで持つ乗務員を作る。
+fn enrolled_seeds(repo: &FakeRepo, seeds: &[u64]) -> Vec<Uuid> {
+    seeds
+        .iter()
+        .map(|&s| {
+            approved_module(
+                repo,
+                &format!("乗務員{s}"),
+                &template_of_seeds(&[s, s, s]),
+                Some("kiosk-1"),
+            )
+        })
+        .collect()
+}
+
+fn top10_of(v: &Value) -> &Value {
+    &v["judgment_top10"]
+}
+
+#[tokio::test]
+async fn top10_matches_the_one_person_who_passes() {
+    let repo = Arc::new(FakeRepo::default());
+    let ids = enrolled_seeds(&repo, &[7, 21, 33]);
+    // 記録が読めない人は外して続ける
+    approved_module(&repo, "壊れた記録", "!!!", Some("kiosk-1"));
+    let (status, v) = post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // self は今までどおり
+    assert_eq!(v["judgment"]["method"], "self");
+    assert_eq!(v["judgment"]["result"], "match");
+    let t = top10_of(&v);
+    assert_eq!(t["method"], "top10");
+    assert_eq!(t["result"], "match", "{t}");
+    assert_eq!(t["matched_employee_id"], ids[0].to_string());
+    assert_eq!(t["logic_version"], auth_shots::logic_version_top10());
+    assert!(t["logic_version"]
+        .as_str()
+        .unwrap()
+        .contains("rank_top10 chara_verify"));
+    let cands = t["candidates"].as_array().unwrap();
+    assert_eq!(cands.len(), 3);
+    for (i, c) in cands.iter().enumerate() {
+        assert_eq!(c["rank"], i as u64 + 1);
+        assert!(c["coarse"].is_u64());
+        assert_eq!(c["scores"].as_array().unwrap().len(), 3);
+    }
+    let hits: Vec<&Value> = cands.iter().filter(|c| c["matched"] == true).collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["employee_id"], ids[0].to_string());
+    // 撮影 1 件に判定 2 行
+    let judgments = repo.judgments.lock().unwrap();
+    assert_eq!(judgments.len(), 2);
+    assert_eq!(judgments[1].1.method, "top10");
+}
+
+#[tokio::test]
+async fn top10_asks_again_when_two_people_pass_and_nomatch_when_nobody_does() {
+    let repo = Arc::new(FakeRepo::default());
+    // 同じ特徴量を 2 人に登録する
+    let ids = enrolled_seeds(&repo, &[7, 7, 21]);
+    let (_, v) = post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    let t = top10_of(&v);
+    assert_eq!(t["result"], "again", "{t}");
+    assert_eq!(t["matched_employee_id"], Value::Null);
+    let hits = t["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["matched"] == true)
+        .count();
+    assert_eq!(hits, 2);
+
+    let (_, v) = post_shot(&repo, shot_body(ids[0], &chara_shot(99))).await;
+    let t = top10_of(&v);
+    assert_eq!(t["result"], "nomatch", "{t}");
+    assert_eq!(t["matched_employee_id"], Value::Null);
+    assert_eq!(t["error"], Value::Null);
+}
+
+#[tokio::test]
+async fn top10_is_an_error_without_usable_records_or_over_the_limit() {
+    // 承認済みの記録が 1 つも無い / 全部読めない
+    let repo = Arc::new(FakeRepo::default());
+    let none = repo.add_employee("記録なし");
+    let (_, v) = post_shot(&repo, shot_body(none, &chara_shot(7))).await;
+    assert_eq!(top10_of(&v)["error"], "no_approved_record");
+    assert_eq!(top10_of(&v)["result"], "error");
+    approved_module(&repo, "壊れた記録", "!!!", Some("kiosk-1"));
+    let (_, v) = post_shot(&repo, shot_body(none, &chara_shot(7))).await;
+    assert_eq!(top10_of(&v)["error"], "no_approved_record");
+
+    // 利用者数の上限を超える
+    let records: Vec<(Uuid, String)> = (0..=MAX_TEMPLATES)
+        .map(|_| (Uuid::new_v4(), "x".to_string()))
+        .collect();
+    assert_eq!(
+        auth_shots::build_gallery(&records).err(),
+        Some("too_many_templates")
+    );
+    let gallery = auth_shots::build_gallery(&records);
+    let j = auth_shots::judge_top10(&gallery, None, true);
+    assert_eq!(
+        (j.result.as_str(), j.error.as_deref()),
+        ("error", Some("too_many_templates"))
+    );
+}
+
+#[tokio::test]
+async fn list_returns_the_latest_judgment_of_each_method() {
+    let repo = Arc::new(FakeRepo::default());
+    let ids = enrolled_seeds(&repo, &[7, 21]);
+    post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    let (_, v) = as_developer(&repo, "GET", "/vein/auth-shots", Value::Null).await;
+    let s = &v["shots"][0];
+    assert_eq!(s["judgment"]["method"], "self");
+    assert_eq!(s["judgment_top10"]["method"], "top10");
+    assert_eq!(s["judgment_top10"]["result"], "match");
 }

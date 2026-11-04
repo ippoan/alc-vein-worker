@@ -247,16 +247,22 @@ pub mod sql {
     ORDER BY created_at, id
     LIMIT $3"#;
 
-    /// 新しい順の状態と最新の判定 (撮影そのものは選ばない)。$1 tenant_id / $2 limit。
+    /// 新しい順の状態と、method ごと (self / top10) の最新の判定 (撮影そのものは選ばない)。$1 tenant_id / $2 limit。
     pub const LIST_AUTH_SHOT_STATUS: &str = r#"SELECT s.id, s.employee_id, s.device_id, s.firmware, s.module_result, s.module_slot,
         s.module_hit, s.module_score, s.module_thresholds, s.pick, s.shot_kind, s.captured_at, s.created_at,
-        j.logic_version, j.method, j.result, j.matched_employee_id, j.candidates::text, j.error, j.elapsed_us, j.created_at
+        j.logic_version, j.method, j.result, j.matched_employee_id, j.candidates::text, j.error, j.elapsed_us, j.created_at,
+        t.logic_version, t.method, t.result, t.matched_employee_id, t.candidates::text, t.error, t.elapsed_us, t.created_at
     FROM vein_auth_shots s
     LEFT JOIN LATERAL (
         SELECT * FROM vein_auth_judgments x
-        WHERE x.tenant_id = s.tenant_id AND x.shot_id = s.id
+        WHERE x.tenant_id = s.tenant_id AND x.shot_id = s.id AND x.method = 'self'
         ORDER BY x.created_at DESC, x.id DESC LIMIT 1
     ) j ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT * FROM vein_auth_judgments x
+        WHERE x.tenant_id = s.tenant_id AND x.shot_id = s.id AND x.method = 'top10'
+        ORDER BY x.created_at DESC, x.id DESC LIMIT 1
+    ) t ON TRUE
     WHERE s.tenant_id = $1
     ORDER BY s.created_at DESC, s.id DESC
     LIMIT $2"#;
@@ -353,13 +359,13 @@ pub trait VeinTemplatesRepository: Send + Sync {
     /// 乗務員のテンプレート (と端末ごとの記録) を消す。`Ok(false)` = 登録が無い。
     async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError>;
 
-    /// 認証ログの撮影と状態を足し、同じ transaction で最初の判定も足す。`Ok(false)` = 生きている乗務員が居ない
+    /// 認証ログの撮影と状態を足し、同じ transaction で最初の判定 (method ごとに 1 行) も足す。`Ok(false)` = 生きている乗務員が居ない
     /// (何も書かない。404 に写す)。
     async fn insert_auth_shot(
         &self,
         tenant_id: Uuid,
         shot: &NewAuthShot,
-        judgment: &Judgment,
+        judgments: &[Judgment],
     ) -> Result<bool, DbError>;
 
     /// 判定し直しの対象 (`since` 以降の保存時刻、古い順に `limit` 件まで)。

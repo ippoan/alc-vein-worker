@@ -9,6 +9,8 @@
 //! 撮影は生体データなので、worker が Secrets Store の鍵で暗号化してから DB に書く (DB は暗号文だけを持つ)。
 //! 鍵は [`VeinState::auth_shot_key`] で、worker が [`needs_key`] の口のときだけ取る。
 
+use std::collections::HashMap;
+
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -25,8 +27,9 @@ use alc_core_wasm::api_error::{internal_error, not_found, unprocessable, ApiErro
 use alc_core_wasm::TenantId;
 use alc_worker_crypto::secret::{decrypt_secret, encrypt_secret};
 use vein_match::{load, PLANE_LEN};
-use vein_match_search::{chara_verify, template_to_charas, Library, TEMPLATE_MAGIC};
+use vein_match_search::{chara_verify, rank_top, template_to_charas, Library, TEMPLATE_MAGIC};
 
+use crate::matcher::MAX_TEMPLATES;
 use crate::repo::{DeviceRecordRow, VeinTemplateRow, FORMAT_MODULE};
 use crate::routes::{
     forbidden, parse_pick, registered_device_id, serve_for_device, MAX_MODULE_RECORD_BYTES,
@@ -38,7 +41,9 @@ use crate::VeinState;
 const DEVELOPER_HEADER: &str = "x-user-developer";
 
 /// 判定し直しの 1 回の件数の上限。超えたら `more: true` を返し、残りは `next_since` から続ける。
-pub const REJUDGE_LIMIT: usize = 500;
+/// 撮影 1 件に self と top10 の 2 回の判定がかかり (利用者 100 人で 1 件 100 ms 前後の見込み)、
+/// 1 回の呼び出しの CPU 時間に収めるため小さめにする。
+pub const REJUDGE_LIMIT: usize = 100;
 const LIST_DEFAULT: i64 = 50;
 const LIST_MAX: i64 = 200;
 const MAX_FIRMWARE_LEN: usize = 64;
@@ -48,10 +53,21 @@ const MAX_THRESHOLDS: usize = 8;
 /// 計算か閾値を直したら [`logic_version`] に出る文字列も変わるよう、1 か所にまとめる。
 const CHARA_VERIFY_THRESHOLDS: &str = "55/55/75";
 
-/// 判定した計算の版 (vein-match-search の版と閾値)。判定の行に残す。
+/// 判定した計算の版 (vein-match-search の版と閾値)。method = `self` の判定の行に残す。
 pub fn logic_version() -> String {
     format!(
         "search-{} chara_verify {CHARA_VERIFY_THRESHOLDS}",
+        vein_match_search::VERSION
+    )
+}
+
+/// 粗い比較で絞る人数 (method = `top10`)。
+const TOP_N: usize = 10;
+
+/// method = `top10` の判定の版 (粗い比較の上位 [`TOP_N`] 人 + `chara_verify`)。
+pub fn logic_version_top10() -> String {
+    format!(
+        "search-{} rank_top{TOP_N} chara_verify {CHARA_VERIFY_THRESHOLDS}",
         vein_match_search::VERSION
     )
 }
@@ -115,6 +131,12 @@ pub struct Candidate {
     pub matched: bool,
     /// `chara_verify` の info の s0, s1, s2
     pub scores: [u8; 3],
+    /// 粗い比較の点数 (`rank_top`。小さいほど近い)。method = `top10` のときだけ
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse: Option<u32>,
+    /// 粗い比較の順位 (1 から)。method = `top10` のときだけ
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
 }
 
 /// 判定 1 回ぶん (`vein_auth_judgments` の 1 行)。
@@ -154,8 +176,10 @@ pub struct AuthShotStatus {
     pub shot_kind: String,
     pub captured_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
-    /// 最新の判定 (判定の行が無ければ null)
+    /// method = `self` の最新の判定 (判定の行が無ければ null)
     pub judgment: Option<StoredJudgment>,
+    /// method = `top10` の最新の判定 (無ければ null)
+    pub judgment_top10: Option<StoredJudgment>,
 }
 
 /// 判定し直しの対象 (暗号化されたままの撮影)。
@@ -246,15 +270,23 @@ fn validate_module(m: &ModuleBody, firmware: Option<&str>) -> Result<(), ApiErro
 /// `chara_verify` は不一致でも読み込みの失敗でも info が全 0 で返るので、先に自分で読めることを確かめて
 /// 区別する (記録は取り込める生のテンプレート、撮影は読み込める特徴量)。
 fn verify(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Result<([u8; 3], bool), &'static str> {
+    let enroll = decode_record(record_b64).ok_or("unreadable_record")?;
+    let (chara, _) = shot_plane(shot)?;
+    verify_chara(&enroll, &chara)
+}
+
+/// 記録 (base64) を取り込める生のテンプレートにする。取り込めなければ `None`。
+fn decode_record(record_b64: &str) -> Option<Vec<u8>> {
     let enroll = STANDARD
         .decode(record_b64)
         .ok()
-        .filter(|e| e.starts_with(&TEMPLATE_MAGIC.to_le_bytes()))
-        .ok_or("unreadable_record")?;
-    let mut lib = Library::new(2).ok_or("library_unavailable")?;
-    if lib.import_temp(1, &enroll) != 0 {
-        return Err("unreadable_record");
-    }
+        .filter(|e| e.starts_with(&TEMPLATE_MAGIC.to_le_bytes()))?;
+    let mut lib = Library::new(2)?;
+    (lib.import_temp(1, &enroll) == 0).then_some(enroll)
+}
+
+/// 撮影から照合に使う特徴量 (0x448 バイト) と、その平面を取り出す。読めなければ `unreadable_shot`。
+fn shot_plane(shot: &(ShotKind, Vec<u8>)) -> Result<(Vec<u8>, [u8; PLANE_LEN]), &'static str> {
     let chara = match shot.0 {
         ShotKind::Chara => shot.1.clone(),
         ShotKind::Record => template_to_charas(&shot.1)
@@ -263,8 +295,15 @@ fn verify(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Result<([u8; 3], bool
             .ok_or("unreadable_shot")?
             .to_vec(),
     };
-    load(&chara, chara.len() as u32, &mut [0u8; PLANE_LEN]).map_err(|_| "unreadable_shot")?;
-    let r = chara_verify(&mut lib, &enroll, &chara, 0);
+    let mut plane = [0u8; PLANE_LEN];
+    load(&chara, chara.len() as u32, &mut plane).map_err(|_| "unreadable_shot")?;
+    Ok((chara, plane))
+}
+
+/// 取り込める記録 `enroll` と特徴量 `chara` を `chara_verify` で 1:1 に確かめる (毎回 `Library::new(2)`)。
+fn verify_chara(enroll: &[u8], chara: &[u8]) -> Result<([u8; 3], bool), &'static str> {
+    let mut lib = Library::new(2).ok_or("library_unavailable")?;
+    let r = chara_verify(&mut lib, enroll, chara, 0);
     let info = r.info.pack();
     Ok(([info[6], info[7], info[8]], r.output.is_some()))
 }
@@ -281,11 +320,7 @@ pub fn judge_self(
         (None, _) => Err("no_approved_record"),
         (_, None) => Err("unreadable_shot"),
     };
-    // Workers の時計は CPU の間は進まないので、0 は「測れなかった」として残さない
-    let elapsed_us = (Utc::now() - started)
-        .num_microseconds()
-        .and_then(|us| i32::try_from(us).ok())
-        .filter(|&us| us > 0);
+    let elapsed_us = elapsed_us(started, 0);
     let (result, matched_employee_id, candidates, error) = match verified {
         Ok((scores, true)) => (
             "match",
@@ -294,6 +329,8 @@ pub fn judge_self(
                 employee_id,
                 matched: true,
                 scores,
+                coarse: None,
+                rank: None,
             }],
             None,
         ),
@@ -304,6 +341,8 @@ pub fn judge_self(
                 employee_id,
                 matched: false,
                 scores,
+                coarse: None,
+                rank: None,
             }],
             None,
         ),
@@ -320,6 +359,137 @@ pub fn judge_self(
     }
 }
 
+/// 微秒で測った経過 (Workers の時計は CPU の間は進まないので、0 は「測れなかった」として残さない)
+fn elapsed_us(started: DateTime<Utc>, extra_us: i64) -> Option<i32> {
+    (Utc::now() - started)
+        .num_microseconds()
+        .and_then(|us| i32::try_from(us.saturating_add(extra_us)).ok())
+        .filter(|&us| us > 0)
+}
+
+/// method = `top10` の相手: その端末へ配る記録 (承認済み・取り込めるもの) を `import_temp` で入れた `Library`。
+/// 粗い比較 (`rank_top`) は `Library` を変えないので、同じ端末・同じ `pick` の撮影のあいだ使い回せる。
+pub struct Gallery {
+    lib: Library,
+    /// 利用者 (1 始まりで `import_temp` した順) の乗務員と、取り込んだ生のテンプレート
+    people: Vec<(Uuid, Vec<u8>)>,
+    /// 取り込みに使った時間 (マイクロ秒。POST の判定の時間に足す)
+    build_us: i64,
+}
+
+/// 相手の記録から [`Gallery`] を組む。読めない記録は外して警告を出す。件数が [`MAX_TEMPLATES`] を超えたら
+/// `too_many_templates`、読める記録が 1 つも無ければ `no_approved_record`。
+pub fn build_gallery(records: &[(Uuid, String)]) -> Result<Gallery, &'static str> {
+    let started = Utc::now();
+    if records.len() > MAX_TEMPLATES {
+        return Err("too_many_templates");
+    }
+    let people: Vec<(Uuid, Vec<u8>)> = records
+        .iter()
+        .filter_map(|(id, b64)| decode_record(b64).map(|enroll| (*id, enroll)))
+        .collect();
+    let dropped = records.len() - people.len();
+    if dropped > 0 {
+        tracing::warn!("vein auth_shot top10: 読めない記録 {dropped} 件を外した");
+    }
+    if people.is_empty() {
+        return Err("no_approved_record");
+    }
+    let mut lib = Library::new(people.len().max(2)).ok_or("library_unavailable")?;
+    // 読めると確かめた記録だけなので、取り込みは通る
+    for (i, (_, enroll)) in people.iter().enumerate() {
+        lib.import_temp(i as u32 + 1, enroll);
+    }
+    let build_us = (Utc::now() - started).num_microseconds().unwrap_or(0);
+    Ok(Gallery {
+        lib,
+        people,
+        build_us,
+    })
+}
+
+/// 粗い比較で上位 [`TOP_N`] 人に絞り、その全員を `chara_verify` にかける (method = `top10`)。
+/// 1 人だけ通れば `match`、2 人以上通れば `again` (点数で選ばない)、0 人なら `nomatch`。
+/// `include_build` なら [`Gallery`] を組んだ時間も判定の時間に足す。
+pub fn judge_top10(
+    gallery: &Result<Gallery, &'static str>,
+    shot: Option<&(ShotKind, Vec<u8>)>,
+    include_build: bool,
+) -> Judgment {
+    let started = Utc::now();
+    let ranked = match (gallery, shot) {
+        (Err(reason), _) => Err(*reason),
+        (_, None) => Err("unreadable_shot"),
+        (Ok(g), Some(shot)) => shot_plane(shot).map(|(chara, plane)| {
+            let rows = rank_top(&g.lib, &plane, TOP_N);
+            (g, chara, rows)
+        }),
+    };
+    let build_us = match gallery {
+        Ok(g) if include_build => g.build_us,
+        _ => 0,
+    };
+    let (result, matched_employee_id, candidates, error) = match ranked {
+        Err(reason) => ("error", None, vec![], Some(reason.to_owned())),
+        Ok((g, chara, rows)) => {
+            let candidates: Vec<Candidate> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, &(user, coarse))| {
+                    let (employee_id, enroll) = &g.people[user as usize - 1];
+                    // 取り込めると確かめた記録なので、読めない場合は起きない
+                    let (scores, matched) = verify_chara(enroll, &chara).unwrap_or(([0; 3], false));
+                    Candidate {
+                        employee_id: *employee_id,
+                        matched,
+                        scores,
+                        coarse: Some(coarse),
+                        rank: Some(i as u32 + 1),
+                    }
+                })
+                .collect();
+            let hits: Vec<Uuid> = candidates
+                .iter()
+                .filter(|c| c.matched)
+                .map(|c| c.employee_id)
+                .collect();
+            let (result, who) = match hits.as_slice() {
+                [] => ("nomatch", None),
+                [one] => ("match", Some(*one)),
+                _ => ("again", None),
+            };
+            (result, who, candidates, None)
+        }
+    };
+    Judgment {
+        logic_version: logic_version_top10(),
+        method: "top10".to_owned(),
+        result: result.to_owned(),
+        matched_employee_id,
+        candidates,
+        error,
+        elapsed_us: elapsed_us(started, build_us),
+    }
+}
+
+/// 端末 `device_id` へ配る、全員ぶんの記録 (承認済みの module の行がある乗務員。登録順)。
+fn served_records(
+    bases: &[VeinTemplateRow],
+    devices: &[DeviceRecordRow],
+    device_id: &str,
+    pick_own: bool,
+) -> Vec<(Uuid, String)> {
+    bases
+        .iter()
+        .map(|b| {
+            (
+                b.employee_id,
+                serve_one(b.clone(), devices, device_id, pick_own),
+            )
+        })
+        .collect()
+}
+
 /// 乗務員 `employee_id` の、端末 `device_id` へ配る記録 (base64)。承認済みの module の行が無ければ `None`。
 fn served_record(
     bases: &[VeinTemplateRow],
@@ -329,11 +499,21 @@ fn served_record(
     pick_own: bool,
 ) -> Option<String> {
     let base = bases.iter().find(|r| r.employee_id == employee_id)?.clone();
+    Some(serve_one(base, devices, device_id, pick_own))
+}
+
+/// `base` の乗務員の、端末 `device_id` へ配る記録 (base64)。
+fn serve_one(
+    base: VeinTemplateRow,
+    devices: &[DeviceRecordRow],
+    device_id: &str,
+    pick_own: bool,
+) -> String {
     let own: Vec<&DeviceRecordRow> = devices
         .iter()
-        .filter(|d| d.employee_id == employee_id)
+        .filter(|d| d.employee_id == base.employee_id)
         .collect();
-    Some(serve_for_device(base, &own, device_id, pick_own).record)
+    serve_for_device(base, &own, device_id, pick_own).record
 }
 
 /// 鍵が取れていない (worker が Secrets Store から取れなかった)。保存も判定し直しもしない。
@@ -377,6 +557,8 @@ async fn post_auth_shot(
         .map_err(|e| internal_error("vein auth_shot list_device_records", e))?;
     let record = served_record(&bases, &devices, body.employee_id, &device_id, pick_own);
     let judgment = judge_self(body.employee_id, record.as_deref(), Some(&shot));
+    let gallery = build_gallery(&served_records(&bases, &devices, &device_id, pick_own));
+    let judgment_top10 = judge_top10(&gallery, Some(&shot), true);
     let record = NewAuthShot {
         id: Uuid::new_v4(),
         employee_id: body.employee_id,
@@ -395,13 +577,21 @@ async fn post_auth_shot(
     };
     let saved = state
         .templates
-        .insert_auth_shot(tenant_id, &record, &judgment)
+        .insert_auth_shot(
+            tenant_id,
+            &record,
+            &[judgment.clone(), judgment_top10.clone()],
+        )
         .await
         .map_err(|e| internal_error("vein insert_auth_shot", e))?;
     if !saved {
         return Err(not_found("employee_not_found"));
     }
-    Ok(Json(json!({ "id": record.id, "judgment": judgment })))
+    Ok(Json(json!({
+        "id": record.id,
+        "judgment": judgment,
+        "judgment_top10": judgment_top10,
+    })))
 }
 
 /// 保存した撮影を今の計算で判定し直し、判定の表に行を足す (前の判定は消さない)。開発者だけ。
@@ -432,31 +622,37 @@ async fn rejudge(
         .list_device_records(tenant_id)
         .await
         .map_err(|e| internal_error("vein rejudge list_device_records", e))?;
-    let judgments: Vec<(Uuid, Judgment)> = shots
-        .iter()
-        .map(|s| {
-            let shot = decrypt_secret(&s.shot_encrypted, key)
-                .ok()
-                .and_then(|b64| classify_shot(&b64));
-            let record = served_record(
-                &bases,
-                &devices,
-                s.employee_id,
-                &s.device_id,
-                s.pick.is_some(),
-            );
-            (
-                s.id,
-                judge_self(s.employee_id, record.as_deref(), shot.as_ref()),
-            )
-        })
-        .collect();
+    // 端末と pick が同じ撮影のあいだは、相手の Library を使い回す (粗い比較は Library を変えない)
+    let mut galleries: HashMap<(String, bool), Result<Gallery, &'static str>> = HashMap::new();
+    let mut judgments: Vec<(Uuid, Judgment)> = Vec::with_capacity(shots.len() * 2);
+    for s in &shots {
+        let shot = decrypt_secret(&s.shot_encrypted, key)
+            .ok()
+            .and_then(|b64| classify_shot(&b64));
+        let pick_own = s.pick.is_some();
+        let record = served_record(&bases, &devices, s.employee_id, &s.device_id, pick_own);
+        judgments.push((
+            s.id,
+            judge_self(s.employee_id, record.as_deref(), shot.as_ref()),
+        ));
+        let gallery = galleries
+            .entry((s.device_id.clone(), pick_own))
+            .or_insert_with(|| {
+                build_gallery(&served_records(&bases, &devices, &s.device_id, pick_own))
+            });
+        judgments.push((s.id, judge_top10(gallery, shot.as_ref(), false)));
+    }
     state
         .templates
         .insert_judgments(tenant_id, &judgments)
         .await
         .map_err(|e| internal_error("vein rejudge insert_judgments", e))?;
-    let mut out = json!({ "judged": judgments.len(), "logic_version": logic_version() });
+    let mut out = json!({
+        "judged": shots.len(),
+        "logic_version": logic_version(),
+        "logic_version_top10": logic_version_top10(),
+        "methods": { "self": shots.len(), "top10": shots.len() },
+    });
     if more {
         out["more"] = json!(true);
         out["next_since"] = json!(shots.last().map(|s| s.created_at));

@@ -215,9 +215,9 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         &self,
         tenant_id: Uuid,
         shot: &NewAuthShot,
-        judgment: &Judgment,
+        judgments: &[Judgment],
     ) -> Result<bool, DbError> {
-        self.timed(self.inner.insert_auth_shot(tenant_id, shot, judgment))
+        self.timed(self.inner.insert_auth_shot(tenant_id, shot, judgments))
             .await
     }
 

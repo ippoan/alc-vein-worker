@@ -311,13 +311,13 @@ pub async fn delete(
     Ok(n == 1)
 }
 
-/// [`sql::INSERT_AUTH_SHOT`] → [`sql::INSERT_AUTH_JUDGMENT`] を、渡された 1 つの transaction の中で続けて流す。
+/// [`sql::INSERT_AUTH_SHOT`] → [`sql::INSERT_AUTH_JUDGMENT`] (method ごとに 1 行) を、渡された 1 つの transaction の中で続けて流す。
 /// `Ok(false)` = 生きている乗務員が居ない (どちらも書かない)。
 pub async fn insert_auth_shot(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
     shot: &NewAuthShot,
-    judgment: &Judgment,
+    judgments: &[Judgment],
 ) -> Result<bool, tokio_postgres::Error> {
     let n = tx
         .execute_typed(
@@ -343,7 +343,9 @@ pub async fn insert_auth_shot(
     if n == 0 {
         return Ok(false);
     }
-    insert_judgment(tx, tenant_id, shot.id, judgment).await?;
+    for judgment in judgments {
+        insert_judgment(tx, tenant_id, shot.id, judgment).await?;
+    }
     Ok(true)
 }
 
@@ -418,21 +420,8 @@ pub async fn list_auth_shot_status(
     Ok(rows
         .into_iter()
         .map(|r| {
-            let judgment = r
-                .get::<_, Option<String>>(13)
-                .map(|logic_version| StoredJudgment {
-                    judgment: Judgment {
-                        logic_version,
-                        method: r.get(14),
-                        result: r.get(15),
-                        matched_employee_id: r.get(16),
-                        candidates: serde_json::from_str::<Vec<Candidate>>(&r.get::<_, String>(17))
-                            .unwrap_or_default(),
-                        error: r.get(18),
-                        elapsed_us: r.get(19),
-                    },
-                    created_at: r.get(20),
-                });
+            let judgment = stored_judgment(&r, 13);
+            let judgment_top10 = stored_judgment(&r, 21);
             AuthShotStatus {
                 id: r.get(0),
                 employee_id: r.get(1),
@@ -448,9 +437,28 @@ pub async fn list_auth_shot_status(
                 captured_at: r.get(11),
                 created_at: r.get(12),
                 judgment,
+                judgment_top10,
             }
         })
         .collect())
+}
+
+/// 判定の 8 列 (logic_version から created_at) を `base` 列目から読む。LEFT JOIN で行が無ければ全部 NULL (= `None`)。
+fn stored_judgment(r: &tokio_postgres::Row, base: usize) -> Option<StoredJudgment> {
+    r.get::<_, Option<String>>(base)
+        .map(|logic_version| StoredJudgment {
+            judgment: Judgment {
+                logic_version,
+                method: r.get(base + 1),
+                result: r.get(base + 2),
+                matched_employee_id: r.get(base + 3),
+                candidates: serde_json::from_str::<Vec<Candidate>>(&r.get::<_, String>(base + 4))
+                    .unwrap_or_default(),
+                error: r.get(base + 5),
+                elapsed_us: r.get(base + 6),
+            },
+            created_at: r.get(base + 7),
+        })
 }
 
 /// [`sql::PURGE_AUTH_SHOTS`]。消した行数。
@@ -683,13 +691,13 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         &self,
         tenant_id: Uuid,
         shot: &NewAuthShot,
-        judgment: &Judgment,
+        judgments: &[Judgment],
     ) -> Result<bool, DbError> {
-        let (shot, judgment) = (shot.clone(), judgment.clone());
+        let (shot, judgments) = (shot.clone(), judgments.to_vec());
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move { insert_auth_shot(tx, tenant_id, &shot, &judgment).await })
+                Box::pin(async move { insert_auth_shot(tx, tenant_id, &shot, &judgments).await })
             })
             .await
             .map_err(db_err)
