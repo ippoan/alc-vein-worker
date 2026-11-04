@@ -18,9 +18,13 @@ use alc_core_wasm::DbError;
 use alc_worker_db::{PgClient, TenantTx, TxOutput};
 use chrono::{DateTime, Utc};
 use futures_util::lock::Mutex;
+use serde_json::json;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
+use crate::auth_shots::{
+    AuthShotStatus, Candidate, Judgment, NewAuthShot, StoredJudgment, StoredShot,
+};
 use crate::repo::{
     sql, ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
     VeinTemplatesRepository,
@@ -31,6 +35,8 @@ impl TxOutput for ApprovalItem {}
 impl TxOutput for PendingModuleItem {}
 impl TxOutput for ApproveByEmployee {}
 impl TxOutput for DeviceRecordRow {}
+impl TxOutput for StoredShot {}
+impl TxOutput for AuthShotStatus {}
 
 /// [`sql::UPSERT`] → (行を返したときだけ) [`sql::INSERT_ENROLL_EVENT`] を、渡された 1 つの transaction の中で
 /// 続けて流す (テンプレートと登録の履歴がずれない)。`Ok(None)` = そのテナントに生きている乗務員が居ない (履歴も書かない)。
@@ -305,6 +311,151 @@ pub async fn delete(
     Ok(n == 1)
 }
 
+/// [`sql::INSERT_AUTH_SHOT`] → [`sql::INSERT_AUTH_JUDGMENT`] を、渡された 1 つの transaction の中で続けて流す。
+/// `Ok(false)` = 生きている乗務員が居ない (どちらも書かない)。
+pub async fn insert_auth_shot(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    shot: &NewAuthShot,
+    judgment: &Judgment,
+) -> Result<bool, tokio_postgres::Error> {
+    let n = tx
+        .execute_typed(
+            sql::INSERT_AUTH_SHOT,
+            &[
+                (&shot.id, Type::UUID),
+                (&tenant_id, Type::UUID),
+                (&shot.employee_id, Type::UUID),
+                (&shot.device_id, Type::TEXT),
+                (&shot.firmware, Type::TEXT),
+                (&shot.module_result, Type::TEXT),
+                (&shot.module_slot, Type::INT4),
+                (&shot.module_hit, Type::TEXT),
+                (&shot.module_score, Type::INT4),
+                (&shot.module_thresholds, Type::INT4_ARRAY),
+                (&shot.shot_kind, Type::TEXT),
+                (&shot.shot_encrypted, Type::TEXT),
+                (&shot.captured_at, Type::TIMESTAMPTZ),
+            ],
+        )
+        .await?;
+    if n == 0 {
+        return Ok(false);
+    }
+    insert_judgment(tx, tenant_id, shot.id, judgment).await?;
+    Ok(true)
+}
+
+/// [`sql::INSERT_AUTH_JUDGMENT`]。candidates は JSON の文字列にして渡す (SQL 側で jsonb にする)。
+pub async fn insert_judgment(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    shot_id: Uuid,
+    judgment: &Judgment,
+) -> Result<(), tokio_postgres::Error> {
+    let candidates = json!(judgment.candidates).to_string();
+    tx.execute_typed(
+        sql::INSERT_AUTH_JUDGMENT,
+        &[
+            (&tenant_id, Type::UUID),
+            (&shot_id, Type::UUID),
+            (&judgment.logic_version, Type::TEXT),
+            (&judgment.method, Type::TEXT),
+            (&judgment.result, Type::TEXT),
+            (&judgment.matched_employee_id, Type::UUID),
+            (&candidates, Type::TEXT),
+            (&judgment.error, Type::TEXT),
+            (&judgment.elapsed_us, Type::INT4),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// [`sql::LIST_AUTH_SHOTS`]。
+pub async fn list_auth_shots(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    since: Option<DateTime<Utc>>,
+    limit: i64,
+) -> Result<Vec<StoredShot>, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(
+            sql::LIST_AUTH_SHOTS,
+            &[
+                (&tenant_id, Type::UUID),
+                (&since, Type::TIMESTAMPTZ),
+                (&limit, Type::INT8),
+            ],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| StoredShot {
+            id: r.get(0),
+            employee_id: r.get(1),
+            device_id: r.get(2),
+            shot_encrypted: r.get(3),
+            created_at: r.get(4),
+        })
+        .collect())
+}
+
+/// [`sql::LIST_AUTH_SHOT_STATUS`]。判定の列は、判定の行が無ければ全部 NULL (= `judgment: None`)。
+pub async fn list_auth_shot_status(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    limit: i64,
+) -> Result<Vec<AuthShotStatus>, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(
+            sql::LIST_AUTH_SHOT_STATUS,
+            &[(&tenant_id, Type::UUID), (&limit, Type::INT8)],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let judgment = r
+                .get::<_, Option<String>>(12)
+                .map(|logic_version| StoredJudgment {
+                    judgment: Judgment {
+                        logic_version,
+                        method: r.get(13),
+                        result: r.get(14),
+                        matched_employee_id: r.get(15),
+                        candidates: serde_json::from_str::<Vec<Candidate>>(&r.get::<_, String>(16))
+                            .unwrap_or_default(),
+                        error: r.get(17),
+                        elapsed_us: r.get(18),
+                    },
+                    created_at: r.get(19),
+                });
+            AuthShotStatus {
+                id: r.get(0),
+                employee_id: r.get(1),
+                device_id: r.get(2),
+                firmware: r.get(3),
+                module_result: r.get(4),
+                module_slot: r.get(5),
+                module_hit: r.get(6),
+                module_score: r.get(7),
+                module_thresholds: r.get(8),
+                shot_kind: r.get(9),
+                captured_at: r.get(10),
+                created_at: r.get(11),
+                judgment,
+            }
+        })
+        .collect())
+}
+
+/// [`sql::PURGE_AUTH_SHOTS`]。消した行数。
+pub async fn purge_auth_shots(tx: &TenantTx<'_>) -> Result<i64, tokio_postgres::Error> {
+    let row = tx.query_typed_one(sql::PURGE_AUTH_SHOTS, &[]).await?;
+    Ok(row.get(0))
+}
+
 /// ログは出さない (出すのは呼び手 = worker)。
 fn db_err(e: tokio_postgres::Error) -> DbError {
     // tokio_postgres::Error の Display は "db error" だけなので、DB の message も載せる
@@ -520,6 +671,82 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         client
             .tenant_tx(tenant_id, move |tx| {
                 Box::pin(async move { delete(tx, tenant_id, employee_id).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn insert_auth_shot(
+        &self,
+        tenant_id: Uuid,
+        shot: &NewAuthShot,
+        judgment: &Judgment,
+    ) -> Result<bool, DbError> {
+        let (shot, judgment) = (shot.clone(), judgment.clone());
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { insert_auth_shot(tx, tenant_id, &shot, &judgment).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn list_auth_shots(
+        &self,
+        tenant_id: Uuid,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<StoredShot>, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { list_auth_shots(tx, tenant_id, since, limit).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn insert_judgments(
+        &self,
+        tenant_id: Uuid,
+        judgments: &[(Uuid, Judgment)],
+    ) -> Result<(), DbError> {
+        let judgments = judgments.to_vec();
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move {
+                    for (shot_id, judgment) in &judgments {
+                        insert_judgment(tx, tenant_id, *shot_id, judgment).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn list_auth_shot_status(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<AuthShotStatus>, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { list_auth_shot_status(tx, tenant_id, limit).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    /// テナントをまたぐ定時の掃除。テナントは nil で、消すのは SECURITY DEFINER の関数
+    async fn purge_auth_shots(&self) -> Result<i64, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(Uuid::nil(), |tx| {
+                Box::pin(async move { purge_auth_shots(tx).await })
             })
             .await
             .map_err(db_err)

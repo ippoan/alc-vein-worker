@@ -30,6 +30,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alc_core_wasm::DbError;
+use alc_vein::auth_shots::{AuthShotStatus, Judgment, NewAuthShot, StoredShot};
 use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::{
     ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
@@ -208,5 +209,47 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
 
     async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
         self.timed(self.inner.delete(tenant_id, employee_id)).await
+    }
+
+    async fn insert_auth_shot(
+        &self,
+        tenant_id: Uuid,
+        shot: &NewAuthShot,
+        judgment: &Judgment,
+    ) -> Result<bool, DbError> {
+        self.timed(self.inner.insert_auth_shot(tenant_id, shot, judgment))
+            .await
+    }
+
+    async fn list_auth_shots(
+        &self,
+        tenant_id: Uuid,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<StoredShot>, DbError> {
+        self.timed(self.inner.list_auth_shots(tenant_id, since, limit))
+            .await
+    }
+
+    async fn insert_judgments(
+        &self,
+        tenant_id: Uuid,
+        judgments: &[(Uuid, Judgment)],
+    ) -> Result<(), DbError> {
+        self.timed(self.inner.insert_judgments(tenant_id, judgments))
+            .await
+    }
+
+    async fn list_auth_shot_status(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<AuthShotStatus>, DbError> {
+        self.timed(self.inner.list_auth_shot_status(tenant_id, limit))
+            .await
+    }
+
+    async fn purge_auth_shots(&self) -> Result<i64, DbError> {
+        self.timed(self.inner.purge_auth_shots()).await
     }
 }

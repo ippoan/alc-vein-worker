@@ -94,6 +94,7 @@ pub fn tenant_router() -> Router<VeinState> {
             put(upsert_template).delete(delete_template),
         )
         .route("/vein/identify", post(identify))
+        .merge(crate::auth_shots::router())
 }
 
 #[derive(Deserialize)]
@@ -193,7 +194,7 @@ const DEVICE_ID_HEADER: &str = "x-device-id";
 const MAX_DEVICE_ID_LEN: usize = 64;
 
 /// `X-Device-Id` を読む。無ければ `None`。1〜64 文字の `[A-Za-z0-9:_-]` 以外は 422 `invalid_device_id`。
-fn registered_device_id(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+pub(crate) fn registered_device_id(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let Some(value) = headers.get(DEVICE_ID_HEADER) else {
         return Ok(None);
     };
@@ -537,7 +538,7 @@ async fn list_module_templates(
 }
 
 /// `pick` の値: 無し = 混ぜる、`own` = 混ぜずに選ぶ。他は 422 `invalid_pick`
-fn parse_pick(pick: Option<&str>) -> Result<bool, ApiError> {
+pub(crate) fn parse_pick(pick: Option<&str>) -> Result<bool, ApiError> {
     match pick {
         None => Ok(false),
         Some("own") => Ok(true),
@@ -549,7 +550,7 @@ fn parse_pick(pick: Option<&str>) -> Result<bool, ApiError> {
 }
 
 /// 端末 `requester` へ配る 1 件 (`pick_own` なら [`pick_for_device`]、でなければ [`compose_for_device`])
-fn serve_for_device(
+pub(crate) fn serve_for_device(
     base: VeinTemplateRow,
     devices: &[&DeviceRecordRow],
     requester: &str,
@@ -713,7 +714,7 @@ async fn list_pending_modules(
     Ok(Json(json!({ "templates": templates })))
 }
 
-fn forbidden(code: &str, message: &str) -> ApiError {
+pub(crate) fn forbidden(code: &str, message: &str) -> ApiError {
     (
         StatusCode::FORBIDDEN,
         Json(json!({ "error": code, "message": message })),

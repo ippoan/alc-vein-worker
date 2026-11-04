@@ -4,7 +4,7 @@
 backend (ippoan/rust-alc-api) から分けた repo (Refs ippoan/rust-alc-api#721)。構造は `.claude/skills/alc-vein-worker-map`、詳細は `README.md`。
 
 - 直下 = Worker 本体 (workers-rs + tokio-postgres、wasm32-unknown-unknown。workspace の root)
-- `crates/alc-vein/` = 口 4 本・照合・trait・SQL の定数・repo の実装 `pg` (tokio-postgres。接続は持たない — 張るのは worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL)
+- `crates/alc-vein/` = 口 4 本 (+ 認証ログの `auth_shots` 3 本)・照合・trait・SQL の定数・repo の実装 `pg` (tokio-postgres。接続は持たない — 張るのは worker とテスト。テストの DB は process の中で起こす組み込みの PostgreSQL)
 - `container/` = staging の DB の image。SQL は ippoan/alc-migrations から取る
 
 ## コマンド
@@ -34,7 +34,7 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 - **`wrangler.toml` の表の順を変えない・前の方に表を足さない。** 陰性対照は `[build]` の初出の前・
   `[env.staging]` 直後の `[env.staging.observability]` という位置に行を挿す作りで、順が変わると検査が意味を失う。
   worker 名・binding・`[version_metadata]` (トップレベルと `env.staging` の両方) も変えない (同じ worker への上書きにするため)。
-- **secret・binding・入口 (route) を増やさない。** Cloudflare の token は org の secret を使い、repo 単位の secret を作らない。
+- **secret・binding・入口 (route) を増やさない。** (例外: 認証ログ `crates/alc-vein/src/auth_shots.rs` の撮影の暗号化に、Secrets Store の binding `SSO_ENCRYPTION_KEY` (`[[secrets_store_secrets]]`、トップレベルだけ。auth-worker・alc-cam と同じ secret で新しい secret は作らない) と、90 日より古い撮影を消す毎日の cron (`[triggers]`、staging / local は `crons = []`)。鍵は `auth_shots::needs_key` の口のときだけ fetch の最初に取る。) Cloudflare の token は org の secret を使い、repo 単位の secret を作らない。
   本番の DB は Hyperdrive の binding `VEIN_HYPERDRIVE` (トップレベルにだけ。設定は共有で worker ごとに作らない)。
   **`env.*` の下に `hyperdrive` を置かない** (本番の DB へ届くため。`check-exposure.sh` が検査)。平文の DB binding (`vpc_services` 等) を本番に置かないのも同じ検査。
 - **public repo。** ホスト名・IP・account ID・Tunnel ID・project ref・テナント ID・メール・接続文字列の実物を、
@@ -74,4 +74,4 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 - **alc-migrations** (staging の DB と、テストの組み込みの PostgreSQL の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
   rev は ippoan/rust-alc-api の `Cargo.toml` が固定している alc-migrations の rev と揃える。
   `bash scripts/fetch-migrations.sh` → `cargo test -p alc-vein` → `docker build` → 起動確認 (CI の「staging DB の Container image が起動する」と同じ命令) を手元で通す。
-- **vein-match**: `crates/alc-vein/Cargo.toml` の `tag` (2 行とも) と `Cargo.lock`。
+- **vein-match**: `crates/alc-vein/Cargo.toml` の `tag` (2 行とも) と `Cargo.lock`。(今は一時的に `rev` で ippoan/vein-match#26 の commit。#26 のマージ後に tag v0.1.4 へ戻す。)

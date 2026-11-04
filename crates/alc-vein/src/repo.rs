@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use alc_core_wasm::DbError;
 
+use crate::auth_shots::{AuthShotStatus, Judgment, NewAuthShot, StoredShot};
+
 /// 照合に使う 1 行 (乗務員名つき。削除済みの乗務員は含めない)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VeinTemplateRow {
@@ -221,6 +223,47 @@ pub mod sql {
     pub const DELETE_DEVICE_RECORDS: &str =
         "DELETE FROM vein_device_records WHERE tenant_id = $1 AND employee_id = $2";
 
+    /// 認証ログの撮影と状態を 1 行足す (生きている乗務員だけ。居なければ 0 行)。
+    /// $1 id / $2 tenant_id / $3 employee_id / $4 device_id / $5 firmware / $6 module_result / $7 module_slot /
+    /// $8 module_hit / $9 module_score / $10 module_thresholds / $11 shot_kind / $12 shot_encrypted / $13 captured_at。
+    pub const INSERT_AUTH_SHOT: &str = r#"INSERT INTO alc_api.vein_auth_shots
+        (id, tenant_id, employee_id, device_id, firmware, module_result, module_slot, module_hit, module_score,
+         module_thresholds, shot_kind, shot_encrypted, captured_at)
+    SELECT $1, e.tenant_id, e.id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 FROM employees e
+    WHERE e.tenant_id = $2 AND e.id = $3 AND e.deleted_at IS NULL"#;
+
+    /// 判定を 1 行足す (受けたときに 1 回、判定し直すたびに 1 回。前の判定は消さない)。candidates は JSON の文字列で渡す。
+    /// $1 tenant_id / $2 shot_id / $3 logic_version / $4 method / $5 result / $6 matched_employee_id /
+    /// $7 candidates / $8 error / $9 elapsed_us。
+    pub const INSERT_AUTH_JUDGMENT: &str = r#"INSERT INTO alc_api.vein_auth_judgments
+        (tenant_id, shot_id, logic_version, method, result, matched_employee_id, candidates, error, elapsed_us)
+    VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9)"#;
+
+    /// 判定し直しの対象 (古い順。$2 = この保存時刻以降、NULL なら全部)。
+    /// $1 tenant_id / $2 since / $3 limit → id, employee_id, device_id, shot_encrypted, created_at。
+    pub const LIST_AUTH_SHOTS: &str = r#"SELECT id, employee_id, device_id, shot_encrypted, created_at
+    FROM vein_auth_shots
+    WHERE tenant_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)
+    ORDER BY created_at, id
+    LIMIT $3"#;
+
+    /// 新しい順の状態と最新の判定 (撮影そのものは選ばない)。$1 tenant_id / $2 limit。
+    pub const LIST_AUTH_SHOT_STATUS: &str = r#"SELECT s.id, s.employee_id, s.device_id, s.firmware, s.module_result, s.module_slot,
+        s.module_hit, s.module_score, s.module_thresholds, s.shot_kind, s.captured_at, s.created_at,
+        j.logic_version, j.method, j.result, j.matched_employee_id, j.candidates::text, j.error, j.elapsed_us, j.created_at
+    FROM vein_auth_shots s
+    LEFT JOIN LATERAL (
+        SELECT * FROM vein_auth_judgments x
+        WHERE x.tenant_id = s.tenant_id AND x.shot_id = s.id
+        ORDER BY x.created_at DESC, x.id DESC LIMIT 1
+    ) j ON TRUE
+    WHERE s.tenant_id = $1
+    ORDER BY s.created_at DESC, s.id DESC
+    LIMIT $2"#;
+
+    /// 90 日より古い撮影を消す (テナントをまたぐ。SECURITY DEFINER の関数。判定は CASCADE で消える)。消した行数を返す。
+    pub const PURGE_AUTH_SHOTS: &str = "SELECT alc_api.vein_auth_shots_purge()";
+
     /// 乗務員のテンプレートを消す。$1 tenant_id / $2 employee_id。
     pub const DELETE: &str = "DELETE FROM vein_templates WHERE tenant_id = $1 AND employee_id = $2";
 }
@@ -309,4 +352,38 @@ pub trait VeinTemplatesRepository: Send + Sync {
 
     /// 乗務員のテンプレート (と端末ごとの記録) を消す。`Ok(false)` = 登録が無い。
     async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError>;
+
+    /// 認証ログの撮影と状態を足し、同じ transaction で最初の判定も足す。`Ok(false)` = 生きている乗務員が居ない
+    /// (何も書かない。404 に写す)。
+    async fn insert_auth_shot(
+        &self,
+        tenant_id: Uuid,
+        shot: &NewAuthShot,
+        judgment: &Judgment,
+    ) -> Result<bool, DbError>;
+
+    /// 判定し直しの対象 (`since` 以降の保存時刻、古い順に `limit` 件まで)。
+    async fn list_auth_shots(
+        &self,
+        tenant_id: Uuid,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<StoredShot>, DbError>;
+
+    /// 判定し直した結果 (撮影の id と判定) を 1 つの transaction で足す。
+    async fn insert_judgments(
+        &self,
+        tenant_id: Uuid,
+        judgments: &[(Uuid, Judgment)],
+    ) -> Result<(), DbError>;
+
+    /// 新しい順の撮影の状態と最新の判定 (`limit` 件まで。撮影そのものは含めない)。
+    async fn list_auth_shot_status(
+        &self,
+        tenant_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<AuthShotStatus>, DbError>;
+
+    /// 90 日より古い撮影を、テナントをまたいで消す (定時実行)。消した行数を返す。
+    async fn purge_auth_shots(&self) -> Result<i64, DbError>;
 }
