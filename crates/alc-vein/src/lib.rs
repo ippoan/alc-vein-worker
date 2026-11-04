@@ -11,7 +11,9 @@
 //! - [`repo`]: `vein_templates` の読み書き (trait・型・SQL の定数)
 //! - [`pg`]: その tokio-postgres 実装 (共通 crate `alc-worker-db` のテナントの transaction に載せる。接続は持たない)
 //! - [`routes`]: 4 本の口
+//! - [`auth_shots`]: 認証ログ (撮影と判定) の口
 
+pub mod auth_shots;
 pub mod matcher;
 pub mod pg;
 pub mod repo;
@@ -26,4 +28,7 @@ use crate::repo::VeinTemplatesRepository;
 #[derive(Clone)]
 pub struct VeinState {
     pub templates: Arc<dyn VeinTemplatesRepository>,
+    /// 認証ログの撮影を暗号化・復号する鍵 (Secrets Store の `SSO_ENCRYPTION_KEY`)。worker が
+    /// [`auth_shots::needs_key`] の口のときだけ取る。取れなければ `None` (その口は 500 `encryption_key_missing`)
+    pub auth_shot_key: Option<String>,
 }

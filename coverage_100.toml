@@ -25,3 +25,7 @@ path = "crates/alc-vein/src/repo.rs"
 # repo の tokio-postgres 実装 (tests/sql_db.rs が組み込みの PostgreSQL で通す。CI は本数を固定して回す)
 [[files]]
 path = "crates/alc-vein/src/pg.rs"
+
+# 認証ログの口 (撮影の分類・chara_verify の判定・暗号化して保存・判定し直し・開発者だけの一覧。Refs ippoan/alc-app-s3#352)
+[[files]]
+path = "crates/alc-vein/src/auth_shots.rs"

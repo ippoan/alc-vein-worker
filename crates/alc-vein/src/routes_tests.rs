@@ -18,6 +18,9 @@ use alc_core_wasm::{AuthUser, DbError, TenantId};
 
 use super::tenant_router;
 use super::{MAX_MODULE_RECORDS, MAX_MODULE_RECORD_BYTES};
+use crate::auth_shots::{
+    self, AuthShotStatus, Judgment, NewAuthShot, StoredJudgment, StoredShot, REJUDGE_LIMIT,
+};
 use crate::matcher::{self, synth, MAX_TEMPLATES};
 use crate::repo::{
     ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
@@ -53,11 +56,27 @@ struct FakeRepo {
     fail_device_upsert: AtomicBool,
     /// update_learned の呼び出し (id, 読んだ updated_at)。
     learned_calls: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+    /// 保存した認証ログの撮影 (保存時刻つき。古い順)。
+    shots: Mutex<Vec<(NewAuthShot, DateTime<Utc>)>>,
+    /// 保存した判定 (撮影の id, 判定)。
+    judgments: Mutex<Vec<(Uuid, Judgment)>>,
+    /// 認証ログのメソッドのうち、DB エラーにするもの (メソッド名)。
+    fail_shot_methods: Mutex<Vec<&'static str>>,
+    /// 撮影の鍵が取れていない。
+    no_key: AtomicBool,
 }
 
 impl FakeRepo {
     fn check(&self) -> Result<(), DbError> {
         if self.fail.load(Ordering::SeqCst) {
+            return Err(DbError::Other("pool timed out".into()));
+        }
+        Ok(())
+    }
+
+    fn check_shots(&self, method: &'static str) -> Result<(), DbError> {
+        self.check()?;
+        if self.fail_shot_methods.lock().unwrap().contains(&method) {
             return Err(DbError::Other("pool timed out".into()));
         }
         Ok(())
@@ -317,6 +336,110 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(self.device_records.lock().unwrap().clone())
     }
 
+    async fn insert_auth_shot(
+        &self,
+        _tenant_id: Uuid,
+        shot: &NewAuthShot,
+        judgment: &Judgment,
+    ) -> Result<bool, DbError> {
+        self.check_shots("insert_auth_shot")?;
+        if !self
+            .employees
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == shot.employee_id)
+        {
+            return Ok(false);
+        }
+        let mut shots = self.shots.lock().unwrap();
+        let at = ts(shots.len() as i64);
+        shots.push((shot.clone(), at));
+        self.judgments
+            .lock()
+            .unwrap()
+            .push((shot.id, judgment.clone()));
+        Ok(true)
+    }
+
+    async fn list_auth_shots(
+        &self,
+        _tenant_id: Uuid,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<StoredShot>, DbError> {
+        self.check_shots("list_auth_shots")?;
+        Ok(self
+            .shots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, at)| since.is_none_or(|s| *at >= s))
+            .take(limit as usize)
+            .map(|(s, at)| StoredShot {
+                id: s.id,
+                employee_id: s.employee_id,
+                device_id: s.device_id.clone(),
+                shot_encrypted: s.shot_encrypted.clone(),
+                pick: s.pick.clone(),
+                created_at: *at,
+            })
+            .collect())
+    }
+
+    async fn insert_judgments(
+        &self,
+        _tenant_id: Uuid,
+        judgments: &[(Uuid, Judgment)],
+    ) -> Result<(), DbError> {
+        self.check_shots("insert_judgments")?;
+        self.judgments.lock().unwrap().extend_from_slice(judgments);
+        Ok(())
+    }
+
+    async fn list_auth_shot_status(
+        &self,
+        _tenant_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<AuthShotStatus>, DbError> {
+        self.check_shots("list_auth_shot_status")?;
+        let judgments = self.judgments.lock().unwrap();
+        Ok(self
+            .shots
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(limit as usize)
+            .map(|(s, at)| AuthShotStatus {
+                id: s.id,
+                employee_id: s.employee_id,
+                device_id: s.device_id.clone(),
+                firmware: s.firmware.clone(),
+                module_result: s.module_result.clone(),
+                module_slot: s.module_slot,
+                module_hit: s.module_hit.clone(),
+                module_score: s.module_score,
+                module_thresholds: s.module_thresholds.clone(),
+                pick: s.pick.clone(),
+                shot_kind: s.shot_kind.to_string(),
+                captured_at: s.captured_at,
+                created_at: *at,
+                judgment: judgments.iter().rfind(|(id, _)| *id == s.id).map(|(_, j)| {
+                    StoredJudgment {
+                        judgment: j.clone(),
+                        created_at: *at,
+                    }
+                }),
+            })
+            .collect())
+    }
+
+    async fn purge_auth_shots(&self) -> Result<i64, DbError> {
+        self.check_shots("purge_auth_shots")?;
+        Ok(0)
+    }
+
     async fn delete(&self, _tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
         self.check()?;
         self.device_records
@@ -329,6 +452,9 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(rows.len() < before)
     }
 }
+
+/// 撮影の暗号化に使うテストの鍵 (本物の鍵ではない)。
+const TEST_KEY: &str = "test-encryption-key";
 
 /// 承認する管理者の user_id (`call_as(Some("admin"), ..)` が付ける)。
 const ADMIN_ID: Uuid = Uuid::from_u128(0xAD);
@@ -360,6 +486,7 @@ async fn call_full(
 ) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
+        auth_shot_key: (!repo.no_key.load(Ordering::SeqCst)).then(|| TEST_KEY.to_string()),
     };
     let mut app = tenant_router()
         .with_state(state)
@@ -1812,4 +1939,553 @@ async fn rotate_db_errors_are_500() {
         rotate(&repo, id, Some(b"kiosk-9"), body).await.0,
         StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+// ---- 認証ログ (POST /vein/auth-shots・rejudge・GET) ----
+
+const DEV: (&str, &[u8]) = ("x-user-developer", b"1");
+const KIOSK: (&str, &[u8]) = ("x-device-id", b"kiosk-1");
+
+/// 種 `seed` の 1 本撮りの記録 (生のテンプレートの base64)。
+fn record_shot(seed: u64) -> String {
+    template_of_seeds(&[seed])
+}
+
+/// 種 `seed` の 0xbdbd の特徴量 (base64)。
+fn chara_shot(seed: u64) -> String {
+    STANDARD.encode(synth::chara(seed))
+}
+
+fn shot_body(employee_id: Uuid, shot: &str) -> Value {
+    json!({
+        "employee_id": employee_id,
+        "shot": shot,
+        "module": { "result": "IDENTIFIED", "slot": 12, "hit": "self", "score": 87, "thresholds": [62, 79, 81] },
+        "firmware": "fw-1.2",
+        "captured_at": "2026-11-04T01:02:03Z",
+    })
+}
+
+async fn post_shot(repo: &Arc<FakeRepo>, body: Value) -> (StatusCode, Value) {
+    call_full(repo, None, &[KIOSK], "POST", "/vein/auth-shots", body).await
+}
+
+async fn as_developer(
+    repo: &Arc<FakeRepo>,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    call_full(repo, Some("admin"), &[DEV], method, uri, body).await
+}
+
+/// 種 7 の記録 (3 件) を承認済みで持つ乗務員。
+fn enrolled_7(repo: &FakeRepo) -> Uuid {
+    approved_module(
+        repo,
+        "山田",
+        &template_of_seeds(&[7, 7, 7]),
+        Some("kiosk-1"),
+    )
+}
+
+#[tokio::test]
+async fn auth_shot_is_judged_against_the_served_record_and_stored_encrypted() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+
+    // 生のテンプレートの撮影 (record)・同じ人 → match
+    let shot = record_shot(7);
+    let (status, v) = post_shot(&repo, shot_body(id, &shot)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let j = &v["judgment"];
+    assert_eq!(j["method"], "self");
+    assert_eq!(j["result"], "match");
+    assert_eq!(j["matched_employee_id"], id.to_string());
+    assert_eq!(j["error"], Value::Null);
+    assert_eq!(j["candidates"][0]["employee_id"], id.to_string());
+    assert_eq!(j["candidates"][0]["matched"], true);
+    assert_eq!(j["candidates"][0]["scores"].as_array().unwrap().len(), 3);
+    assert_eq!(j["logic_version"], auth_shots::logic_version());
+    assert!(j["logic_version"]
+        .as_str()
+        .unwrap()
+        .contains("chara_verify 55/55/75"));
+    assert_eq!(v["id"], repo.shots.lock().unwrap()[0].0.id.to_string());
+
+    // 0xbdbd の特徴量の撮影 (chara)・同じ人 → match、別の人 → nomatch
+    let (status, v) = post_shot(&repo, shot_body(id, &chara_shot(7))).await;
+    assert_eq!(
+        (status, &v["judgment"]["result"]),
+        (StatusCode::OK, &json!("match"))
+    );
+    let (status, v) = post_shot(&repo, shot_body(id, &chara_shot(99))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["judgment"]["result"], "nomatch");
+    assert_eq!(v["judgment"]["matched_employee_id"], Value::Null);
+    assert_eq!(v["judgment"]["candidates"][0]["matched"], false);
+
+    // 保存したのは状態と暗号文 (平文の撮影ではない)。鍵で戻せる
+    let shots = repo.shots.lock().unwrap();
+    assert_eq!(shots.len(), 3);
+    let (first, _) = &shots[0];
+    assert_eq!(
+        (first.shot_kind, first.device_id.as_str(), first.employee_id),
+        ("record", "kiosk-1", id)
+    );
+    assert_eq!(first.firmware.as_deref(), Some("fw-1.2"));
+    assert_eq!(
+        (
+            first.module_result.as_str(),
+            first.module_slot,
+            first.module_hit.as_str(),
+            first.module_score
+        ),
+        ("IDENTIFIED", Some(12), "self", Some(87))
+    );
+    assert_eq!(first.module_thresholds, Some(vec![62, 79, 81]));
+    assert_eq!(first.captured_at.to_rfc3339(), "2026-11-04T01:02:03+00:00");
+    assert_ne!(first.shot_encrypted, shot);
+    assert_eq!(
+        alc_worker_crypto::secret::decrypt_secret(&first.shot_encrypted, TEST_KEY).unwrap(),
+        shot
+    );
+    assert_eq!(shots[1].0.shot_kind, "chara");
+    assert_eq!(repo.judgments.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn auth_shot_pick_own_and_optional_fields() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let mut body = shot_body(id, &chara_shot(7));
+    body["pick"] = json!("own");
+    body["module"] = json!({ "result": "NOMATCH", "slot": null, "hit": "none", "score": null, "thresholds": null });
+    body["firmware"] = Value::Null;
+    let (status, v) = post_shot(&repo, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["judgment"]["result"], "match");
+    {
+        let shots = repo.shots.lock().unwrap();
+        assert_eq!(shots[0].0.pick.as_deref(), Some("own"));
+        assert_eq!(
+            (
+                shots[0].0.module_slot,
+                shots[0].0.module_score,
+                &shots[0].0.module_thresholds,
+                &shots[0].0.firmware
+            ),
+            (None, None, &None, &None)
+        );
+    }
+    body["pick"] = json!("mix");
+    let (status, v) = post_shot(&repo, body).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_pick"))
+    );
+}
+
+#[tokio::test]
+async fn auth_shot_rejects_bad_input_with_422_and_stores_nothing() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let ok = shot_body(id, &chara_shot(7));
+
+    // X-Device-Id 無し
+    let (status, v) = call(&repo, "POST", "/vein/auth-shots", ok.clone()).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("device_id_required"))
+    );
+    // X-Device-Id の形が違う
+    let bad_device: (&str, &[u8]) = ("x-device-id", b"a b");
+    let (status, v) = call_full(
+        &repo,
+        None,
+        &[bad_device],
+        "POST",
+        "/vein/auth-shots",
+        ok.clone(),
+    )
+    .await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_device_id"))
+    );
+
+    // module / firmware が CHECK の値でない
+    let patch = |path: &str, value: Value| {
+        let mut b = ok.clone();
+        match path {
+            "result" => b["module"]["result"] = value,
+            "hit" => b["module"]["hit"] = value,
+            "thresholds" => b["module"]["thresholds"] = value,
+            _ => b["firmware"] = value,
+        }
+        b
+    };
+    for body in [
+        patch("result", json!("MAYBE")),
+        patch("hit", json!("mine")),
+        patch("thresholds", json!([1, 2, 3, 4, 5, 6, 7, 8, 9])),
+        patch("firmware", json!("x".repeat(65))),
+    ] {
+        let (status, v) = post_shot(&repo, body).await;
+        assert_eq!(
+            (status, v["error"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_module"))
+        );
+    }
+
+    // shot が base64 でない・どちらの形でもない・大きすぎる
+    let mut magic_too_long = vec![0xbd, 0xbd];
+    magic_too_long.resize(MAX_MODULE_RECORD_BYTES + 1, 0);
+    for shot in [
+        "not base64!".to_string(),
+        STANDARD.encode(b"hello world"),
+        STANDARD.encode(magic_too_long),
+    ] {
+        let (status, v) = post_shot(&repo, shot_body(id, &shot)).await;
+        assert_eq!(
+            (status, v["error"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_shot")),
+            "{shot:.20}"
+        );
+    }
+    assert!(repo.shots.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auth_shot_without_a_usable_record_is_saved_as_an_error_judgment() {
+    let repo = Arc::new(FakeRepo::default());
+    // 承認済みの記録が無い乗務員
+    let none = repo.add_employee("記録なし");
+    let (status, v) = post_shot(&repo, shot_body(none, &chara_shot(7))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["judgment"]["result"], "error");
+    assert_eq!(v["judgment"]["error"], "no_approved_record");
+    assert_eq!(v["judgment"]["candidates"], json!([]));
+    assert_eq!(repo.shots.lock().unwrap().len(), 1);
+
+    // 記録が base64 として読めない
+    let broken = approved_module(&repo, "壊れた記録", "!!!", Some("kiosk-1"));
+    let (_, v) = post_shot(&repo, shot_body(broken, &chara_shot(7))).await;
+    assert_eq!(v["judgment"]["error"], "unreadable_record");
+
+    // 記録が照合に使えない形 (base64 としては読める)
+    let garbage = approved_module(
+        &repo,
+        "読めない記録",
+        &STANDARD.encode(b"garbage"),
+        Some("kiosk-1"),
+    );
+    let (_, v) = post_shot(&repo, shot_body(garbage, &chara_shot(7))).await;
+    assert_eq!(v["judgment"]["error"], "unreadable_record");
+
+    // 記録が型の印だけで取り込めない
+    let magic_only = approved_module(
+        &repo,
+        "印だけの記録",
+        &STANDARD.encode([0xde, 0xed, 0xde, 0xed, 0, 0, 0, 0]),
+        Some("kiosk-1"),
+    );
+    let (_, v) = post_shot(&repo, shot_body(magic_only, &chara_shot(7))).await;
+    assert_eq!(v["judgment"]["error"], "unreadable_record");
+
+    // 撮影が型の印だけで中身が読めない (record / chara)
+    let id = enrolled_7(&repo);
+    let mut template_like = vec![0xde, 0xed, 0xde, 0xed];
+    template_like.resize(64, 0);
+    let mut chara_like = vec![0xbd, 0xbd];
+    chara_like.resize(0x448, 0);
+    let (_, v) = post_shot(&repo, shot_body(id, &STANDARD.encode(template_like))).await;
+    assert_eq!(v["judgment"]["error"], "unreadable_shot");
+    let (_, v) = post_shot(&repo, shot_body(id, &STANDARD.encode(chara_like))).await;
+    assert_eq!(v["judgment"]["error"], "unreadable_shot");
+    assert_eq!(repo.shots.lock().unwrap().len(), 6);
+
+    // 乗務員が居ない → 404 (何も保存しない)
+    let (status, v) = post_shot(&repo, shot_body(Uuid::new_v4(), &chara_shot(7))).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("employee_not_found"))
+    );
+    assert_eq!(repo.shots.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn auth_shot_needs_the_key_and_db_errors_are_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let body = shot_body(id, &chara_shot(7));
+
+    // 鍵が取れていなければ保存しない
+    repo.no_key.store(true, Ordering::SeqCst);
+    let (status, v) = post_shot(&repo, body.clone()).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("encryption_key_missing")
+        )
+    );
+    assert!(repo.shots.lock().unwrap().is_empty());
+    repo.no_key.store(false, Ordering::SeqCst);
+
+    repo.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        post_shot(&repo, body.clone()).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail.store(false, Ordering::SeqCst);
+    repo.fail_device_list.store(true, Ordering::SeqCst);
+    assert_eq!(
+        post_shot(&repo, body.clone()).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail_device_list.store(false, Ordering::SeqCst);
+    repo.fail_shot_methods
+        .lock()
+        .unwrap()
+        .push("insert_auth_shot");
+    assert_eq!(
+        post_shot(&repo, body).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(repo.shots.lock().unwrap().is_empty());
+}
+
+#[test]
+fn needs_key_only_for_the_shot_writing_paths() {
+    for (method, path, want) in [
+        ("POST", "/vein/auth-shots", true),
+        ("POST", "/api/vein/auth-shots", true),
+        ("POST", "/api/vein/auth-shots/rejudge", true),
+        ("GET", "/api/vein/auth-shots", false),
+        ("GET", "/vein/auth-shots/rejudge", false),
+        ("POST", "/vein/identify", false),
+        ("POST", "/vein/templates/x/module/devices/rotate", false),
+    ] {
+        assert_eq!(auth_shots::needs_key(method, path), want, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn rejudge_adds_judgments_for_stored_shots_and_keeps_the_old_ones() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    post_shot(&repo, shot_body(id, &record_shot(7))).await;
+    post_shot(&repo, shot_body(id, &chara_shot(99))).await;
+    // 暗号文が読めない撮影も、error の判定として足す
+    {
+        let mut shots = repo.shots.lock().unwrap();
+        let mut broken = shots[0].0.clone();
+        broken.id = Uuid::new_v4();
+        broken.shot_encrypted = "AAAA".to_string();
+        let at = ts(2);
+        shots.push((broken, at));
+    }
+
+    // 開発者だけ
+    let uri = "/vein/auth-shots/rejudge";
+    let (status, v) = call_full(&repo, Some("admin"), &[], "POST", uri, json!({})).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("developer_only"))
+    );
+    let not_one: (&str, &[u8]) = ("x-user-developer", b"0");
+    let (status, _) = call_full(&repo, Some("admin"), &[not_one], "POST", uri, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&repo, "POST", uri, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(repo.judgments.lock().unwrap().len(), 2);
+
+    let (status, v) = as_developer(&repo, "POST", uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["judged"], 3);
+    assert_eq!(v["logic_version"], auth_shots::logic_version());
+    assert_eq!(v.get("more"), None);
+    {
+        let judgments = repo.judgments.lock().unwrap();
+        assert_eq!(judgments.len(), 5);
+        let results: Vec<&str> = judgments[2..]
+            .iter()
+            .map(|(_, j)| j.result.as_str())
+            .collect();
+        assert_eq!(results, ["match", "nomatch", "error"]);
+        assert_eq!(judgments[4].1.error.as_deref(), Some("unreadable_shot"));
+    }
+
+    // since 以降だけ (保存時刻 ts(1) 以降の 2 件)
+    let (_, v) = as_developer(&repo, "POST", uri, json!({ "since": ts(1) })).await;
+    assert_eq!(v["judged"], 2);
+    // 行の pick で組む (body の pick は見ない)
+    repo.shots.lock().unwrap()[0].0.pick = Some("own".to_string());
+    let (_, v) = as_developer(&repo, "POST", uri, json!({ "pick": "x" })).await;
+    assert_eq!(v["judged"], 3);
+}
+
+#[tokio::test]
+async fn rejudge_caps_one_run_and_points_at_the_rest() {
+    let repo = Arc::new(FakeRepo::default());
+    let none = repo.add_employee("記録なし");
+    let enc = alc_worker_crypto::secret::encrypt_secret(&chara_shot(7), TEST_KEY).unwrap();
+    {
+        let mut shots = repo.shots.lock().unwrap();
+        for i in 0..=REJUDGE_LIMIT {
+            let shot = NewAuthShot {
+                id: Uuid::new_v4(),
+                employee_id: none,
+                device_id: "kiosk-1".to_string(),
+                firmware: None,
+                module_result: "NOMATCH".to_string(),
+                module_slot: None,
+                module_hit: "none".to_string(),
+                module_score: None,
+                module_thresholds: None,
+                pick: None,
+                shot_kind: "chara",
+                shot_encrypted: enc.clone(),
+                captured_at: ts(0),
+            };
+            shots.push((shot, ts(i as i64)));
+        }
+    }
+    let (status, v) = as_developer(&repo, "POST", "/vein/auth-shots/rejudge", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["judged"], REJUDGE_LIMIT);
+    assert_eq!(v["more"], true);
+    assert_eq!(v["next_since"], json!(ts(REJUDGE_LIMIT as i64 - 1)));
+    // 続きは next_since から (同じ時刻の最後の 1 件はもう一度、残りの 1 件が加わる)
+    let (_, v) = as_developer(
+        &repo,
+        "POST",
+        "/vein/auth-shots/rejudge",
+        json!({ "since": v["next_since"] }),
+    )
+    .await;
+    assert_eq!(v["judged"], 2);
+    assert_eq!(v.get("more"), None);
+}
+
+#[tokio::test]
+async fn rejudge_needs_the_key_and_db_errors_are_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    post_shot(&repo, shot_body(id, &chara_shot(7))).await;
+    let rejudge = |repo: Arc<FakeRepo>| async move {
+        as_developer(&repo, "POST", "/vein/auth-shots/rejudge", json!({})).await
+    };
+
+    repo.no_key.store(true, Ordering::SeqCst);
+    let (status, v) = rejudge(repo.clone()).await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("encryption_key_missing")
+        )
+    );
+    repo.no_key.store(false, Ordering::SeqCst);
+
+    repo.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rejudge(repo.clone()).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail.store(false, Ordering::SeqCst);
+    repo.fail_device_list.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rejudge(repo.clone()).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    repo.fail_device_list.store(false, Ordering::SeqCst);
+    for method in ["list_auth_shots", "insert_judgments"] {
+        repo.fail_shot_methods.lock().unwrap().push(method);
+        assert_eq!(
+            rejudge(repo.clone()).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{method}"
+        );
+        repo.fail_shot_methods.lock().unwrap().clear();
+    }
+    assert_eq!(repo.judgments.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn list_auth_shots_is_developer_only_newest_first_and_never_returns_the_shot() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    for seed in [7, 99, 7] {
+        post_shot(&repo, shot_body(id, &chara_shot(seed))).await;
+    }
+    let (status, v) = call_full(
+        &repo,
+        Some("admin"),
+        &[],
+        "GET",
+        "/vein/auth-shots",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("developer_only"))
+    );
+
+    let (status, v) = as_developer(&repo, "GET", "/vein/auth-shots", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let shots = v["shots"].as_array().unwrap();
+    assert_eq!(shots.len(), 3);
+    // 新しい順 (保存した順の逆)
+    let stored: Vec<String> = repo
+        .shots
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|(s, _)| s.id.to_string())
+        .collect();
+    let listed: Vec<&str> = shots.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(listed, stored);
+    assert_eq!(shots[0]["judgment"]["result"], "match");
+    assert_eq!(shots[1]["judgment"]["result"], "nomatch");
+    assert_eq!(shots[0]["module_result"], "IDENTIFIED");
+    assert_eq!(shots[0]["shot_kind"], "chara");
+    assert_eq!(shots[0]["device_id"], "kiosk-1");
+    assert!(shots
+        .iter()
+        .all(|s| s.get("shot").is_none() && s.get("shot_encrypted").is_none()));
+
+    // limit は 1〜200 に収める
+    for (query, want) in [
+        ("limit=2", 2),
+        ("limit=0", 1),
+        ("limit=-5", 1),
+        ("limit=9999", 3),
+        ("", 3),
+    ] {
+        let uri = format!("/vein/auth-shots?{query}");
+        let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+        assert_eq!(v["shots"].as_array().unwrap().len(), want, "{query}");
+    }
+
+    repo.fail_shot_methods
+        .lock()
+        .unwrap()
+        .push("list_auth_shot_status");
+    let (status, _) = as_developer(&repo, "GET", "/vein/auth-shots", Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn purge_is_part_of_the_repo_contract() {
+    let repo = FakeRepo::default();
+    assert_eq!(repo.purge_auth_shots().await.unwrap(), 0);
+    repo.fail_shot_methods
+        .lock()
+        .unwrap()
+        .push("purge_auth_shots");
+    assert!(repo.purge_auth_shots().await.is_err());
 }

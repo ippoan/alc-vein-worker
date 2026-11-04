@@ -27,6 +27,8 @@ members = ["crates/alc-vein"]
 [workspace.dependencies]
 alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
 alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2", features = ["chrono"] }
+# 認証ログの撮影の暗号化 (AES-256-GCM)。同じ kit の rev (alc-core-wasm / alc-worker-db と揃える)
+alc-worker-crypto = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
 
 # alc-vein は private repo ippoan/vein-match (vein-match / vein-match-search) に git 依存する。
 # 取得の仕方は crates/alc-vein/Cargo.toml と同じ (ローカルは `gh auth setup-git`、CI は

@@ -31,6 +31,7 @@ mod embedded;
 use std::sync::Arc;
 
 use alc_core_wasm::{AuthUser, DbError, TenantId};
+use alc_vein::auth_shots::{Candidate, Judgment, NewAuthShot};
 use alc_vein::matcher::{self, synth};
 use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::{VeinTemplatesRepository, FORMAT_CHARA, FORMAT_MODULE};
@@ -40,6 +41,7 @@ use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use embedded::{employee, set_roles, soft_delete_employee, tenant, Embedded, APP_ROLE};
 use serde_json::{json, Value};
 use tokio_postgres::types::Type;
@@ -71,6 +73,7 @@ async fn send_with_device(
 ) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
+        auth_shot_key: None,
     };
     let app = tenant_router()
         .with_state(state)
@@ -104,6 +107,7 @@ async fn send_as(
 ) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
+        auth_shot_key: None,
     };
     let mut app = tenant_router()
         .with_state(state)
@@ -248,7 +252,7 @@ async fn enroll_identify_writes_back_learned_template() {
     assert_eq!(put_approved(r, t, suzuki, 12).await.0, StatusCode::OK);
 
     let before = list(r, t).await;
-    assert_eq!(before["logic_version"], "0.1.1");
+    assert_eq!(before["logic_version"], vein_match_search::VERSION);
     assert_eq!(templates(&before).len(), 2);
     let yamada_before = row_of(&before, yamada);
 
@@ -695,6 +699,7 @@ async fn send_from(
 ) -> (StatusCode, Value) {
     let state = VeinState {
         templates: repo.clone(),
+        auth_shot_key: None,
     };
     let app = tenant_router()
         .with_state(state)
@@ -1270,5 +1275,349 @@ async fn closed_connection_becomes_other() {
     assert!(matches!(approved, Err(DbError::Other(_))));
     assert_eq!(repo.current_user().await, None);
     drop(repo);
+    db.shutdown();
+}
+
+// ---- 認証ログ (vein_auth_shots / vein_auth_judgments、alc-migrations 202) ----
+
+fn auth_shot(employee_id: Uuid, device: &str) -> NewAuthShot {
+    NewAuthShot {
+        id: Uuid::new_v4(),
+        employee_id,
+        device_id: device.to_string(),
+        firmware: Some("fw-1.2".to_string()),
+        module_result: "IDENTIFIED".to_string(),
+        module_slot: Some(12),
+        module_hit: "self".to_string(),
+        module_score: Some(87),
+        module_thresholds: Some(vec![62, 79, 81]),
+        pick: Some("own".to_string()),
+        shot_kind: "chara",
+        shot_encrypted: "ciphertext".to_string(),
+        captured_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+    }
+}
+
+fn judgment(employee_id: Uuid, result: &str, logic_version: &str) -> Judgment {
+    let matched = result == "match";
+    Judgment {
+        logic_version: logic_version.to_string(),
+        method: "self".to_string(),
+        result: result.to_string(),
+        matched_employee_id: matched.then_some(employee_id),
+        candidates: vec![Candidate {
+            employee_id,
+            matched,
+            scores: [60, 61, 77],
+        }],
+        error: (result == "error").then(|| "no_approved_record".to_string()),
+        elapsed_us: Some(1234),
+    }
+}
+
+async fn judgment_count(db: &Embedded) -> i64 {
+    let su = db.superuser().await;
+    let n: i64 = su
+        .inner
+        .query_one("SELECT count(*) FROM alc_api.vein_auth_judgments", &[])
+        .await
+        .unwrap()
+        .get(0);
+    su.close().await;
+    n
+}
+
+/// 撮影と最初の判定は 1 つの transaction で入り、一覧は最新の判定を返す。生きている乗務員だけ。テナントをまたがない。
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_shots_are_inserted_listed_and_kept_within_the_tenant() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let (a, b) = (
+        tenant(&mut prep.inner, "Auth Shot A").await,
+        tenant(&mut prep.inner, "Auth Shot B").await,
+    );
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let sato = employee(&mut prep.inner, a, "佐藤").await;
+    let other = employee(&mut prep.inner, b, "他社").await;
+    soft_delete_employee(&mut prep.inner, a, sato).await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+
+    let shot = auth_shot(yamada, "kiosk-1");
+    assert!(r
+        .insert_auth_shot(a, &shot, &judgment(yamada, "match", "v1"))
+        .await
+        .unwrap());
+    // 削除済み・他のテナント・居ない乗務員には書けない (判定も書かない)
+    for (tenant_id, employee_id) in [(a, sato), (a, other), (b, yamada), (a, Uuid::new_v4())] {
+        let s = auth_shot(employee_id, "kiosk-1");
+        assert!(!r
+            .insert_auth_shot(tenant_id, &s, &judgment(employee_id, "match", "v1"))
+            .await
+            .unwrap());
+    }
+
+    let listed = r.list_auth_shot_status(a, 10).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let item = &listed[0];
+    assert_eq!((item.id, item.employee_id), (shot.id, yamada));
+    assert_eq!(item.device_id, "kiosk-1");
+    assert_eq!(item.firmware.as_deref(), Some("fw-1.2"));
+    assert_eq!(
+        (
+            item.module_result.as_str(),
+            item.module_slot,
+            item.module_hit.as_str(),
+            item.module_score
+        ),
+        ("IDENTIFIED", Some(12), "self", Some(87))
+    );
+    assert_eq!(item.module_thresholds, Some(vec![62, 79, 81]));
+    assert_eq!(item.pick.as_deref(), Some("own"));
+    assert_eq!(item.shot_kind, "chara");
+    assert_eq!(item.captured_at, shot.captured_at);
+    let stored = item.judgment.as_ref().unwrap();
+    assert_eq!(stored.judgment, judgment(yamada, "match", "v1"));
+    // 判定を足しても前のは消えず、一覧は新しいほうを出す
+    r.insert_judgments(a, &[(shot.id, judgment(yamada, "nomatch", "v2"))])
+        .await
+        .unwrap();
+    r.insert_judgments(a, &[]).await.unwrap();
+    // 接続は 1 本ずつ: 数えるあいだは repo を閉じる
+    repo.close().await;
+    assert_eq!(judgment_count(&db).await, 2);
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    let item = r.list_auth_shot_status(a, 10).await.unwrap().remove(0);
+    assert_eq!(item.judgment.unwrap().judgment.logic_version, "v2");
+
+    // 別のテナントからは見えない・足せない (RLS と WHERE tenant_id)
+    assert_eq!(r.list_auth_shot_status(b, 10).await.unwrap(), vec![]);
+    assert_eq!(r.list_auth_shots(b, None, 10).await.unwrap(), vec![]);
+    assert!(r
+        .insert_judgments(b, &[(shot.id, judgment(yamada, "match", "v1"))])
+        .await
+        .is_err());
+
+    // 判定し直しの対象: 暗号文のまま、since で絞れる
+    let rows = r.list_auth_shots(a, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (
+            rows[0].id,
+            rows[0].employee_id,
+            rows[0].device_id.as_str(),
+            rows[0].shot_encrypted.as_str()
+        ),
+        (shot.id, yamada, "kiosk-1", "ciphertext")
+    );
+    assert_eq!(rows[0].pick.as_deref(), Some("own"));
+    let later = rows[0].created_at + chrono::Duration::seconds(1);
+    assert_eq!(
+        r.list_auth_shots(a, Some(rows[0].created_at), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(r.list_auth_shots(a, Some(later), 10).await.unwrap(), vec![]);
+
+    // 新しい順・limit
+    let second = auth_shot(yamada, "kiosk-2");
+    assert!(r
+        .insert_auth_shot(a, &second, &judgment(yamada, "error", "v2"))
+        .await
+        .unwrap());
+    let listed = r.list_auth_shot_status(a, 1).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, second.id);
+    assert_eq!(
+        listed[0]
+            .judgment
+            .as_ref()
+            .unwrap()
+            .judgment
+            .error
+            .as_deref(),
+        Some("no_approved_record")
+    );
+    repo.close().await;
+    db.shutdown();
+}
+
+/// 90 日より古い撮影だけを、テナントをまたいで消す。判定は CASCADE で消える。
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_removes_shots_older_than_90_days_across_tenants() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let (a, b) = (
+        tenant(&mut prep.inner, "Purge A").await,
+        tenant(&mut prep.inner, "Purge B").await,
+    );
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let sato = employee(&mut prep.inner, b, "佐藤").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    let mut old = vec![];
+    let mut fresh = vec![];
+    for (tenant_id, employee_id) in [(a, yamada), (b, sato)] {
+        for bucket in [&mut old, &mut fresh] {
+            let s = auth_shot(employee_id, "kiosk-1");
+            assert!(r
+                .insert_auth_shot(tenant_id, &s, &judgment(employee_id, "match", "v1"))
+                .await
+                .unwrap());
+            bucket.push(s.id);
+        }
+    }
+    // 何も古くなければ 0 件
+    assert_eq!(r.purge_auth_shots().await.unwrap(), 0);
+    repo.close().await;
+
+    // 古い側の created_at を 91 日前に、新しい側は 89 日前にする
+    let su = db.superuser().await;
+    for (ids, days) in [(&old, 91), (&fresh, 89)] {
+        let n = su
+            .inner
+            .execute(
+                &format!("UPDATE alc_api.vein_auth_shots SET created_at = now() - interval '{days} days' WHERE id = ANY($1)"),
+                &[ids],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+    su.close().await;
+    assert_eq!(judgment_count(&db).await, 4);
+
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    assert_eq!(r.purge_auth_shots().await.unwrap(), 2);
+    let left_a: Vec<Uuid> = r
+        .list_auth_shots(a, None, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    let left_b: Vec<Uuid> = r
+        .list_auth_shots(b, None, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!((left_a, left_b), (vec![fresh[0]], vec![fresh[1]]));
+    repo.close().await;
+    assert_eq!(judgment_count(&db).await, 2);
+    db.shutdown();
+}
+
+/// 口を通して: 端末の鍵で撮影を送ると暗号化して書き、判定が付く。開発者の一覧に出る (撮影は出ない)。
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let t = tenant(&mut prep.inner, "Auth Shot Route").await;
+    let yamada = employee(&mut prep.inner, t, "山田").await;
+    prep.close().await;
+    let repo = db.repo(APP_ROLE).await;
+    let state = VeinState {
+        templates: repo.inner.clone(),
+        auth_shot_key: Some("route-test-key".to_string()),
+    };
+    let call = |method: &'static str,
+                uri: &'static str,
+                headers: Vec<(&'static str, &'static str)>,
+                body: Value| {
+        let app = tenant_router()
+            .with_state(state.clone())
+            .layer(Extension(TenantId(t)));
+        async move {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    // 承認済みの記録が無い乗務員でも、撮影は残り、判定は error
+    let shot = STANDARD.encode(synth::chara(7));
+    let body = json!({
+        "employee_id": yamada,
+        "shot": shot,
+        "module": { "result": "NOMATCH", "slot": null, "hit": "none", "score": null, "thresholds": [62, 79, 81] },
+        "firmware": null,
+        "captured_at": "2026-11-04T01:02:03Z",
+    });
+    let (status, v) = call(
+        "POST",
+        "/vein/auth-shots",
+        vec![("x-device-id", "kiosk-1")],
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["judgment"]["result"], "error");
+    assert_eq!(v["judgment"]["error"], "no_approved_record");
+
+    let (status, v) = call(
+        "GET",
+        "/vein/auth-shots",
+        vec![("x-user-developer", "1")],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &v["shots"][0];
+    assert_eq!(
+        (item["employee_id"].as_str(), item["shot_kind"].as_str()),
+        (Some(yamada.to_string().as_str()), Some("chara"))
+    );
+    assert_eq!(item["module_thresholds"], json!([62, 79, 81]));
+    assert_eq!(item["judgment"]["candidates"], json!([]));
+    assert!(item.get("shot_encrypted").is_none());
+    let (status, _) = call("GET", "/vein/auth-shots", vec![], Value::Null).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 保存したのは暗号文で、鍵で元に戻る
+    let stored = repo.inner.list_auth_shots(t, None, 10).await.unwrap();
+    assert_ne!(stored[0].shot_encrypted, shot);
+    assert_eq!(
+        alc_worker_crypto::secret::decrypt_secret(&stored[0].shot_encrypted, "route-test-key")
+            .unwrap(),
+        shot
+    );
+
+    // 判定し直し: 判定の行が増える
+    let (status, v) = call(
+        "POST",
+        "/vein/auth-shots/rejudge",
+        vec![("x-user-developer", "1")],
+        json!({}),
+    )
+    .await;
+    assert_eq!((status, &v["judged"]), (StatusCode::OK, &json!(1)));
+    // 接続を閉じ切る前に、Arc の写しを持つ state を手放す
+    drop(state);
+    repo.close().await;
+    assert_eq!(judgment_count(&db).await, 2);
     db.shutdown();
 }

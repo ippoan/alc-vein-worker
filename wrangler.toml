@@ -37,6 +37,19 @@ region = "aws:ap-northeast-1"
 binding = "VEIN_HYPERDRIVE"
 id = "6bdf446634034f989d4e094d5510b162"
 
+# 認証ログの撮影 (指静脈の生体データ) の暗号化・復号の鍵 (auth-worker・alc-cam と同じ Secrets Store の secret。値は repo に無い)。
+# binding は env に継承されないので staging / local には無い (その口は 500 encryption_key_missing)。
+# ★ この表は [placement] の後に置く (前の方に表を足すと scripts/check-exposure-test.sh の陰性対照が効かなくなる)
+[[secrets_store_secrets]]
+binding = "SSO_ENCRYPTION_KEY"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "sso-encryption-key"
+
+# 定時実行: 毎日 18:00 UTC (= 日本時間 3:00) に 90 日より古い認証ログの撮影を消す (src/lib.rs の scheduled)。
+# triggers は env に継承されるので、staging / local は下で空に上書きする (本番の DB を掃除するのは本番だけ)
+[triggers]
+crons = ["0 18 * * *"]
+
 # staging: DB は一時的に (ippoan/rust-alc-api#695) 運用者の Linux 機の docker (container/ の image、127.0.0.1:6432) に置き、
 # Workers VPC の binding VEIN_DB_VPC (VPC Service 型) から既存の Tunnel 経由で繋ぐ (src/db.rs)。
 # VEIN_DB_VPC を外して deploy すると、下の Container 経路 (fallback) に戻る:
@@ -62,6 +75,10 @@ binding = "CF_VERSION_METADATA"
 # 実際に動いた場所は応答ヘッダー cf-placement で分かる
 [env.staging.placement]
 region = "aws:ap-northeast-3"
+
+# 定時実行は staging では動かさない (トップレベルの cron を空で上書きする)
+[env.staging.triggers]
+crons = []
 
 # 手元の DB への口 (ippoan/rust-alc-api#695、一時)。本番 (トップレベル) には置かない (scripts/check-exposure.sh が検査)
 [[env.staging.vpc_services]]
@@ -103,3 +120,7 @@ new_sqlite_classes = ["VeinDb"]
 name = "alc-vein-local"
 workers_dev = false
 preview_urls = false
+
+# ローカルでも定時実行は動かさない
+[env.local.triggers]
+crons = []

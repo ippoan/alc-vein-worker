@@ -21,13 +21,15 @@ mod vein_db;
 use std::sync::Arc;
 
 use alc_core_wasm::require_tenant_header;
-use alc_vein::{routes::tenant_router, VeinState};
+use alc_vein::repo::VeinTemplatesRepository;
+use alc_vein::{auth_shots, routes::tenant_router, VeinState};
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use axum::{middleware, Router};
 use tower_service::Service;
 use worker::{
-    console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
+    console_error, console_log, event, Context, Date, Env, HttpRequest, Result, ScheduleContext,
+    ScheduledEvent, WorkerVersionMetadata,
 };
 
 use crate::repo::WorkerVeinTemplatesRepository;
@@ -56,8 +58,26 @@ fn error_response(status: StatusCode, code: &str) -> Response<Body> {
     resp
 }
 
+/// 認証ログの撮影の暗号化・復号の鍵の binding (`[[secrets_store_secrets]]`。auth-worker・alc-cam と同じ Secrets Store の secret)
+const SSO_ENCRYPTION_KEY_BINDING: &str = "SSO_ENCRYPTION_KEY";
+
+/// Secrets Store の鍵。取れなければ `None` (その口が 500 `encryption_key_missing` を返す)。
+/// JS の値の await なので、transaction の外 (fetch の最初) で取る
+async fn auth_shot_key(env: &Env) -> Option<String> {
+    match env.secret_store(SSO_ENCRYPTION_KEY_BINDING) {
+        Ok(store) => store.get().await.ok().flatten(),
+        Err(_) => None,
+    }
+}
+
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Body>> {
+    // 鍵が要る口 (撮影を書く・判定し直す) のときだけ取る。他の口の待ち時間を増やさない
+    let auth_shot_key = if auth_shots::needs_key(req.method().as_str(), req.uri().path()) {
+        auth_shot_key(&env).await
+    } else {
+        None
+    };
     let started = Date::now().as_millis();
     let client = match db::connect(&env).await {
         Ok(c) => c,
@@ -80,6 +100,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     let repo = Arc::new(WorkerVeinTemplatesRepository::new(client));
     let state = VeinState {
         templates: repo.clone(),
+        auth_shot_key,
     };
     let internal = db_role::internal_router(repo.clone());
     let mut resp = match router(state, internal).call(req).await {
@@ -108,4 +129,22 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     }
     Ok(resp)
+}
+
+/// 定時実行 (wrangler.toml の `[triggers]`、1 日 1 回): 90 日より古い認証ログの撮影を消す
+/// (`vein_auth_shots_purge`。判定は CASCADE で消える)。ログは消した件数だけ。DB の経路は fetch と同じ [`db::connect`]
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let client = match db::connect(&env).await {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("vein: scheduled {e}");
+            return;
+        }
+    };
+    let repo = WorkerVeinTemplatesRepository::new(client);
+    // 失敗は repo がログに残す
+    if let Ok(purged) = repo.purge_auth_shots().await {
+        console_log!("vein: purged {purged} auth shots");
+    }
 }
