@@ -1312,6 +1312,8 @@ fn judgment(employee_id: Uuid, result: &str, logic_version: &str) -> Judgment {
             scores: [60, 61, 77],
             coarse: None,
             rank: None,
+            rule: matched.then(|| "A".to_string()),
+            change: false,
         }],
         error: (result == "error").then(|| "no_approved_record".to_string()),
         elapsed_us: Some(1234),

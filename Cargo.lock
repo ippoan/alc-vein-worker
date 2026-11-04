@@ -3761,13 +3761,13 @@ dependencies = [
 
 [[package]]
 name = "vein-match"
-version = "0.1.4"
-source = "git+https://github.com/ippoan/vein-match?tag=v0.1.4#48628efc727b87c1a9df1dda97017301d5c709d1"
+version = "0.1.5"
+source = "git+https://github.com/ippoan/vein-match?tag=v0.1.5#214a6a8dd6af24617d7a3156e6257ce7589c9dac"
 
 [[package]]
 name = "vein-match-search"
-version = "0.1.4"
-source = "git+https://github.com/ippoan/vein-match?tag=v0.1.4#48628efc727b87c1a9df1dda97017301d5c709d1"
+version = "0.1.5"
+source = "git+https://github.com/ippoan/vein-match?tag=v0.1.5#214a6a8dd6af24617d7a3156e6257ce7589c9dac"
 dependencies = [
  "aes",
  "base64",
