@@ -27,7 +27,9 @@ use alc_core_wasm::api_error::{internal_error, not_found, unprocessable, ApiErro
 use alc_core_wasm::TenantId;
 use alc_worker_crypto::secret::{decrypt_secret, encrypt_secret};
 use vein_match::{load, PLANE_LEN};
-use vein_match_search::{chara_verify, rank_top, template_to_charas, Library, TEMPLATE_MAGIC};
+use vein_match_search::{
+    chara_verify, rank_top, template_to_charas, Library, Pass, Rule, TEMPLATE_MAGIC,
+};
 
 use crate::matcher::MAX_TEMPLATES;
 use crate::repo::{DeviceRecordRow, VeinTemplateRow, FORMAT_MODULE};
@@ -143,6 +145,48 @@ pub struct Candidate {
     /// 粗い比較の順位 (1 から)。method = `top10` のときだけ
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
+    /// `chara_verify` が通した規則 (`A` / `B` / `C`。vein-match-search の `Rule`)。通らなければ無い。
+    /// A は s0, s1, s2 が全部下限以上、B / C は緩い条件で、`scores` が下限に届かなくても通ることがある
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// 照合側と登録側を入れ替えた 2 周目 (CHANGE) で通ったか
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub change: bool,
+}
+
+/// `chara_verify` の 1 回の結果 (s0, s1, s2・一致したか・通した規則)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Verified {
+    scores: [u8; 3],
+    matched: bool,
+    pass: Option<Pass>,
+}
+
+impl Verified {
+    const NONE: Verified = Verified {
+        scores: [0; 3],
+        matched: false,
+        pass: None,
+    };
+
+    fn candidate(self, employee_id: Uuid, coarse: Option<u32>, rank: Option<u32>) -> Candidate {
+        Candidate {
+            employee_id,
+            matched: self.matched,
+            scores: self.scores,
+            coarse,
+            rank,
+            rule: self.pass.map(|p| {
+                match p.rule {
+                    Rule::A => "A",
+                    Rule::B => "B",
+                    Rule::C => "C",
+                }
+                .to_owned()
+            }),
+            change: self.pass.is_some_and(|p| p.change),
+        }
+    }
 }
 
 /// 判定 1 回ぶん (`vein_auth_judgments` の 1 行)。
@@ -276,10 +320,10 @@ fn validate_module(m: &ModuleBody, firmware: Option<&str>) -> Result<(), ApiErro
     }
 }
 
-/// `chara_verify` で 1:1 に確かめる。返すのは (s0, s1, s2, 一致したか)。読めなければ理由。
+/// `chara_verify` で 1:1 に確かめる。返すのは (s0, s1, s2・一致したか・通した規則)。読めなければ理由。
 /// `chara_verify` は不一致でも読み込みの失敗でも info が全 0 で返るので、先に自分で読めることを確かめて
 /// 区別する (記録は取り込める生のテンプレート、撮影は読み込める特徴量)。
-fn verify(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Result<([u8; 3], bool), &'static str> {
+fn verify(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Result<Verified, &'static str> {
     let enroll = decode_record(record_b64).ok_or("unreadable_record")?;
     let (chara, _) = shot_plane(shot)?;
     verify_chara(&enroll, &chara)
@@ -311,11 +355,15 @@ fn shot_plane(shot: &(ShotKind, Vec<u8>)) -> Result<(Vec<u8>, [u8; PLANE_LEN]), 
 }
 
 /// 取り込める記録 `enroll` と特徴量 `chara` を `chara_verify` で 1:1 に確かめる (毎回 `Library::new(2)`)。
-fn verify_chara(enroll: &[u8], chara: &[u8]) -> Result<([u8; 3], bool), &'static str> {
+fn verify_chara(enroll: &[u8], chara: &[u8]) -> Result<Verified, &'static str> {
     let mut lib = Library::new(2).ok_or("library_unavailable")?;
     let r = chara_verify(&mut lib, enroll, chara, 0);
     let info = r.info.pack();
-    Ok(([info[6], info[7], info[8]], r.output.is_some()))
+    Ok(Verified {
+        scores: [info[6], info[7], info[8]],
+        matched: r.output.is_some(),
+        pass: r.pass,
+    })
 }
 
 /// 本人の記録 (その端末へ配る 1 件) との 1:1 の判定 (method = `self`)。記録が無い・読めない場合は `error`
@@ -333,28 +381,10 @@ pub fn judge_self(
     };
     let elapsed_us = elapsed_us(started, 0);
     let (result, matched_employee_id, candidates, error) = match verified {
-        Ok((scores, true)) => (
-            "match",
-            Some(employee_id),
-            vec![Candidate {
-                employee_id,
-                matched: true,
-                scores,
-                coarse: None,
-                rank: None,
-            }],
-            None,
-        ),
-        Ok((scores, false)) => (
-            "nomatch",
-            None,
-            vec![Candidate {
-                employee_id,
-                matched: false,
-                scores,
-                coarse: None,
-                rank: None,
-            }],
+        Ok(v) => (
+            if v.matched { "match" } else { "nomatch" },
+            v.matched.then_some(employee_id),
+            vec![v.candidate(employee_id, None, None)],
             None,
         ),
         Err(reason) => ("error", None, vec![], Some(reason.to_owned())),
@@ -449,14 +479,9 @@ pub fn judge_top10(
                 .map(|(i, &(user, coarse))| {
                     let (employee_id, enroll) = &g.people[user as usize - 1];
                     // 取り込めると確かめた記録なので、読めない場合は起きない
-                    let (scores, matched) = verify_chara(enroll, &chara).unwrap_or(([0; 3], false));
-                    Candidate {
-                        employee_id: *employee_id,
-                        matched,
-                        scores,
-                        coarse: Some(coarse),
-                        rank: Some(i as u32 + 1),
-                    }
+                    verify_chara(enroll, &chara)
+                        .unwrap_or(Verified::NONE)
+                        .candidate(*employee_id, Some(coarse), Some(i as u32 + 1))
                 })
                 .collect();
             let hits: Vec<Uuid> = candidates
@@ -730,4 +755,31 @@ async fn list_auth_shots(
         .await
         .map_err(|e| internal_error("vein list_auth_shot_status", e))?;
     Ok(Json(json!({ "shots": shots })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_names_each_rule_and_change() {
+        let id = Uuid::nil();
+        for (rule, name) in [(Rule::A, "A"), (Rule::B, "B"), (Rule::C, "C")] {
+            for change in [false, true] {
+                let v = Verified {
+                    scores: [50, 51, 78],
+                    matched: true,
+                    pass: Some(Pass {
+                        rule,
+                        change,
+                        hits: 13,
+                    }),
+                };
+                let c = v.candidate(id, None, None);
+                assert_eq!((c.rule.as_deref(), c.change), (Some(name), change));
+            }
+        }
+        let c = Verified::NONE.candidate(id, Some(3), Some(1));
+        assert_eq!((c.rule, c.change, c.matched), (None, false, false));
+    }
 }

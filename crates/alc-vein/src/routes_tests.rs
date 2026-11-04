@@ -2020,6 +2020,9 @@ async fn auth_shot_is_judged_against_the_served_record_and_stored_encrypted() {
     assert_eq!(j["candidates"][0]["employee_id"], id.to_string());
     assert_eq!(j["candidates"][0]["matched"], true);
     assert_eq!(j["candidates"][0]["scores"].as_array().unwrap().len(), 3);
+    // 通した規則が残る (同じ撮影なので A。CHANGE ではないので change は書かない)
+    assert_eq!(j["candidates"][0]["rule"], "A", "{j}");
+    assert_eq!(j["candidates"][0].get("change"), None);
     assert_eq!(j["logic_version"], auth_shots::logic_version());
     assert!(j["logic_version"]
         .as_str()
@@ -2038,6 +2041,7 @@ async fn auth_shot_is_judged_against_the_served_record_and_stored_encrypted() {
     assert_eq!(v["judgment"]["result"], "nomatch");
     assert_eq!(v["judgment"]["matched_employee_id"], Value::Null);
     assert_eq!(v["judgment"]["candidates"][0]["matched"], false);
+    assert_eq!(v["judgment"]["candidates"][0].get("rule"), None);
 
     // 保存したのは状態と暗号文 (平文の撮影ではない)。鍵で戻せる
     let shots = repo.shots.lock().unwrap();
@@ -2575,6 +2579,10 @@ async fn top10_matches_the_one_person_who_passes() {
     let hits: Vec<&Value> = cands.iter().filter(|c| c["matched"] == true).collect();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["employee_id"], ids[0].to_string());
+    // 通った候補だけに規則がある
+    for c in cands {
+        assert_eq!(c["matched"] == true, c.get("rule").is_some(), "{c}");
+    }
     // 撮影 1 件に判定 2 行
     let judgments = repo.judgments.lock().unwrap();
     assert_eq!(judgments.len(), 2);
