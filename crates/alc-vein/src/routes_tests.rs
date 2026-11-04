@@ -381,6 +381,7 @@ impl VeinTemplatesRepository for FakeRepo {
                 employee_id: s.employee_id,
                 device_id: s.device_id.clone(),
                 shot_encrypted: s.shot_encrypted.clone(),
+                pick: s.pick.clone(),
                 created_at: *at,
             })
             .collect())
@@ -420,6 +421,7 @@ impl VeinTemplatesRepository for FakeRepo {
                 module_hit: s.module_hit.clone(),
                 module_score: s.module_score,
                 module_thresholds: s.module_thresholds.clone(),
+                pick: s.pick.clone(),
                 shot_kind: s.shot_kind.to_string(),
                 captured_at: s.captured_at,
                 created_at: *at,
@@ -2065,6 +2067,7 @@ async fn auth_shot_pick_own_and_optional_fields() {
     assert_eq!(v["judgment"]["result"], "match");
     {
         let shots = repo.shots.lock().unwrap();
+        assert_eq!(shots[0].0.pick.as_deref(), Some("own"));
         assert_eq!(
             (
                 shots[0].0.module_slot,
@@ -2317,14 +2320,10 @@ async fn rejudge_adds_judgments_for_stored_shots_and_keeps_the_old_ones() {
     // since 以降だけ (保存時刻 ts(1) 以降の 2 件)
     let (_, v) = as_developer(&repo, "POST", uri, json!({ "since": ts(1) })).await;
     assert_eq!(v["judged"], 2);
-    // pick の指定
-    let (_, v) = as_developer(&repo, "POST", uri, json!({ "pick": "own" })).await;
+    // 行の pick で組む (body の pick は見ない)
+    repo.shots.lock().unwrap()[0].0.pick = Some("own".to_string());
+    let (_, v) = as_developer(&repo, "POST", uri, json!({ "pick": "x" })).await;
     assert_eq!(v["judged"], 3);
-    let (status, v) = as_developer(&repo, "POST", uri, json!({ "pick": "x" })).await;
-    assert_eq!(
-        (status, v["error"].as_str()),
-        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_pick"))
-    );
 }
 
 #[tokio::test]
@@ -2345,6 +2344,7 @@ async fn rejudge_caps_one_run_and_points_at_the_rest() {
                 module_hit: "none".to_string(),
                 module_score: None,
                 module_thresholds: None,
+                pick: None,
                 shot_kind: "chara",
                 shot_encrypted: enc.clone(),
                 captured_at: ts(0),

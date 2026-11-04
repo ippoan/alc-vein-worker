@@ -100,6 +100,8 @@ pub struct NewAuthShot {
     pub module_hit: String,
     pub module_score: Option<i32>,
     pub module_thresholds: Option<Vec<i32>>,
+    /// 端末へ配る記録の組み方 (`own` か、混ぜる側の NULL)。判定し直しで同じ組み方に戻す
+    pub pick: Option<String>,
     pub shot_kind: &'static str,
     /// 撮影 (base64) を暗号化したもの
     pub shot_encrypted: String,
@@ -148,6 +150,7 @@ pub struct AuthShotStatus {
     pub module_hit: String,
     pub module_score: Option<i32>,
     pub module_thresholds: Option<Vec<i32>>,
+    pub pick: Option<String>,
     pub shot_kind: String,
     pub captured_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -162,6 +165,8 @@ pub struct StoredShot {
     pub employee_id: Uuid,
     pub device_id: String,
     pub shot_encrypted: String,
+    /// 保存時の `pick` (`own` なら混ぜずに選ぶ)
+    pub pick: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -189,7 +194,6 @@ struct ShotBody {
 #[derive(Deserialize)]
 struct RejudgeBody {
     since: Option<DateTime<Utc>>,
-    pick: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -377,6 +381,7 @@ async fn post_auth_shot(
         id: Uuid::new_v4(),
         employee_id: body.employee_id,
         device_id,
+        pick: body.pick,
         firmware: body.firmware,
         module_result: body.module.result,
         module_slot: body.module.slot,
@@ -409,7 +414,6 @@ async fn rejudge(
     Json(body): Json<RejudgeBody>,
 ) -> Result<Json<Value>, ApiError> {
     require_developer(&headers)?;
-    let pick_own = parse_pick(body.pick.as_deref())?;
     let key = state.auth_shot_key.as_deref().ok_or_else(key_missing)?;
     let mut shots = state
         .templates
@@ -434,7 +438,13 @@ async fn rejudge(
             let shot = decrypt_secret(&s.shot_encrypted, key)
                 .ok()
                 .and_then(|b64| classify_shot(&b64));
-            let record = served_record(&bases, &devices, s.employee_id, &s.device_id, pick_own);
+            let record = served_record(
+                &bases,
+                &devices,
+                s.employee_id,
+                &s.device_id,
+                s.pick.is_some(),
+            );
             (
                 s.id,
                 judge_self(s.employee_id, record.as_deref(), shot.as_ref()),

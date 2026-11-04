@@ -336,6 +336,7 @@ pub async fn insert_auth_shot(
                 (&shot.shot_kind, Type::TEXT),
                 (&shot.shot_encrypted, Type::TEXT),
                 (&shot.captured_at, Type::TIMESTAMPTZ),
+                (&shot.pick, Type::TEXT),
             ],
         )
         .await?;
@@ -396,7 +397,8 @@ pub async fn list_auth_shots(
             employee_id: r.get(1),
             device_id: r.get(2),
             shot_encrypted: r.get(3),
-            created_at: r.get(4),
+            pick: r.get(4),
+            created_at: r.get(5),
         })
         .collect())
 }
@@ -417,19 +419,19 @@ pub async fn list_auth_shot_status(
         .into_iter()
         .map(|r| {
             let judgment = r
-                .get::<_, Option<String>>(12)
+                .get::<_, Option<String>>(13)
                 .map(|logic_version| StoredJudgment {
                     judgment: Judgment {
                         logic_version,
-                        method: r.get(13),
-                        result: r.get(14),
-                        matched_employee_id: r.get(15),
-                        candidates: serde_json::from_str::<Vec<Candidate>>(&r.get::<_, String>(16))
+                        method: r.get(14),
+                        result: r.get(15),
+                        matched_employee_id: r.get(16),
+                        candidates: serde_json::from_str::<Vec<Candidate>>(&r.get::<_, String>(17))
                             .unwrap_or_default(),
-                        error: r.get(17),
-                        elapsed_us: r.get(18),
+                        error: r.get(18),
+                        elapsed_us: r.get(19),
                     },
-                    created_at: r.get(19),
+                    created_at: r.get(20),
                 });
             AuthShotStatus {
                 id: r.get(0),
@@ -441,9 +443,10 @@ pub async fn list_auth_shot_status(
                 module_hit: r.get(6),
                 module_score: r.get(7),
                 module_thresholds: r.get(8),
-                shot_kind: r.get(9),
-                captured_at: r.get(10),
-                created_at: r.get(11),
+                pick: r.get(9),
+                shot_kind: r.get(10),
+                captured_at: r.get(11),
+                created_at: r.get(12),
                 judgment,
             }
         })

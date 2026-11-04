@@ -1291,6 +1291,7 @@ fn auth_shot(employee_id: Uuid, device: &str) -> NewAuthShot {
         module_hit: "self".to_string(),
         module_score: Some(87),
         module_thresholds: Some(vec![62, 79, 81]),
+        pick: Some("own".to_string()),
         shot_kind: "chara",
         shot_encrypted: "ciphertext".to_string(),
         captured_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
@@ -1373,6 +1374,7 @@ async fn auth_shots_are_inserted_listed_and_kept_within_the_tenant() {
         ("IDENTIFIED", Some(12), "self", Some(87))
     );
     assert_eq!(item.module_thresholds, Some(vec![62, 79, 81]));
+    assert_eq!(item.pick.as_deref(), Some("own"));
     assert_eq!(item.shot_kind, "chara");
     assert_eq!(item.captured_at, shot.captured_at);
     let stored = item.judgment.as_ref().unwrap();
@@ -1410,6 +1412,7 @@ async fn auth_shots_are_inserted_listed_and_kept_within_the_tenant() {
         ),
         (shot.id, yamada, "kiosk-1", "ciphertext")
     );
+    assert_eq!(rows[0].pick.as_deref(), Some("own"));
     let later = rows[0].created_at + chrono::Duration::seconds(1);
     assert_eq!(
         r.list_auth_shots(a, Some(rows[0].created_at), 10)
