@@ -41,7 +41,9 @@ use crate::VeinState;
 const DEVELOPER_HEADER: &str = "x-user-developer";
 
 /// 判定し直しの 1 回の件数の上限。超えたら `more: true` を返し、残りは `next_since` から続ける。
-pub const REJUDGE_LIMIT: usize = 500;
+/// 撮影 1 件に self と top10 の 2 回の判定がかかり (利用者 100 人で 1 件 100 ms 前後の見込み)、
+/// 1 回の呼び出しの CPU 時間に収めるため小さめにする。
+pub const REJUDGE_LIMIT: usize = 100;
 const LIST_DEFAULT: i64 = 50;
 const LIST_MAX: i64 = 200;
 const MAX_FIRMWARE_LEN: usize = 64;
