@@ -337,6 +337,7 @@ pub async fn insert_auth_shot(
                 (&shot.shot_encrypted, Type::TEXT),
                 (&shot.captured_at, Type::TIMESTAMPTZ),
                 (&shot.pick, Type::TEXT),
+                (&shot.enroll_encrypted, Type::TEXT),
             ],
         )
         .await?;
@@ -399,8 +400,9 @@ pub async fn list_auth_shots(
             employee_id: r.get(1),
             device_id: r.get(2),
             shot_encrypted: r.get(3),
-            pick: r.get(4),
-            created_at: r.get(5),
+            enroll_encrypted: r.get(4),
+            pick: r.get(5),
+            created_at: r.get(6),
         })
         .collect())
 }
@@ -420,8 +422,8 @@ pub async fn list_auth_shot_status(
     Ok(rows
         .into_iter()
         .map(|r| {
-            let judgment = stored_judgment(&r, 13);
-            let judgment_top10 = stored_judgment(&r, 21);
+            let judgment = stored_judgment(&r, 14);
+            let judgment_top10 = stored_judgment(&r, 22);
             AuthShotStatus {
                 id: r.get(0),
                 employee_id: r.get(1),
@@ -436,6 +438,7 @@ pub async fn list_auth_shot_status(
                 shot_kind: r.get(10),
                 captured_at: r.get(11),
                 created_at: r.get(12),
+                has_enroll_snapshot: r.get(13),
                 judgment,
                 judgment_top10,
             }

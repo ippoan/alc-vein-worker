@@ -225,11 +225,11 @@ pub mod sql {
 
     /// 認証ログの撮影と状態を 1 行足す (生きている乗務員だけ。居なければ 0 行)。
     /// $1 id / $2 tenant_id / $3 employee_id / $4 device_id / $5 firmware / $6 module_result / $7 module_slot /
-    /// $8 module_hit / $9 module_score / $10 module_thresholds / $11 shot_kind / $12 shot_encrypted / $13 captured_at / $14 pick。
+    /// $8 module_hit / $9 module_score / $10 module_thresholds / $11 shot_kind / $12 shot_encrypted / $13 captured_at / $14 pick / $15 enroll_encrypted。
     pub const INSERT_AUTH_SHOT: &str = r#"INSERT INTO alc_api.vein_auth_shots
         (id, tenant_id, employee_id, device_id, firmware, module_result, module_slot, module_hit, module_score,
-         module_thresholds, shot_kind, shot_encrypted, captured_at, pick)
-    SELECT $1, e.tenant_id, e.id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 FROM employees e
+         module_thresholds, shot_kind, shot_encrypted, captured_at, pick, enroll_encrypted)
+    SELECT $1, e.tenant_id, e.id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 FROM employees e
     WHERE e.tenant_id = $2 AND e.id = $3 AND e.deleted_at IS NULL"#;
 
     /// 判定を 1 行足す (受けたときに 1 回、判定し直すたびに 1 回。前の判定は消さない)。candidates は JSON の文字列で渡す。
@@ -240,8 +240,8 @@ pub mod sql {
     VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9)"#;
 
     /// 判定し直しの対象 (古い順。$2 = この保存時刻以降、NULL なら全部)。
-    /// $1 tenant_id / $2 since / $3 limit → id, employee_id, device_id, shot_encrypted, pick, created_at。
-    pub const LIST_AUTH_SHOTS: &str = r#"SELECT id, employee_id, device_id, shot_encrypted, pick, created_at
+    /// $1 tenant_id / $2 since / $3 limit → id, employee_id, device_id, shot_encrypted, enroll_encrypted, pick, created_at。
+    pub const LIST_AUTH_SHOTS: &str = r#"SELECT id, employee_id, device_id, shot_encrypted, enroll_encrypted, pick, created_at
     FROM vein_auth_shots
     WHERE tenant_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)
     ORDER BY created_at, id
@@ -249,7 +249,7 @@ pub mod sql {
 
     /// 新しい順の状態と、method ごと (self / top10) の最新の判定 (撮影そのものは選ばない)。$1 tenant_id / $2 limit。
     pub const LIST_AUTH_SHOT_STATUS: &str = r#"SELECT s.id, s.employee_id, s.device_id, s.firmware, s.module_result, s.module_slot,
-        s.module_hit, s.module_score, s.module_thresholds, s.pick, s.shot_kind, s.captured_at, s.created_at,
+        s.module_hit, s.module_score, s.module_thresholds, s.pick, s.shot_kind, s.captured_at, s.created_at, s.enroll_encrypted IS NOT NULL,
         j.logic_version, j.method, j.result, j.matched_employee_id, j.candidates::text, j.error, j.elapsed_us, j.created_at,
         t.logic_version, t.method, t.result, t.matched_employee_id, t.candidates::text, t.error, t.elapsed_us, t.created_at
     FROM vein_auth_shots s

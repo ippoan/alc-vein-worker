@@ -381,6 +381,7 @@ impl VeinTemplatesRepository for FakeRepo {
                 employee_id: s.employee_id,
                 device_id: s.device_id.clone(),
                 shot_encrypted: s.shot_encrypted.clone(),
+                enroll_encrypted: s.enroll_encrypted.clone(),
                 pick: s.pick.clone(),
                 created_at: *at,
             })
@@ -412,6 +413,7 @@ impl VeinTemplatesRepository for FakeRepo {
             .rev()
             .take(limit as usize)
             .map(|(s, at)| AuthShotStatus {
+                has_enroll_snapshot: s.enroll_encrypted.is_some(),
                 judgment: latest(&judgments, s.id, "self", *at),
                 judgment_top10: latest(&judgments, s.id, "top10", *at),
                 id: s.id,
@@ -2376,6 +2378,7 @@ async fn rejudge_caps_one_run_and_points_at_the_rest() {
                 module_score: None,
                 module_thresholds: None,
                 pick: None,
+                enroll_encrypted: None,
                 shot_kind: "chara",
                 shot_encrypted: enc.clone(),
                 captured_at: ts(0),
@@ -2640,4 +2643,154 @@ async fn list_returns_the_latest_judgment_of_each_method() {
     assert_eq!(s["judgment"]["method"], "self");
     assert_eq!(s["judgment_top10"]["method"], "top10");
     assert_eq!(s["judgment_top10"]["result"], "match");
+}
+
+// ---- 判定し直しは撮影したときの記録で ----
+
+/// 乗務員の今の記録 (元の行) を種 `seed` のものに差し替える。
+fn replace_current_record(repo: &FakeRepo, id: Uuid, seed: u64) {
+    let mut rows = repo.rows.lock().unwrap();
+    rows.iter_mut()
+        .find(|r| r.employee_id == id)
+        .unwrap()
+        .template = template_of_seeds(&[seed, seed, seed]);
+}
+
+fn judged_by(repo: &FakeRepo, method: &str) -> Judgment {
+    repo.judgments
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|(_, j)| j.method == method)
+        .unwrap()
+        .1
+        .clone()
+}
+
+#[tokio::test]
+async fn rejudge_uses_the_record_saved_with_the_shot() {
+    let repo = Arc::new(FakeRepo::default());
+    let ids = enrolled_seeds(&repo, &[7, 21]);
+    let (_, v) = post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    let before = v["judgment"]["candidates"][0]["scores"].clone();
+    assert_eq!(v["judgment"]["result"], "match");
+
+    // 保存したのは相手にした記録の暗号文
+    {
+        let shots = repo.shots.lock().unwrap();
+        let enc = shots[0].0.enroll_encrypted.as_deref().unwrap();
+        assert_eq!(
+            alc_worker_crypto::secret::decrypt_secret(enc, TEST_KEY).unwrap(),
+            template_of_seeds(&[7, 7, 7])
+        );
+    }
+
+    // 今の記録が変わっても (照合が通った後に入れ替わる想定)、保存した記録で判定し直す
+    replace_current_record(&repo, ids[0], 50);
+    let (status, _) = as_developer(&repo, "POST", "/vein/auth-shots/rejudge", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let s = judged_by(&repo, "self");
+    assert_eq!(s.result, "match");
+    assert_eq!(json!(s.candidates[0].scores), before);
+    assert_eq!(s.logic_version, auth_shots::logic_version());
+    // top10 は本人の記録だけ保存したものに差し替わる (他人は今のまま)
+    let t = judged_by(&repo, "top10");
+    assert_eq!(t.result, "match");
+    assert_eq!(t.matched_employee_id, Some(ids[0]));
+    assert_eq!(t.logic_version, auth_shots::logic_version_top10());
+
+    // 今の記録のままなら、同じ撮影は通らない (保存した記録を使う意味)
+    let mut old = repo.shots.lock().unwrap()[0].0.clone();
+    old.id = Uuid::new_v4();
+    old.enroll_encrypted = None;
+    repo.shots.lock().unwrap().push((old, ts(5)));
+
+    // 本人の今の記録が消えていても、保存した記録で top10 の相手に加わる
+    repo.rows
+        .lock()
+        .unwrap()
+        .retain(|r| r.employee_id != ids[0]);
+    as_developer(
+        &repo,
+        "POST",
+        "/vein/auth-shots/rejudge",
+        json!({ "since": ts(0) }),
+    )
+    .await;
+    let judgments = repo.judgments.lock().unwrap();
+    let first_pair: Vec<&Judgment> = judgments[judgments.len() - 4..judgments.len() - 2]
+        .iter()
+        .map(|(_, j)| j)
+        .collect();
+    assert_eq!(first_pair[1].result, "match");
+}
+
+#[tokio::test]
+async fn rejudge_marks_rows_without_a_saved_record_as_judged_by_the_current_one() {
+    let repo = Arc::new(FakeRepo::default());
+    let ids = enrolled_seeds(&repo, &[7, 21]);
+    post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    repo.shots.lock().unwrap()[0].0.enroll_encrypted = None;
+    replace_current_record(&repo, ids[0], 50);
+    as_developer(&repo, "POST", "/vein/auth-shots/rejudge", json!({})).await;
+    let s = judged_by(&repo, "self");
+    let t = judged_by(&repo, "top10");
+    // 今の記録 (種 50) で判定するので通らず、印が付く
+    assert_eq!(s.result, "nomatch");
+    assert_eq!(
+        s.logic_version,
+        format!("{} current-enroll", auth_shots::logic_version())
+    );
+    assert_eq!(
+        t.logic_version,
+        format!("{} current-enroll", auth_shots::logic_version_top10())
+    );
+    assert_eq!(t.result, "nomatch");
+
+    // 保存した記録も今の記録も無い行は no_approved_record
+    repo.rows
+        .lock()
+        .unwrap()
+        .retain(|r| r.employee_id != ids[0]);
+    as_developer(&repo, "POST", "/vein/auth-shots/rejudge", json!({})).await;
+    assert_eq!(
+        judged_by(&repo, "self").error.as_deref(),
+        Some("no_approved_record")
+    );
+}
+
+#[tokio::test]
+async fn rejudge_with_an_unreadable_saved_record_is_an_error() {
+    let repo = Arc::new(FakeRepo::default());
+    let ids = enrolled_seeds(&repo, &[7]);
+    post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    repo.shots.lock().unwrap()[0].0.enroll_encrypted = Some("AAAA".to_string());
+    as_developer(&repo, "POST", "/vein/auth-shots/rejudge", json!({})).await;
+    for method in ["self", "top10"] {
+        let j = judged_by(&repo, method);
+        assert_eq!(
+            (j.result.as_str(), j.error.as_deref()),
+            ("error", Some("unreadable_enroll")),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_shot_without_a_record_saves_no_snapshot_and_the_list_only_says_whether_there_is_one()
+{
+    let repo = Arc::new(FakeRepo::default());
+    let none = repo.add_employee("記録なし");
+    post_shot(&repo, shot_body(none, &chara_shot(7))).await;
+    assert!(repo.shots.lock().unwrap()[0].0.enroll_encrypted.is_none());
+    let ids = enrolled_seeds(&repo, &[7]);
+    post_shot(&repo, shot_body(ids[0], &chara_shot(7))).await;
+    let (_, v) = as_developer(&repo, "GET", "/vein/auth-shots", Value::Null).await;
+    assert_eq!(v["shots"][0]["has_enroll_snapshot"], true);
+    assert_eq!(v["shots"][1]["has_enroll_snapshot"], false);
+    assert!(v["shots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s.get("enroll_encrypted").is_none()));
 }
