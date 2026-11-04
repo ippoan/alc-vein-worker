@@ -74,4 +74,4 @@ private repo ippoan/vein-match への git 依存がある。ローカルは `gh 
 - **alc-migrations** (staging の DB と、テストの組み込みの PostgreSQL の SQL): `container/ALC_MIGRATIONS_REV` の 1 行を変える (**rev を書くのはこのファイルだけ**)。
   rev は ippoan/rust-alc-api の `Cargo.toml` が固定している alc-migrations の rev と揃える。
   `bash scripts/fetch-migrations.sh` → `cargo test -p alc-vein` → `docker build` → 起動確認 (CI の「staging DB の Container image が起動する」と同じ命令) を手元で通す。
-- **vein-match**: `crates/alc-vein/Cargo.toml` の `tag` (2 行とも) と `Cargo.lock`。(今は一時的に `rev` で ippoan/vein-match#26 の commit。#26 のマージ後に tag v0.1.4 へ戻す。)
+- **vein-match**: `crates/alc-vein/Cargo.toml` の `tag` (2 行とも) と `Cargo.lock`。

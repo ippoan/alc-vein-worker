@@ -32,10 +32,8 @@ serde_json = "1"
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-uuid-1"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-# vein-match / vein-match-search は一時的に chara_verify の入った commit (ippoan/vein-match#26、未マージ) に固定している。
-# #26 のマージ後に tag v0.1.4 へ戻す (戻すとき Cargo.lock も一緒に更新する)。
-vein-match = { git = "https://github.com/ippoan/vein-match", rev = "5d8da3c53191d4042b101386c8fb59d130d7c4ee" }
-vein-match-search = { git = "https://github.com/ippoan/vein-match", rev = "5d8da3c53191d4042b101386c8fb59d130d7c4ee" }
+vein-match = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.4" }
+vein-match-search = { git = "https://github.com/ippoan/vein-match", tag = "v0.1.4" }
 
 # trait・型・matcher・routes と repo の実装 (`pg`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
 # (接続は持たない。張るのは直下の worker と tests/sql_db.rs、Refs ippoan/rust-alc-api#682 / ippoan/rust-alc-api#723)。
