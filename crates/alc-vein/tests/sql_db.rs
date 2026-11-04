@@ -1309,6 +1309,8 @@ fn judgment(employee_id: Uuid, result: &str, logic_version: &str) -> Judgment {
             employee_id,
             matched,
             scores: [60, 61, 77],
+            coarse: None,
+            rank: None,
         }],
         error: (result == "error").then(|| "no_approved_record".to_string()),
         elapsed_us: Some(1234),
@@ -1346,14 +1348,14 @@ async fn auth_shots_are_inserted_listed_and_kept_within_the_tenant() {
 
     let shot = auth_shot(yamada, "kiosk-1");
     assert!(r
-        .insert_auth_shot(a, &shot, &judgment(yamada, "match", "v1"))
+        .insert_auth_shot(a, &shot, &[judgment(yamada, "match", "v1")])
         .await
         .unwrap());
     // 削除済み・他のテナント・居ない乗務員には書けない (判定も書かない)
     for (tenant_id, employee_id) in [(a, sato), (a, other), (b, yamada), (a, Uuid::new_v4())] {
         let s = auth_shot(employee_id, "kiosk-1");
         assert!(!r
-            .insert_auth_shot(tenant_id, &s, &judgment(employee_id, "match", "v1"))
+            .insert_auth_shot(tenant_id, &s, &[judgment(employee_id, "match", "v1")])
             .await
             .unwrap());
     }
@@ -1392,6 +1394,18 @@ async fn auth_shots_are_inserted_listed_and_kept_within_the_tenant() {
     let item = r.list_auth_shot_status(a, 10).await.unwrap().remove(0);
     assert_eq!(item.judgment.unwrap().judgment.logic_version, "v2");
 
+    // method = top10 の判定 (粗い点数と順位つき) は別に最新が残る
+    let mut top10 = judgment(yamada, "again", "v2-top10");
+    top10.method = "top10".to_string();
+    top10.candidates[0].coarse = Some(1234);
+    top10.candidates[0].rank = Some(1);
+    r.insert_judgments(a, &[(shot.id, top10.clone())])
+        .await
+        .unwrap();
+    let item = r.list_auth_shot_status(a, 10).await.unwrap().remove(0);
+    assert_eq!(item.judgment.unwrap().judgment.logic_version, "v2");
+    assert_eq!(item.judgment_top10.unwrap().judgment, top10);
+
     // 別のテナントからは見えない・足せない (RLS と WHERE tenant_id)
     assert_eq!(r.list_auth_shot_status(b, 10).await.unwrap(), vec![]);
     assert_eq!(r.list_auth_shots(b, None, 10).await.unwrap(), vec![]);
@@ -1426,7 +1440,7 @@ async fn auth_shots_are_inserted_listed_and_kept_within_the_tenant() {
     // 新しい順・limit
     let second = auth_shot(yamada, "kiosk-2");
     assert!(r
-        .insert_auth_shot(a, &second, &judgment(yamada, "error", "v2"))
+        .insert_auth_shot(a, &second, &[judgment(yamada, "error", "v2")])
         .await
         .unwrap());
     let listed = r.list_auth_shot_status(a, 1).await.unwrap();
@@ -1466,7 +1480,7 @@ async fn purge_removes_shots_older_than_90_days_across_tenants() {
         for bucket in [&mut old, &mut fresh] {
             let s = auth_shot(employee_id, "kiosk-1");
             assert!(r
-                .insert_auth_shot(tenant_id, &s, &judgment(employee_id, "match", "v1"))
+                .insert_auth_shot(tenant_id, &s, &[judgment(employee_id, "match", "v1")])
                 .await
                 .unwrap());
             bucket.push(s.id);
@@ -1593,6 +1607,9 @@ async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
     );
     assert_eq!(item["module_thresholds"], json!([62, 79, 81]));
     assert_eq!(item["judgment"]["candidates"], json!([]));
+    // 撮影 1 件に判定 2 行 (self と top10)
+    assert_eq!(item["judgment_top10"]["method"], "top10");
+    assert_eq!(item["judgment_top10"]["error"], "no_approved_record");
     assert!(item.get("shot_encrypted").is_none());
     let (status, _) = call("GET", "/vein/auth-shots", vec![], Value::Null).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1618,6 +1635,6 @@ async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
     // 接続を閉じ切る前に、Arc の写しを持つ state を手放す
     drop(state);
     repo.close().await;
-    assert_eq!(judgment_count(&db).await, 2);
+    assert_eq!(judgment_count(&db).await, 4);
     db.shutdown();
 }
