@@ -64,6 +64,9 @@ pub fn logic_version() -> String {
 /// 粗い比較で絞る人数 (method = `top10`)。
 const TOP_N: usize = 10;
 
+/// 保存した記録が無い古い行を今の記録で判定し直したときに、`logic_version` の後ろに付ける印。
+const CURRENT_ENROLL_MARK: &str = " current-enroll";
+
 /// method = `top10` の判定の版 (粗い比較の上位 [`TOP_N`] 人 + `chara_verify`)。
 pub fn logic_version_top10() -> String {
     format!(
@@ -121,6 +124,9 @@ pub struct NewAuthShot {
     pub shot_kind: &'static str,
     /// 撮影 (base64) を暗号化したもの
     pub shot_encrypted: String,
+    /// 撮影したときに相手にした本人の記録 (base64) を、撮影と同じ鍵で暗号化したもの。
+    /// 記録が無かったとき (`no_approved_record`) は `None`。判定し直しはこの記録を相手にする
+    pub enroll_encrypted: Option<String>,
     pub captured_at: DateTime<Utc>,
 }
 
@@ -176,6 +182,8 @@ pub struct AuthShotStatus {
     pub shot_kind: String,
     pub captured_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// 撮影したときの記録を保存してあるか (記録そのものは返さない)
+    pub has_enroll_snapshot: bool,
     /// method = `self` の最新の判定 (判定の行が無ければ null)
     pub judgment: Option<StoredJudgment>,
     /// method = `top10` の最新の判定 (無ければ null)
@@ -189,6 +197,8 @@ pub struct StoredShot {
     pub employee_id: Uuid,
     pub device_id: String,
     pub shot_encrypted: String,
+    /// 撮影したときの本人の記録 (暗号化されたまま。古い行は `None`)
+    pub enroll_encrypted: Option<String>,
     /// 保存時の `pick` (`own` なら混ぜずに選ぶ)
     pub pick: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -308,16 +318,17 @@ fn verify_chara(enroll: &[u8], chara: &[u8]) -> Result<([u8; 3], bool), &'static
     Ok(([info[6], info[7], info[8]], r.output.is_some()))
 }
 
-/// 本人の記録 (その端末へ配る 1 件) との 1:1 の判定 (method = `self`)。記録が無い・読めない場合は `error`。
+/// 本人の記録 (その端末へ配る 1 件) との 1:1 の判定 (method = `self`)。記録が無い・読めない場合は `error`
+/// (`record_b64` が `Err` なら、その理由をそのまま error に残す)。
 pub fn judge_self(
     employee_id: Uuid,
-    record_b64: Option<&str>,
+    record_b64: Result<&str, &'static str>,
     shot: Option<&(ShotKind, Vec<u8>)>,
 ) -> Judgment {
     let started = Utc::now();
     let verified = match (record_b64, shot) {
-        (Some(record), Some(shot)) => verify(record, shot),
-        (None, _) => Err("no_approved_record"),
+        (Ok(record), Some(shot)) => verify(record, shot),
+        (Err(reason), _) => Err(reason),
         (_, None) => Err("unreadable_shot"),
     };
     let elapsed_us = elapsed_us(started, 0);
@@ -472,6 +483,15 @@ pub fn judge_top10(
     }
 }
 
+/// `records` のうち乗務員 `employee_id` の記録を `own` に差し替える (居なければ足す)。
+/// 照合が通ると端末は撮影を本人の記録に入れるので、判定し直しは本人の記録だけを撮影したときのものにする。
+fn replace_own(records: &mut Vec<(Uuid, String)>, employee_id: Uuid, own: String) {
+    match records.iter_mut().find(|(id, _)| *id == employee_id) {
+        Some(slot) => slot.1 = own,
+        None => records.push((employee_id, own)),
+    }
+}
+
 /// 端末 `device_id` へ配る、全員ぶんの記録 (承認済みの module の行がある乗務員。登録順)。
 fn served_records(
     bases: &[VeinTemplateRow],
@@ -555,8 +575,12 @@ async fn post_auth_shot(
         .list_device_records(tenant_id)
         .await
         .map_err(|e| internal_error("vein auth_shot list_device_records", e))?;
-    let record = served_record(&bases, &devices, body.employee_id, &device_id, pick_own);
-    let judgment = judge_self(body.employee_id, record.as_deref(), Some(&shot));
+    let served = served_record(&bases, &devices, body.employee_id, &device_id, pick_own);
+    let judgment = judge_self(
+        body.employee_id,
+        served.as_deref().ok_or("no_approved_record"),
+        Some(&shot),
+    );
     let gallery = build_gallery(&served_records(&bases, &devices, &device_id, pick_own));
     let judgment_top10 = judge_top10(&gallery, Some(&shot), true);
     let record = NewAuthShot {
@@ -573,6 +597,11 @@ async fn post_auth_shot(
         shot_kind: shot.0.as_str(),
         shot_encrypted: encrypt_secret(&body.shot, key)
             .map_err(|e| internal_error("vein auth_shot encrypt", e))?,
+        enroll_encrypted: served
+            .as_deref()
+            .map(|r| encrypt_secret(r, key))
+            .transpose()
+            .map_err(|e| internal_error("vein auth_shot encrypt enroll", e))?,
         captured_at: body.captured_at,
     };
     let saved = state
@@ -622,7 +651,8 @@ async fn rejudge(
         .list_device_records(tenant_id)
         .await
         .map_err(|e| internal_error("vein rejudge list_device_records", e))?;
-    // 端末と pick が同じ撮影のあいだは、相手の Library を使い回す (粗い比較は Library を変えない)
+    // 保存した記録が無い古い行は、端末と pick が同じ撮影のあいだ今の相手の Library を使い回す
+    // (粗い比較は Library を変えない)。保存した記録がある行は、本人の記録だけ差し替えて組む
     let mut galleries: HashMap<(String, bool), Result<Gallery, &'static str>> = HashMap::new();
     let mut judgments: Vec<(Uuid, Judgment)> = Vec::with_capacity(shots.len() * 2);
     for s in &shots {
@@ -630,17 +660,42 @@ async fn rejudge(
             .ok()
             .and_then(|b64| classify_shot(&b64));
         let pick_own = s.pick.is_some();
-        let record = served_record(&bases, &devices, s.employee_id, &s.device_id, pick_own);
-        judgments.push((
-            s.id,
-            judge_self(s.employee_id, record.as_deref(), shot.as_ref()),
-        ));
-        let gallery = galleries
-            .entry((s.device_id.clone(), pick_own))
-            .or_insert_with(|| {
-                build_gallery(&served_records(&bases, &devices, &s.device_id, pick_own))
-            });
-        judgments.push((s.id, judge_top10(gallery, shot.as_ref(), false)));
+        // 撮影したときの本人の記録 (復号できなければ unreadable_enroll)
+        let snapshot = s
+            .enroll_encrypted
+            .as_deref()
+            .map(|enc| decrypt_secret(enc, key).map_err(|_| "unreadable_enroll"));
+        let current = served_record(&bases, &devices, s.employee_id, &s.device_id, pick_own);
+        let record = match &snapshot {
+            Some(Ok(r)) => Ok(r.as_str()),
+            Some(Err(reason)) => Err(*reason),
+            None => current.as_deref().ok_or("no_approved_record"),
+        };
+        let mut self_judgment = judge_self(s.employee_id, record, shot.as_ref());
+        let top10_judgment = match snapshot {
+            Some(snapshot) => {
+                let gallery = snapshot.and_then(|own| {
+                    let mut records = served_records(&bases, &devices, &s.device_id, pick_own);
+                    replace_own(&mut records, s.employee_id, own);
+                    build_gallery(&records)
+                });
+                judge_top10(&gallery, shot.as_ref(), false)
+            }
+            None => {
+                let gallery = galleries
+                    .entry((s.device_id.clone(), pick_own))
+                    .or_insert_with(|| {
+                        build_gallery(&served_records(&bases, &devices, &s.device_id, pick_own))
+                    });
+                let mut j = judge_top10(gallery, shot.as_ref(), false);
+                // 保存した記録が無い行は今の記録で判定したので、印を残す
+                j.logic_version.push_str(CURRENT_ENROLL_MARK);
+                self_judgment.logic_version.push_str(CURRENT_ENROLL_MARK);
+                j
+            }
+        };
+        judgments.push((s.id, self_judgment));
+        judgments.push((s.id, top10_judgment));
     }
     state
         .templates
