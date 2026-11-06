@@ -2023,6 +2023,12 @@ async fn auth_shot_is_judged_against_the_served_record_and_stored_encrypted() {
     // 通した規則が残る (同じ撮影なので A。CHANGE ではないので change は書かない)
     assert_eq!(j["candidates"][0]["rule"], "A", "{j}");
     assert_eq!(j["candidates"][0].get("change"), None);
+    // 同じ撮影なので、記録の件の 1 本目とずれ 0・重なり全部で重なる
+    assert_eq!(
+        j["candidates"][0]["shift"],
+        json!({ "entry": 6, "dx": 0, "dy": 0, "overlap": 1000, "overlap0": 1000 }),
+        "{j}"
+    );
     assert_eq!(j["logic_version"], auth_shots::logic_version());
     assert!(j["logic_version"]
         .as_str()

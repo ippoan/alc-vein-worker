@@ -28,7 +28,7 @@ use alc_core_wasm::TenantId;
 use alc_worker_crypto::secret::{decrypt_secret, encrypt_secret};
 use vein_match::{load, PLANE_LEN};
 use vein_match_search::{
-    chara_verify, rank_top, template_to_charas, Library, Pass, Rule, TEMPLATE_MAGIC,
+    chara_verify, rank_top, shot_shifts, template_to_charas, Library, Pass, Rule, TEMPLATE_MAGIC,
 };
 
 use crate::matcher::MAX_TEMPLATES;
@@ -152,6 +152,40 @@ pub struct Candidate {
     /// 照合側と登録側を入れ替えた 2 周目 (CHANGE) で通ったか
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub change: bool,
+    /// 撮影と記録の件のうち、いちばん重なった件との位置のずれ (置き方の診断。判定には使わない)。
+    /// method = `self` のときだけ
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<ShotShift>,
+}
+
+/// 撮影を記録の 1 件と上下左右にずらして重ねたとき、いちばん重なったずらし量 (vein-match-search の
+/// `shot_shifts`)。撮影が記録より右・下へずれていれば正。重なりは撮影の静脈の画素のうち重なった千分率
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShotShift {
+    /// 件の通し番号 (0..6 は学習記録の件、6..12 は記録の件)
+    pub entry: u8,
+    pub dx: i8,
+    pub dy: i8,
+    /// ずらしたときの重なり (千分率)
+    pub overlap: u16,
+    /// ずらさずに重ねたときの重なり (千分率)
+    pub overlap0: u16,
+}
+
+/// 記録 (base64) の件のうち、撮影といちばん重なる件の位置のずれ。読めなければ `None`。
+fn best_shot_shift(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Option<ShotShift> {
+    let enroll = decode_record(record_b64)?;
+    let (chara, _) = shot_plane(shot).ok()?;
+    shot_shifts(&enroll, &chara)?
+        .into_iter()
+        .max_by_key(|x| (x.overlap, std::cmp::Reverse(x.entry)))
+        .map(|x| ShotShift {
+            entry: x.entry,
+            dx: x.dx,
+            dy: x.dy,
+            overlap: x.overlap,
+            overlap0: x.overlap0,
+        })
 }
 
 /// `chara_verify` の 1 回の結果 (s0, s1, s2・一致したか・通した規則)。
@@ -185,6 +219,7 @@ impl Verified {
                 .to_owned()
             }),
             change: self.pass.is_some_and(|p| p.change),
+            shift: None,
         }
     }
 }
@@ -384,7 +419,10 @@ pub fn judge_self(
         Ok(v) => (
             if v.matched { "match" } else { "nomatch" },
             v.matched.then_some(employee_id),
-            vec![v.candidate(employee_id, None, None)],
+            vec![Candidate {
+                shift: record_b64.ok().zip(shot).and_then(|(r, s)| best_shot_shift(r, s)),
+                ..v.candidate(employee_id, None, None)
+            }],
             None,
         ),
         Err(reason) => ("error", None, vec![], Some(reason.to_owned())),
