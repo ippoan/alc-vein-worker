@@ -420,7 +420,10 @@ pub fn judge_self(
             if v.matched { "match" } else { "nomatch" },
             v.matched.then_some(employee_id),
             vec![Candidate {
-                shift: record_b64.ok().zip(shot).and_then(|(r, s)| best_shot_shift(r, s)),
+                shift: record_b64
+                    .ok()
+                    .zip(shot)
+                    .and_then(|(r, s)| best_shot_shift(r, s)),
                 ..v.candidate(employee_id, None, None)
             }],
             None,
