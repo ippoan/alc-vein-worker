@@ -401,6 +401,19 @@ fn verify_chara(enroll: &[u8], chara: &[u8]) -> Result<Verified, &'static str> {
     })
 }
 
+/// 登録した記録 `new_b64` の件 (撮った 1 枚ずつ) のうち、承認済みの記録 `approved_b64` と `chara_verify` で合う件の数と、
+/// 件の総数 (Refs ippoan/alc-app-s3#352、端末ごとの承認の自動承認)。どちらかが読めなければ `None`
+pub fn count_matching_entries(new_b64: &str, approved_b64: &str) -> Option<(usize, usize)> {
+    let enroll = decode_record(approved_b64)?;
+    let new = STANDARD.decode(new_b64).ok()?;
+    let charas = template_to_charas(&new).ok()?;
+    let matched = charas
+        .iter()
+        .filter(|c| verify_chara(&enroll, &c[..]).is_ok_and(|v| v.matched))
+        .count();
+    Some((matched, charas.len()))
+}
+
 /// 本人の記録 (その端末へ配る 1 件) との 1:1 の判定 (method = `self`)。記録が無い・読めない場合は `error`
 /// (`record_b64` が `Err` なら、その理由をそのまま error に残す)。
 pub fn judge_self(

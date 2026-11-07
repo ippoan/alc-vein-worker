@@ -23,8 +23,8 @@ use crate::auth_shots::{
 };
 use crate::matcher::{self, synth, MAX_TEMPLATES};
 use crate::repo::{
-    ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
-    VeinTemplatesRepository, FORMAT_MODULE,
+    ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, PendingModuleItem,
+    VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE,
 };
 use crate::VeinState;
 
@@ -46,6 +46,8 @@ struct FakeRepo {
     approved_by_employee: Mutex<Vec<(Uuid, Uuid)>>,
     /// 端末ごとの記録 (`vein_device_records`)。
     device_records: Mutex<Vec<DeviceRecordRow>>,
+    /// 端末ごとの記録の承認 ((乗務員, 端末) → 承認の種類。無ければ承認済み)。
+    device_approvals: Mutex<Vec<((Uuid, String), DeviceApproval)>>,
     fail: AtomicBool,
     /// upsert だけを DB エラーにする (人数の数えは通す)。
     fail_upsert: AtomicBool,
@@ -67,6 +69,32 @@ struct FakeRepo {
 }
 
 impl FakeRepo {
+    fn device_approval(&self, d: &DeviceRecordRow) -> DeviceApproval {
+        self.device_approvals
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|((e, dev), _)| *e == d.employee_id && *dev == d.device_id)
+            .map(|(_, a)| *a)
+            .unwrap_or(DeviceApproval::Approved)
+    }
+
+    fn set_device_approval(&self, employee_id: Uuid, device_id: &str, approval: DeviceApproval) {
+        let mut approvals = self.device_approvals.lock().unwrap();
+        approvals.retain(|((e, dev), _)| !(*e == employee_id && dev == device_id));
+        approvals.push(((employee_id, device_id.to_string()), approval));
+    }
+
+    fn name_of(&self, employee_id: Uuid) -> String {
+        self.employees
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == employee_id)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_default()
+    }
+
     fn check(&self) -> Result<(), DbError> {
         if self.fail.load(Ordering::SeqCst) {
             return Err(DbError::Other("pool timed out".into()));
@@ -210,7 +238,22 @@ impl VeinTemplatesRepository for FakeRepo {
                 name: r.name.clone(),
                 updated_at: r.updated_at,
                 registered_device_id: r.registered_device_id.clone(),
+                device_id: None,
             })
+            .chain(
+                self.device_records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|d| self.device_approval(d) == DeviceApproval::Pending)
+                    .map(|d| PendingModuleItem {
+                        employee_id: d.employee_id,
+                        name: self.name_of(d.employee_id),
+                        updated_at: d.updated_at,
+                        registered_device_id: Some(d.device_id.clone()),
+                        device_id: Some(d.device_id.clone()),
+                    }),
+            )
             .collect())
     }
 
@@ -220,6 +263,7 @@ impl VeinTemplatesRepository for FakeRepo {
         employee_id: Uuid,
         approver_employee_id: Uuid,
         updated_at: DateTime<Utc>,
+        device_id: Option<&str>,
     ) -> Result<ApproveByEmployee, DbError> {
         self.check()?;
         if !self
@@ -238,6 +282,24 @@ impl VeinTemplatesRepository for FakeRepo {
             && !pending.contains(&approver_employee_id);
         if !enrolled {
             return Ok(ApproveByEmployee::ApproverNotEnrolled);
+        }
+        if let Some(device_id) = device_id {
+            let devices = self.device_records.lock().unwrap();
+            let waiting = devices.iter().any(|d| {
+                d.employee_id == employee_id
+                    && d.device_id == device_id
+                    && d.updated_at == updated_at
+                    && self.device_approval(d) == DeviceApproval::Pending
+            });
+            if !waiting {
+                return Ok(ApproveByEmployee::Conflict);
+            }
+            self.set_device_approval(employee_id, device_id, DeviceApproval::Approved);
+            self.approved_by_employee
+                .lock()
+                .unwrap()
+                .push((employee_id, approver_employee_id));
+            return Ok(ApproveByEmployee::Approved);
         }
         let version_matches = rows
             .iter()
@@ -300,6 +362,7 @@ impl VeinTemplatesRepository for FakeRepo {
         employee_id: Uuid,
         device_id: &str,
         record: &str,
+        approval: DeviceApproval,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         self.check()?;
         if self.fail_device_upsert.load(Ordering::SeqCst) {
@@ -325,6 +388,7 @@ impl VeinTemplatesRepository for FakeRepo {
             record: record.to_string(),
             updated_at: now,
         });
+        self.set_device_approval(employee_id, device_id, approval);
         Ok(Some(now))
     }
 
@@ -333,7 +397,14 @@ impl VeinTemplatesRepository for FakeRepo {
         if self.fail_device_list.load(Ordering::SeqCst) {
             return Err(DbError::Other("pool timed out".into()));
         }
-        Ok(self.device_records.lock().unwrap().clone())
+        Ok(self
+            .device_records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| self.device_approval(d) != DeviceApproval::Pending)
+            .cloned()
+            .collect())
     }
 
     async fn insert_auth_shot(
@@ -2807,4 +2878,136 @@ async fn auth_shot_without_a_record_saves_no_snapshot_and_the_list_only_says_whe
         .unwrap()
         .iter()
         .all(|s| s.get("enroll_encrypted").is_none()));
+}
+
+// ---- 端末ごとの承認と自動承認 (Refs ippoan/alc-app-s3#352、migration 210) ----
+
+/// `X-Device-Id` つきで、記録 `record` を `PUT /vein/templates/{id}/module` (登録)。
+async fn register_from(
+    repo: &Arc<FakeRepo>,
+    id: Uuid,
+    device: &[u8],
+    record: &str,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/module");
+    call_full(
+        repo,
+        None,
+        &[("x-device-id", device)],
+        "PUT",
+        &uri,
+        json!({ "record": record }),
+    )
+    .await
+}
+
+/// 端末ごとの記録の承認待ちを、運行管理者として承認する (`device_id` つき)。
+async fn approve_device_by_employee(
+    repo: &Arc<FakeRepo>,
+    id: Uuid,
+    approver: Uuid,
+    updated_at: &Value,
+    device: &str,
+) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/approve-by-employee");
+    let body =
+        json!({ "approver_employee_id": approver, "updated_at": updated_at, "device_id": device });
+    call(repo, "POST", &uri, body).await
+}
+
+#[tokio::test]
+async fn register_on_another_device_auto_approves_when_4_of_the_entries_match() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+
+    // 承認済みの記録 (種 7) と同じ指の 6 件 → 全部合う → その端末の記録として自動承認
+    let (status, v) =
+        register_from(&repo, id, b"bp-1", &template_of_seeds(&[7, 7, 7, 7, 7, 7])).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["device_record"], true);
+    assert_eq!(v["approved"], true);
+    assert_eq!(v["auto_approved"], true);
+    assert_eq!(v["matched"], 6);
+    assert_eq!(v["entries"], 6);
+    // 乗務員の記録は承認済みのまま (承認待ちにしない・上書きしない)
+    assert!(!repo.pending.lock().unwrap().contains(&id));
+    assert_eq!(repo.template_of(id), template_of_seeds(&[7, 7, 7]));
+    let (_, pending) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    assert_eq!(
+        pending["templates"].as_array().unwrap().len(),
+        0,
+        "{pending}"
+    );
+    // その端末には、その端末の記録を選んで配る
+    let (_, served) = get_modules_query(&repo, b"bp-1", "pick=own").await;
+    assert_eq!(
+        served["templates"][0]["record"],
+        template_of_seeds(&[7, 7, 7, 7, 7, 7])
+    );
+    assert_eq!(served["templates"][0]["source"], "own");
+}
+
+#[tokio::test]
+async fn register_on_another_device_that_does_not_match_waits_for_that_device_only() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let manager = approved_manager(&repo, "運行管理者").await;
+
+    // 合うのは 3 件 (種 7) だけ → その端末の記録だけ承認待ち
+    let fresh = template_of_seeds(&[7, 7, 7, 8, 9, 10]);
+    let (status, v) = register_from(&repo, id, b"bp-1", &fresh).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["device_record"], true);
+    assert_eq!(v["approved"], false);
+    assert_eq!(v["auto_approved"], false);
+    assert_eq!(v["matched"], 3);
+    assert!(!repo.pending.lock().unwrap().contains(&id));
+
+    // 承認待ちの一覧にその端末つきで出る
+    let (_, pending) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    let rows = pending["templates"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{pending}");
+    assert_eq!(rows[0]["employee_id"], id.to_string());
+    assert_eq!(rows[0]["device_id"], "bp-1");
+    // 承認待ちの間は、その端末にも承認済みの記録 (乗務員の記録) を配る
+    let (_, served) = get_modules_query(&repo, b"bp-1", "pick=own").await;
+    assert_eq!(
+        served["templates"][0]["record"],
+        template_of_seeds(&[7, 7, 7])
+    );
+
+    // 別の端末・古い版では承認できない
+    let at = rows[0]["updated_at"].clone();
+    let (status, _) = approve_device_by_employee(&repo, id, manager, &at, "kiosk-9").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // その端末で承認すると、その端末の記録を配る
+    let (status, v) = approve_device_by_employee(&repo, id, manager, &at, "bp-1").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{v}");
+    let (_, pending) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    assert_eq!(pending["templates"].as_array().unwrap().len(), 0);
+    let (_, served) = get_modules_query(&repo, b"bp-1", "pick=own").await;
+    assert_eq!(served["templates"][0]["record"], fresh);
+}
+
+#[tokio::test]
+async fn register_on_device_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    repo.fail_device_list.store(true, Ordering::SeqCst);
+    let (status, _) = register_from(&repo, id, b"bp-1", &template_of_seeds(&[7, 7, 7, 7])).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    repo.fail_device_list.store(false, Ordering::SeqCst);
+    repo.fail_device_upsert.store(true, Ordering::SeqCst);
+    let (status, _) = register_from(&repo, id, b"bp-1", &template_of_seeds(&[7, 7, 7, 7])).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn register_without_an_approved_record_is_still_a_pending_employee_record() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = repo.add_employee("山田");
+    let (status, v) = register_from(&repo, id, b"bp-1", &template_of_seeds(&[7, 7, 7])).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v.get("device_record").is_none(), "{v}");
+    assert!(repo.pending.lock().unwrap().contains(&id));
 }

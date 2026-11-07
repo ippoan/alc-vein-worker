@@ -649,7 +649,8 @@ async fn module_records_are_kept_apart_from_chara_rows() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list(r, a).await["templates"], json!([]));
     assert_eq!(identify(r, a, 71).await, json!({ "employee_id": null }));
-    // ヘッダ無しの登録し直しは端末を NULL に戻し、別の端末で登録し直すと上書きする
+    // ヘッダ無しの登録し直しは端末を NULL に戻す。承認済みの記録が在る乗務員が端末で登録し直しても、乗務員の記録は
+    // 上書きせず承認済みのまま (その端末の記録として預かる。migration 210)
     let (status, put) = put_module(suzuki, rec).await;
     assert_eq!(status, StatusCode::OK, "{put}");
     assert_eq!(
@@ -662,13 +663,10 @@ async fn module_records_are_kept_apart_from_chara_rows() {
     );
     let (status, put) = send_with_device(r, a, "kiosk-2", &uri, json!({ "record": rec })).await;
     assert_eq!(status, StatusCode::OK, "{put}");
-    assert_eq!(
-        approve(r, a, suzuki, &put["updated_at"]).await.0,
-        StatusCode::NO_CONTENT
-    );
+    assert_eq!(put["device_record"], true, "{put}");
     assert_eq!(
         module_list().await["templates"][0]["registered_device_id"],
-        "kiosk-2"
+        Value::Null
     );
     // chara で登録し直すと chara に戻る
     assert_eq!(put_approved(r, a, yamada, 72).await.0, StatusCode::OK);
@@ -854,9 +852,9 @@ async fn device_records_are_composed_per_device_and_follow_the_base_row() {
 
     // 別テナントには出ない
     assert_eq!(r.list_device_records(b).await.unwrap(), vec![]);
-    // 元の行が承認待ちに戻る (登録し直し) と一覧から外れる (端末ごとの記録は残る)
+    // 元の行が承認待ちに戻る (端末の鍵の無い登録し直し) と一覧から外れる (端末ごとの記録は残る)
     let uri = format!("/vein/templates/{yamada}/module");
-    let (status, put) = send_with_device(r, a, "kiosk-1", &uri, json!({ "record": base })).await;
+    let (status, put) = send(r, a, "PUT", &uri, Some(json!({ "record": base }))).await;
     assert_eq!(status, StatusCode::OK, "{put}");
     assert_eq!(list_from(Some("kiosk-1")).await, Vec::<Value>::new());
     assert_eq!(r.list_device_records(a).await.unwrap(), vec![]);
@@ -1647,5 +1645,141 @@ async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
     drop(state);
     repo.close().await;
     assert_eq!(judgment_count(&db).await, 4);
+    db.shutdown();
+}
+
+/// `vein_device_records` の承認の列 `(承認済みか, auto_approved, approved_by_employee_id)` (migration 210)。
+async fn device_approval_columns(
+    db: &mut PgClient,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    device: &str,
+) -> (bool, bool, Option<Uuid>) {
+    let device = device.to_owned();
+    db.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_one(
+                    "SELECT approved_at IS NOT NULL, auto_approved, approved_by_employee_id FROM vein_device_records WHERE tenant_id = $1 AND employee_id = $2 AND device_id = $3",
+                    &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID), (&device, Type::TEXT)],
+                )
+                .await?;
+            Ok((row.get(0), row.get(1), row.get(2)))
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// 端末ごとの承認 (Refs ippoan/alc-app-s3#352、migration 210): 承認済みの記録が在る乗務員が別の端末で登録すると、
+/// 乗務員の記録は承認済みのまま、その端末の記録として預かる。4 件以上合えば自動承認、合わなければその端末だけ
+/// 承認待ち (一覧に端末つきで出て、その端末へは承認済みの記録を配り、運行管理者が端末を指して承認する)。履歴も残る。
+#[tokio::test(flavor = "multi_thread")]
+async fn device_registration_auto_approves_or_waits_per_device() {
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Vein Device Approval Tenant").await;
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let manager = employee(&mut prep.inner, a, "管理者").await;
+    set_roles(&mut prep.inner, a, manager, &["manager"]).await;
+    prep.close().await;
+
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    // 山田 (種 7) と管理者を、乗務員の記録として登録して管理画面で承認する
+    let base = template3(7);
+    for (id, record) in [(yamada, base.clone()), (manager, template3(3))] {
+        let uri = format!("/vein/templates/{id}/module");
+        let (status, v) = send(r, a, "PUT", &uri, Some(json!({ "record": record }))).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            approve(r, a, id, &v["updated_at"]).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let uri = format!("/vein/templates/{yamada}/module");
+
+    // 同じ指の 6 件 → 自動承認。乗務員の記録は承認済みのまま
+    let same = matcher::enroll_template(&vec![synth::chara(7); 6]).unwrap();
+    let (status, v) = send_with_device(r, a, "bp-1", &uri, json!({ "record": same })).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        (
+            v["device_record"].clone(),
+            v["approved"].clone(),
+            v["auto_approved"].clone()
+        ),
+        (json!(true), json!(true), json!(true))
+    );
+    assert_eq!(v["matched"], 6);
+    assert!(pending_modules(r, a).await.is_empty());
+
+    // 3 件しか合わない → その端末だけ承認待ち
+    let other = matcher::enroll_template(&[7, 7, 7, 8, 9, 10].map(synth::chara)).unwrap();
+    let (status, v) = send_with_device(r, a, "seat-1", &uri, json!({ "record": other })).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        (v["approved"].clone(), v["matched"].clone()),
+        (json!(false), json!(3))
+    );
+    let waiting = pending_modules(r, a).await;
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    assert_eq!(waiting[0]["employee_id"], yamada.to_string());
+    assert_eq!(waiting[0]["device_id"], "seat-1");
+    // その端末へは承認済みの記録 (乗務員の記録) を配り、自動承認の端末へはその端末の記録を配る
+    let served = |device: &'static str| async move {
+        let (status, v) =
+            send_from(r, a, device, "GET", "/vein/module-templates?pick=own", None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        v["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["employee_id"] == yamada.to_string())
+            .unwrap()["record"]
+            .clone()
+    };
+    // seat-1 の記録は承認待ちなので配らず、承認済みのうち最新 (bp-1 の自動承認の記録) を配る
+    assert_eq!(served("seat-1").await, json!(same));
+    assert_eq!(served("bp-1").await, json!(same));
+
+    // 運行管理者がその端末を指して承認する (端末が違えば 409)
+    let at = waiting[0]["updated_at"].clone();
+    let approve_device = |device: &'static str| {
+        let at = at.clone();
+        async move {
+            let uri = format!("/vein/templates/{yamada}/approve-by-employee");
+            let body =
+                json!({ "approver_employee_id": manager, "updated_at": at, "device_id": device });
+            send(r, a, "POST", &uri, Some(body)).await.0
+        }
+    };
+    assert_eq!(approve_device("bp-1").await, StatusCode::CONFLICT);
+    assert_eq!(approve_device("seat-1").await, StatusCode::NO_CONTENT);
+    assert!(pending_modules(r, a).await.is_empty());
+    assert_eq!(served("seat-1").await, json!(other));
+    repo.close().await;
+
+    let mut prep = db.client(APP_ROLE).await;
+    assert_eq!(
+        device_approval_columns(&mut prep.inner, a, yamada, "bp-1").await,
+        (true, true, None)
+    );
+    assert_eq!(
+        device_approval_columns(&mut prep.inner, a, yamada, "seat-1").await,
+        (true, false, Some(manager))
+    );
+    // 端末での登録も履歴に端末つきで残る (乗務員の記録の登録 2 件 + 端末の登録 2 件)
+    let events = enroll_events(&mut prep.inner, a).await;
+    let devices: Vec<_> = events
+        .iter()
+        .filter(|(e, _, _)| *e == yamada)
+        .map(|(_, d, _)| d.clone())
+        .collect();
+    assert_eq!(
+        devices,
+        vec![None, Some("bp-1".to_owned()), Some("seat-1".to_owned())]
+    );
+    prep.close().await;
     db.shutdown();
 }

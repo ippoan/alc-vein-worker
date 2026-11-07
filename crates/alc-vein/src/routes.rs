@@ -46,8 +46,8 @@ use vein_match_search::MAXREG;
 
 use crate::matcher::{self, CharaError, MAX_TEMPLATES};
 use crate::repo::{
-    ApproveByEmployee, DeviceRecordRow, ModuleRecordItem, VeinTemplateItem, VeinTemplateRow,
-    FORMAT_CHARA, FORMAT_MODULE,
+    ApproveByEmployee, DeviceApproval, DeviceRecordRow, ModuleRecordItem, VeinTemplateItem,
+    VeinTemplateRow, FORMAT_CHARA, FORMAT_MODULE,
 };
 use crate::VeinState;
 
@@ -58,6 +58,10 @@ pub const MAX_MODULE_RECORD_BYTES: usize = 0x2000;
 /// 端末は免許証で決まった人だけを枠に書き、埋まったら一番長く使っていない人の枠を使い回す
 /// (Refs ippoan/alc-app-s3#352)。数は chara の行の 1:N の上限 [`MAX_TEMPLATES`] に揃える。
 pub const MAX_MODULE_RECORDS: usize = MAX_TEMPLATES;
+
+/// 端末ごとの記録の自動承認に要る、登録した記録の件のうち承認済みの記録と合う件の数 (6 件中 4 件。2026-11-07 オーナー決定)。
+/// 件が 4 件に満たない記録は全部合っても届かない (承認待ちになる)。
+pub const AUTO_APPROVE_MIN_MATCHES: usize = 4;
 
 /// 端末向けに混ぜる記録の、1 つの出どころから取る件数 (自分の 3 件 + 他の端末の 3 件 = 記録の上限の 6 件)。
 const MIX_TAKE: usize = 3;
@@ -124,6 +128,9 @@ struct ApproveBody {
 struct ApproveByEmployeeBody {
     approver_employee_id: Uuid,
     updated_at: DateTime<Utc>,
+    /// 端末ごとの記録の承認待ちを承認するときの、その端末 (一覧の `device_id`)。無ければ乗務員の記録
+    #[serde(default)]
+    device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +245,13 @@ async fn upsert_module_record(
 ) -> Result<Json<Value>, ApiError> {
     let device_id = registered_device_id(&headers)?;
     validate_module_record(&body.record)?;
+    if let Some(device_id) = device_id.as_deref() {
+        if let Some(outcome) =
+            register_on_device(&state, tenant_id, employee_id, device_id, &body.record).await?
+        {
+            return Ok(Json(outcome));
+        }
+    }
     let (registered, enrolled) = state
         .templates
         .registration_count(tenant_id, employee_id, FORMAT_MODULE)
@@ -267,6 +281,70 @@ async fn upsert_module_record(
     ))
 }
 
+/// 承認済みの module の記録が在る乗務員の、端末での登録 (Refs ippoan/alc-app-s3#352、migration 210)。乗務員の記録
+/// (vein_templates、1 人 1 件) には上書きせず、その端末の記録として預かる。登録した記録の件のうち
+/// [`AUTO_APPROVE_MIN_MATCHES`] 件以上が、承認済みの記録 (乗務員の記録か、承認済みの端末ごとの記録のどれか) と
+/// `chara_verify` で合えば自動で承認し、合わなければその端末の記録だけ承認待ちにする。
+///
+/// 乗務員の記録を上書きすると全端末で承認待ちになり、端末の同期がモジュールの記録を消して指紋互換の部分を失う
+/// (2026-11-06)。承認済みの記録が無い乗務員は `Ok(None)` (今までどおり乗務員の記録として承認待ちで登録する)
+async fn register_on_device(
+    state: &VeinState,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    device_id: &str,
+    record: &str,
+) -> Result<Option<Value>, ApiError> {
+    let Some(base) = state
+        .templates
+        .list(tenant_id, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein register_on_device list", e))?
+        .into_iter()
+        .find(|r| r.employee_id == employee_id)
+    else {
+        return Ok(None);
+    };
+    let devices = state
+        .templates
+        .list_device_records(tenant_id)
+        .await
+        .map_err(|e| internal_error("vein register_on_device list_device_records", e))?;
+    let approved = std::iter::once(base.template.as_str()).chain(
+        devices
+            .iter()
+            .filter(|d| d.employee_id == employee_id)
+            .map(|d| d.record.as_str()),
+    );
+    let (matched, entries) = approved
+        .filter_map(|a| crate::auth_shots::count_matching_entries(record, a))
+        .max_by_key(|(m, _)| *m)
+        .unwrap_or((0, 0));
+    let approval = if matched >= AUTO_APPROVE_MIN_MATCHES {
+        DeviceApproval::AutoApproved
+    } else {
+        DeviceApproval::Pending
+    };
+    let auto = approval == DeviceApproval::AutoApproved;
+    // 照合の間に乗務員の記録が承認待ち・削除になった (書けなかった) なら None: 今までどおりの登録に任せる
+    Ok(state
+        .templates
+        .upsert_device_record(tenant_id, employee_id, device_id, record, approval)
+        .await
+        .map_err(|e| internal_error("vein register_on_device upsert_device_record", e))?
+        .map(|updated_at| {
+            json!({
+                "employee_id": employee_id,
+                "updated_at": updated_at,
+                "device_record": true,
+                "approved": auto,
+                "auto_approved": auto,
+                "matched": matched,
+                "entries": entries,
+            })
+        }))
+}
+
 /// 追加の端末で撮った記録を、端末ごとに 1 行預かる (同じ端末なら差し替え)。`X-Device-Id` 必須 (422 `device_id_required`)。
 /// 検査は [`upsert_module_record`] と同じ。承認済みの module の行が無い乗務員には足せない (409 `no_approved_module_record`)。
 /// vein_templates の承認には触らず、承認も要らない (足したらすぐ [`list_module_templates`] で端末向けに混ざる)。
@@ -286,7 +364,13 @@ async fn upsert_device_record(
     validate_module_record(&body.record)?;
     let updated_at = state
         .templates
-        .upsert_device_record(tenant_id, employee_id, &device_id, &body.record)
+        .upsert_device_record(
+            tenant_id,
+            employee_id,
+            &device_id,
+            &body.record,
+            DeviceApproval::Approved,
+        )
         .await
         .map_err(|e| internal_error("vein upsert_device_record", e))?
         .ok_or_else(|| {
@@ -615,7 +699,13 @@ async fn rotate_device_record(
         .ok_or_else(|| unprocessable("invalid_module_record", "記録を組み直せません"))?;
     let updated_at = state
         .templates
-        .upsert_device_record(tenant_id, employee_id, &requester, &record)
+        .upsert_device_record(
+            tenant_id,
+            employee_id,
+            &requester,
+            &record,
+            DeviceApproval::Approved,
+        )
         .await
         .map_err(|e| internal_error("vein rotate upsert_device_record", e))?
         .ok_or_else(no_record)?;
@@ -742,6 +832,7 @@ async fn approve_by_employee(
             employee_id,
             body.approver_employee_id,
             body.updated_at,
+            body.device_id.as_deref(),
         )
         .await
         .map_err(|e| internal_error("vein approve_by_employee", e))?;

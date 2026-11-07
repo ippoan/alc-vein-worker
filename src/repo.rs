@@ -33,8 +33,8 @@ use alc_core_wasm::DbError;
 use alc_vein::auth_shots::{AuthShotStatus, Judgment, NewAuthShot, StoredShot};
 use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::{
-    ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
-    VeinTemplatesRepository,
+    ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, PendingModuleItem,
+    VeinTemplateRow, VeinTemplatesRepository,
 };
 use alc_worker_db::PgClient;
 use chrono::{DateTime, Utc};
@@ -152,12 +152,14 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         employee_id: Uuid,
         approver_employee_id: Uuid,
         updated_at: DateTime<Utc>,
+        device_id: Option<&str>,
     ) -> Result<ApproveByEmployee, DbError> {
         self.timed(self.inner.approve_by_employee(
             tenant_id,
             employee_id,
             approver_employee_id,
             updated_at,
+            device_id,
         ))
         .await
     }
@@ -195,11 +197,15 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         employee_id: Uuid,
         device_id: &str,
         record: &str,
+        approval: DeviceApproval,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
-        self.timed(
-            self.inner
-                .upsert_device_record(tenant_id, employee_id, device_id, record),
-        )
+        self.timed(self.inner.upsert_device_record(
+            tenant_id,
+            employee_id,
+            device_id,
+            record,
+            approval,
+        ))
         .await
     }
 
