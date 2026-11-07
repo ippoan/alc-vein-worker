@@ -53,6 +53,32 @@ pub struct PendingModuleItem {
     pub name: String,
     pub updated_at: DateTime<Utc>,
     pub registered_device_id: Option<String>,
+    /// 端末ごとの記録の承認待ち (承認済みの記録が在る乗務員が別の端末で登録し、自動承認に届かなかった) なら、その端末。
+    /// 乗務員の記録 (vein_templates) の承認待ちなら `None` (応答に出さない)。承認の body に同じ値を返す
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+/// 端末ごとの記録を預かるときの承認 (migration 210)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceApproval {
+    /// 承認済み (「この端末の指を足す」は承認済みの記録を持つ本人の追加なので、今までどおりすぐ使う)
+    Approved,
+    /// 承認済みの記録との照合で自動で承認した (登録)
+    AutoApproved,
+    /// その端末の行だけ承認待ち (登録が承認済みの記録と合わなかった)
+    Pending,
+}
+
+impl DeviceApproval {
+    /// (承認済みか, 自動承認か)
+    pub fn flags(self) -> (bool, bool) {
+        match self {
+            Self::Approved => (true, false),
+            Self::AutoApproved => (true, true),
+            Self::Pending => (false, false),
+        }
+    }
 }
 
 /// 運行管理者 (社員) による承認の結果。`Approved` 以外は書き込んでいない。
@@ -165,11 +191,18 @@ pub mod sql {
 
     /// テナントの承認待ちの module の記録の一覧 (削除済みの乗務員を除く、古い順)。記録の中身は返さない。
     /// $1 tenant_id → employee_id, name, updated_at, registered_device_id。
-    pub const LIST_PENDING_MODULE: &str = r#"SELECT v.employee_id, e.name, v.updated_at, v.registered_device_id
+    /// 端末ごとの記録の承認待ち (migration 210) も同じ一覧に並べる (5 列目 = その端末。乗務員の記録は NULL)。
+    /// $1 tenant_id → employee_id, name, updated_at, registered_device_id, device_id。
+    pub const LIST_PENDING_MODULE: &str = r#"SELECT v.employee_id, e.name, v.updated_at, v.registered_device_id, NULL::TEXT
     FROM vein_templates v
     JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
     WHERE v.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NULL AND v.template_format = 'module'
-    ORDER BY v.updated_at, v.id"#;
+    UNION ALL
+    SELECT d.employee_id, e.name, d.updated_at, d.device_id, d.device_id
+    FROM vein_device_records d
+    JOIN employees e ON e.id = d.employee_id AND e.tenant_id = d.tenant_id
+    WHERE d.tenant_id = $1 AND e.deleted_at IS NULL AND d.approved_at IS NULL
+    ORDER BY 3, 1"#;
 
     /// 承認者 $2 の検査。生きている社員が居なければ 0 行。居れば (`role` に manager か admin を含むか,
     /// 自分の module の記録が承認済みか)。$1 tenant_id / $2 approver_employee_id → (BOOL, BOOL)。
@@ -187,6 +220,12 @@ pub mod sql {
     SET approved_at = NOW(), approved_by = NULL, approved_by_employee_id = $3
     WHERE tenant_id = $1 AND employee_id = $2 AND updated_at = $4 AND approved_at IS NULL AND template_format = 'module'"#;
 
+    /// 運行管理者 (社員) として端末ごとの記録を承認する (migration 210)。$5 = その端末。版の固定は [`APPROVE_BY_EMPLOYEE`] と同じ。
+    /// $1 tenant_id / $2 employee_id / $3 approver_employee_id / $4 updated_at / $5 device_id。0 行 = 409。
+    pub const APPROVE_DEVICE_BY_EMPLOYEE: &str = r#"UPDATE vein_device_records
+    SET approved_at = NOW(), approved_by_employee_id = $3, auto_approved = FALSE
+    WHERE tenant_id = $1 AND employee_id = $2 AND updated_at = $4 AND device_id = $5 AND approved_at IS NULL"#;
+
     /// $3 の形式の登録の人数 (承認待ちを含む、削除済みの乗務員を除く) と、$2 employee_id がその中に既に居るか。
     /// $1 tenant_id / $2 employee_id / $3 template_format → (COUNT, BOOL)。
     pub const REGISTRATION_COUNT: &str = r#"SELECT COUNT(*), COALESCE(BOOL_OR(v.employee_id = $2), FALSE)
@@ -201,13 +240,15 @@ pub mod sql {
     /// 端末ごとの記録を預かる (同じ端末なら差し替え)。承認済みの module の行が在る生きている乗務員にだけ足せる
     /// (無ければ 0 行)。vein_templates の承認には触らない。
     /// $1 tenant_id / $2 employee_id / $3 device_id / $4 record (base64) → updated_at。
-    pub const UPSERT_DEVICE_RECORD: &str = r#"INSERT INTO vein_device_records (tenant_id, employee_id, device_id, record)
-    SELECT v.tenant_id, v.employee_id, $3, $4 FROM vein_templates v
+    pub const UPSERT_DEVICE_RECORD: &str = r#"INSERT INTO vein_device_records
+        (tenant_id, employee_id, device_id, record, approved_at, auto_approved, approved_by_employee_id)
+    SELECT v.tenant_id, v.employee_id, $3, $4, CASE WHEN $5 THEN NOW() END, $6, NULL::UUID FROM vein_templates v
     JOIN employees e ON e.id = v.employee_id AND e.tenant_id = v.tenant_id
     WHERE v.tenant_id = $1 AND v.employee_id = $2 AND e.deleted_at IS NULL
         AND v.approved_at IS NOT NULL AND v.template_format = 'module'
     ON CONFLICT (tenant_id, employee_id, device_id)
-    DO UPDATE SET record = EXCLUDED.record, updated_at = NOW()
+    DO UPDATE SET record = EXCLUDED.record, updated_at = NOW(), approved_at = EXCLUDED.approved_at,
+        auto_approved = EXCLUDED.auto_approved, approved_by_employee_id = NULL
     RETURNING updated_at"#;
 
     /// テナントの、承認済みの module の行が在る生きている乗務員の端末ごとの記録 (1 回で全員分)。
@@ -217,6 +258,7 @@ pub mod sql {
     JOIN vein_templates v ON v.tenant_id = d.tenant_id AND v.employee_id = d.employee_id
     JOIN employees e ON e.id = d.employee_id AND e.tenant_id = d.tenant_id
     WHERE d.tenant_id = $1 AND e.deleted_at IS NULL AND v.approved_at IS NOT NULL AND v.template_format = 'module'
+        AND d.approved_at IS NOT NULL
     ORDER BY d.updated_at, d.id"#;
 
     /// 乗務員の端末ごとの記録を消す ([`DELETE`] と同じ transaction で)。$1 tenant_id / $2 employee_id。
@@ -322,6 +364,7 @@ pub trait VeinTemplatesRepository: Send + Sync {
         employee_id: Uuid,
         approver_employee_id: Uuid,
         updated_at: DateTime<Utc>,
+        device_id: Option<&str>,
     ) -> Result<ApproveByEmployee, DbError>;
 
     /// `format` の登録の人数 (承認待ちを含み、削除済みの乗務員を除く) と、
@@ -351,9 +394,10 @@ pub trait VeinTemplatesRepository: Send + Sync {
         employee_id: Uuid,
         device_id: &str,
         record: &str,
+        approval: DeviceApproval,
     ) -> Result<Option<DateTime<Utc>>, DbError>;
 
-    /// テナントの端末ごとの記録 (承認済みの module の行が在る乗務員の分。古い順)。
+    /// テナントの端末ごとの記録 (承認済みの module の行が在る乗務員の、承認済みの分。古い順)。
     async fn list_device_records(&self, tenant_id: Uuid) -> Result<Vec<DeviceRecordRow>, DbError>;
 
     /// 乗務員のテンプレート (と端末ごとの記録) を消す。`Ok(false)` = 登録が無い。

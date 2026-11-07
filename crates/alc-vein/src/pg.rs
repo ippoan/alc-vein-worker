@@ -26,8 +26,8 @@ use crate::auth_shots::{
     AuthShotStatus, Candidate, Judgment, NewAuthShot, StoredJudgment, StoredShot,
 };
 use crate::repo::{
-    sql, ApprovalItem, ApproveByEmployee, DeviceRecordRow, PendingModuleItem, VeinTemplateRow,
-    VeinTemplatesRepository,
+    sql, ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, PendingModuleItem,
+    VeinTemplateRow, VeinTemplatesRepository,
 };
 
 impl TxOutput for VeinTemplateRow {}
@@ -158,6 +158,7 @@ pub async fn list_pending_modules(
             name: r.get(1),
             updated_at: r.get(2),
             registered_device_id: r.get(3),
+            device_id: r.get(4),
         })
         .collect())
 }
@@ -169,6 +170,7 @@ pub async fn approve_by_employee(
     employee_id: Uuid,
     approver_employee_id: Uuid,
     updated_at: DateTime<Utc>,
+    device_id: Option<&str>,
 ) -> Result<ApproveByEmployee, tokio_postgres::Error> {
     let check = tx
         .query_typed_opt(
@@ -189,17 +191,33 @@ pub async fn approve_by_employee(
     if !enrolled {
         return Ok(ApproveByEmployee::ApproverNotEnrolled);
     }
-    let n = tx
-        .execute_typed(
-            sql::APPROVE_BY_EMPLOYEE,
-            &[
-                (&tenant_id, Type::UUID),
-                (&employee_id, Type::UUID),
-                (&approver_employee_id, Type::UUID),
-                (&updated_at, Type::TIMESTAMPTZ),
-            ],
-        )
-        .await?;
+    let n = match device_id {
+        None => {
+            tx.execute_typed(
+                sql::APPROVE_BY_EMPLOYEE,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&employee_id, Type::UUID),
+                    (&approver_employee_id, Type::UUID),
+                    (&updated_at, Type::TIMESTAMPTZ),
+                ],
+            )
+            .await?
+        }
+        Some(device_id) => {
+            tx.execute_typed(
+                sql::APPROVE_DEVICE_BY_EMPLOYEE,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&employee_id, Type::UUID),
+                    (&approver_employee_id, Type::UUID),
+                    (&updated_at, Type::TIMESTAMPTZ),
+                    (&device_id, Type::TEXT),
+                ],
+            )
+            .await?
+        }
+    };
     Ok(if n == 1 {
         ApproveByEmployee::Approved
     } else {
@@ -256,7 +274,9 @@ pub async fn upsert_device_record(
     employee_id: Uuid,
     device_id: &str,
     record: &str,
+    approval: DeviceApproval,
 ) -> Result<Option<DateTime<Utc>>, tokio_postgres::Error> {
+    let (approved, auto_approved) = approval.flags();
     let row = tx
         .query_typed_opt(
             sql::UPSERT_DEVICE_RECORD,
@@ -265,10 +285,28 @@ pub async fn upsert_device_record(
                 (&employee_id, Type::UUID),
                 (&device_id, Type::TEXT),
                 (&record, Type::TEXT),
+                (&approved, Type::BOOL),
+                (&auto_approved, Type::BOOL),
             ],
         )
         .await?;
-    Ok(row.map(|r| r.get(0)))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    // 端末での登録 (自動承認・承認待ち) は、乗務員の記録の登録と同じく履歴に 1 行残す (拠点カメラの切り出し、
+    // ippoan/alc-cam#2)。「この端末の指を足す」・入れ替え (承認済み) は登録ではないので残さない
+    if approval != DeviceApproval::Approved {
+        tx.execute_typed(
+            sql::INSERT_ENROLL_EVENT,
+            &[
+                (&tenant_id, Type::UUID),
+                (&employee_id, Type::UUID),
+                (&Some(device_id), Type::TEXT),
+            ],
+        )
+        .await?;
+    }
+    Ok(Some(row.get(0)))
 }
 
 /// [`sql::LIST_DEVICE_RECORDS`]。
@@ -594,7 +632,9 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         employee_id: Uuid,
         approver_employee_id: Uuid,
         updated_at: DateTime<Utc>,
+        device_id: Option<&str>,
     ) -> Result<ApproveByEmployee, DbError> {
+        let device_id = device_id.map(str::to_owned);
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
@@ -605,6 +645,7 @@ impl VeinTemplatesRepository for PgVeinTemplates {
                         employee_id,
                         approver_employee_id,
                         updated_at,
+                        device_id.as_deref(),
                     )
                     .await
                 })
@@ -656,6 +697,7 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         employee_id: Uuid,
         device_id: &str,
         record: &str,
+        approval: DeviceApproval,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         let device_id = device_id.to_owned();
         let record = record.to_owned();
@@ -663,7 +705,8 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         client
             .tenant_tx(tenant_id, move |tx| {
                 Box::pin(async move {
-                    upsert_device_record(tx, tenant_id, employee_id, &device_id, &record).await
+                    upsert_device_record(tx, tenant_id, employee_id, &device_id, &record, approval)
+                        .await
                 })
             })
             .await
