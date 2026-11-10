@@ -376,6 +376,11 @@ pub async fn insert_auth_shot(
                 (&shot.captured_at, Type::TIMESTAMPTZ),
                 (&shot.pick, Type::TEXT),
                 (&shot.enroll_encrypted, Type::TEXT),
+                (&shot.module_via, Type::TEXT),
+                (&shot.module_rule, Type::TEXT),
+                (&shot.module_fv_slot, Type::INT4),
+                (&shot.module_fp_slot, Type::INT4),
+                (&shot.module_fv_score, Type::INT4),
             ],
         )
         .await?;
@@ -477,6 +482,11 @@ pub async fn list_auth_shot_status(
                 captured_at: r.get(11),
                 created_at: r.get(12),
                 has_enroll_snapshot: r.get(13),
+                module_via: r.get(30),
+                module_rule: r.get(31),
+                module_fv_slot: r.get(32),
+                module_fp_slot: r.get(33),
+                module_fv_score: r.get(34),
                 judgment,
                 judgment_top10,
             }

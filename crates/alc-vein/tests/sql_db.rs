@@ -1289,6 +1289,11 @@ fn auth_shot(employee_id: Uuid, device: &str) -> NewAuthShot {
         module_hit: "self".to_string(),
         module_score: Some(87),
         module_thresholds: Some(vec![62, 79, 81]),
+        module_via: Some("FP".to_owned()),
+        module_rule: Some("C".to_owned()),
+        module_fv_slot: Some(12),
+        module_fp_slot: Some(34),
+        module_fv_score: Some(41),
         pick: Some("own".to_string()),
         enroll_encrypted: Some("enroll-ciphertext".to_string()),
         shot_kind: "chara",
@@ -1586,7 +1591,7 @@ async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
     let body = json!({
         "employee_id": yamada,
         "shot": shot,
-        "module": { "result": "NOMATCH", "slot": null, "hit": "none", "score": null, "thresholds": [62, 79, 81] },
+        "module": { "result": "NOMATCH", "slot": null, "hit": "none", "score": null, "thresholds": [62, 79, 81], "via": "FP", "rule": "C", "fv_slot": 12, "fp_slot": 34, "fv_score": 41 },
         "firmware": null,
         "captured_at": "2026-11-04T01:02:03Z",
     });
@@ -1615,6 +1620,11 @@ async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
         (Some(yamada.to_string().as_str()), Some("chara"))
     );
     assert_eq!(item["module_thresholds"], json!([62, 79, 81]));
+    assert_eq!(item["module_via"], "FP");
+    assert_eq!(item["module_rule"], "C");
+    assert_eq!(item["module_fv_slot"], 12);
+    assert_eq!(item["module_fp_slot"], 34);
+    assert_eq!(item["module_fv_score"], 41);
     assert_eq!(item["judgment"]["candidates"], json!([]));
     // 撮影 1 件に判定 2 行 (self と top10)
     assert_eq!(item["judgment_top10"]["method"], "top10");

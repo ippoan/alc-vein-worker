@@ -91,6 +91,7 @@ pub fn router() -> Router<VeinState> {
             post(post_auth_shot).get(list_auth_shots),
         )
         .route("/vein/auth-shots/rejudge", post(rejudge))
+        .route("/vein/verify-shot", post(verify_shot))
 }
 
 /// 撮影の形。ファームの 1 本撮りの記録 (生のテンプレート) か、0xbdbd の特徴量。
@@ -121,6 +122,16 @@ pub struct NewAuthShot {
     pub module_hit: String,
     pub module_score: Option<i32>,
     pub module_thresholds: Option<Vec<i32>>,
+    /// 照合を通した層 (`FV` 静脈 / `FP` 指紋互換)。古い端末は None
+    pub module_via: Option<String>,
+    /// 通した規則 (英大文字 1 字)
+    pub module_rule: Option<String>,
+    /// 静脈の層が当てたモジュールの枠 ID
+    pub module_fv_slot: Option<i32>,
+    /// 指紋互換の層が当てたモジュールの枠 ID
+    pub module_fp_slot: Option<i32>,
+    /// FV が返した ID と違うときの、静脈の層の点数
+    pub module_fv_score: Option<i32>,
     /// 端末へ配る記録の組み方 (`own` か、混ぜる側の NULL)。判定し直しで同じ組み方に戻す
     pub pick: Option<String>,
     pub shot_kind: &'static str,
@@ -257,6 +268,16 @@ pub struct AuthShotStatus {
     pub module_hit: String,
     pub module_score: Option<i32>,
     pub module_thresholds: Option<Vec<i32>>,
+    /// 照合を通した層 (`FV` 静脈 / `FP` 指紋互換)。古い端末は None
+    pub module_via: Option<String>,
+    /// 通した規則 (英大文字 1 字)
+    pub module_rule: Option<String>,
+    /// 静脈の層が当てたモジュールの枠 ID
+    pub module_fv_slot: Option<i32>,
+    /// 指紋互換の層が当てたモジュールの枠 ID
+    pub module_fp_slot: Option<i32>,
+    /// FV が返した ID と違うときの、静脈の層の点数
+    pub module_fv_score: Option<i32>,
     pub pick: Option<String>,
     pub shot_kind: String,
     pub captured_at: DateTime<Utc>,
@@ -290,6 +311,16 @@ struct ModuleBody {
     hit: String,
     score: Option<i32>,
     thresholds: Option<Vec<i32>>,
+    #[serde(default)]
+    via: Option<String>,
+    #[serde(default)]
+    rule: Option<String>,
+    #[serde(default)]
+    fv_slot: Option<i32>,
+    #[serde(default)]
+    fp_slot: Option<i32>,
+    #[serde(default)]
+    fv_score: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +333,13 @@ struct ShotBody {
     captured_at: DateTime<Utc>,
     /// 端末へ配る記録の組み方 (`rotate` と同じ意味。`own` なら混ぜずに選ぶ)
     pick: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VerifyShotBody {
+    employee_id: Uuid,
+    /// 認証ログと同じ base64 の 1 本撮りの記録 (生のテンプレート) か 0xbdbd の特徴量
+    shot: String,
 }
 
 #[derive(Deserialize)]
@@ -453,6 +491,54 @@ pub fn judge_self(
         elapsed_us,
     }
 }
+
+/// 登録した記録 `new_b64` に近い、同じテナントの他の人 (登録時の警告用。判定・承認・保存には使わない)。
+/// `others` は他の人の承認済みの記録。新しい記録の件 1 つずつを [`judge_top10`] と同じ方法 (粗い比較の上位 + `chara_verify`)
+/// にかけ、通った人を粗い比較の小さい順に最大 [`NEAR_MAX`] 人返す。比べられない・誰も通らないときは空。
+pub fn near_others(new_b64: &str, others: &[(Uuid, String)]) -> Vec<Value> {
+    let gallery = build_gallery(others);
+    if gallery.is_err() {
+        return vec![];
+    }
+    let Some(charas) = STANDARD
+        .decode(new_b64)
+        .ok()
+        .and_then(|b| template_to_charas(&b).ok())
+    else {
+        return vec![];
+    };
+    // 人ごとに、通った件のうち粗い比較がいちばん近いもの
+    let mut best: HashMap<Uuid, Candidate> = HashMap::new();
+    for chara in &charas {
+        let shot = (ShotKind::Chara, chara.to_vec());
+        for c in judge_top10(&gallery, Some(&shot), false)
+            .candidates
+            .into_iter()
+            .filter(|c| c.matched)
+        {
+            let closer = best.get(&c.employee_id).is_none_or(|b| c.coarse < b.coarse);
+            if closer {
+                best.insert(c.employee_id, c);
+            }
+        }
+    }
+    let mut near: Vec<Candidate> = best.into_values().collect();
+    near.sort_by_key(|c| (c.coarse, c.employee_id));
+    near.truncate(NEAR_MAX);
+    near.into_iter()
+        .map(|c| {
+            json!({
+                "employee_id": c.employee_id,
+                "rule": c.rule,
+                "scores": c.scores,
+                "coarse": c.coarse,
+            })
+        })
+        .collect()
+}
+
+/// 登録時の見比べで返す人数の上限
+const NEAR_MAX: usize = 3;
 
 /// 微秒で測った経過 (Workers の時計は CPU の間は進まないので、0 は「測れなかった」として残さない)
 fn elapsed_us(started: DateTime<Utc>, extra_us: i64) -> Option<i32> {
@@ -673,6 +759,11 @@ async fn post_auth_shot(
         module_hit: body.module.hit,
         module_score: body.module.score,
         module_thresholds: body.module.thresholds,
+        module_via: body.module.via,
+        module_rule: body.module.rule,
+        module_fv_slot: body.module.fv_slot,
+        module_fp_slot: body.module.fp_slot,
+        module_fv_score: body.module.fv_score,
         shot_kind: shot.0.as_str(),
         shot_encrypted: encrypt_secret(&body.shot, key)
             .map_err(|e| internal_error("vein auth_shot encrypt", e))?,
@@ -700,6 +791,60 @@ async fn post_auth_shot(
         "judgment": judgment,
         "judgment_top10": judgment_top10,
     })))
+}
+
+/// 本人が分かっている 1:1 の照合 (保存しない)。その人の承認済みの記録 (乗務員の記録と、承認済みの端末ごとの記録) と
+/// [`judge_self`] と同じ方法で比べ、どれか 1 つでも通れば `matched`。記録が無い・読めないときは `matched: false`。
+/// 認証ログの許可テナントには縛らない (auth-worker が決める口の範囲だけ)。
+async fn verify_shot(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Json(body): Json<VerifyShotBody>,
+) -> Result<Json<Value>, ApiError> {
+    let shot = classify_shot(&body.shot).ok_or_else(|| {
+        unprocessable(
+            "invalid_shot",
+            "shot は base64 の生のテンプレートか 0xbdbd の特徴量で送ってください",
+        )
+    })?;
+    let bases = state
+        .templates
+        .list(tenant_id, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein verify_shot list", e))?;
+    let devices = state
+        .templates
+        .list_device_records(tenant_id)
+        .await
+        .map_err(|e| internal_error("vein verify_shot list_device_records", e))?;
+    let records: Vec<&str> = bases
+        .iter()
+        .filter(|b| b.employee_id == body.employee_id)
+        .map(|b| b.template.as_str())
+        .chain(
+            devices
+                .iter()
+                .filter(|d| d.employee_id == body.employee_id)
+                .map(|d| d.record.as_str()),
+        )
+        .collect();
+    let best = records
+        .iter()
+        .filter_map(|r| verify(r, &shot).ok())
+        .max_by_key(|v| {
+            (
+                v.matched,
+                v.scores.iter().map(|&s| u32::from(s)).sum::<u32>(),
+            )
+        });
+    Ok(Json(match best {
+        Some(v) => json!({
+            "matched": v.matched,
+            "rule": v.candidate(body.employee_id, None, None).rule,
+            "scores": v.scores.map(i32::from),
+        }),
+        None => json!({ "matched": false, "rule": null, "scores": null }),
+    }))
 }
 
 /// 保存した撮影を今の計算で判定し直し、判定の表に行を足す (前の判定は消さない)。開発者だけ。
