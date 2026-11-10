@@ -496,6 +496,11 @@ impl VeinTemplatesRepository for FakeRepo {
                 module_hit: s.module_hit.clone(),
                 module_score: s.module_score,
                 module_thresholds: s.module_thresholds.clone(),
+                module_via: s.module_via.clone(),
+                module_rule: s.module_rule.clone(),
+                module_fv_slot: s.module_fv_slot,
+                module_fp_slot: s.module_fp_slot,
+                module_fv_score: s.module_fv_score,
                 pick: s.pick.clone(),
                 shot_kind: s.shot_kind.to_string(),
                 captured_at: s.captured_at,
@@ -2458,6 +2463,11 @@ async fn rejudge_caps_one_run_and_points_at_the_rest() {
                 module_hit: "none".to_string(),
                 module_score: None,
                 module_thresholds: None,
+                module_via: None,
+                module_rule: None,
+                module_fv_slot: None,
+                module_fp_slot: None,
+                module_fv_score: None,
                 pick: None,
                 enroll_encrypted: None,
                 shot_kind: "chara",
@@ -3010,4 +3020,162 @@ async fn register_without_an_approved_record_is_still_a_pending_employee_record(
     assert_eq!(status, StatusCode::OK, "{v}");
     assert!(v.get("device_record").is_none(), "{v}");
     assert!(repo.pending.lock().unwrap().contains(&id));
+}
+
+// --- 登録時の見比べ (near) と本人の 1:1 の照合 (verify-shot) ---
+
+/// `PUT /vein/templates/{id}/module` を端末の鍵つきで叩く。
+async fn put_module_on_device(repo: &Arc<FakeRepo>, id: Uuid, record: &str) -> (StatusCode, Value) {
+    let uri = format!("/vein/templates/{id}/module");
+    call_full(
+        repo,
+        None,
+        &[KIOSK],
+        "PUT",
+        &uri,
+        json!({ "record": record }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn first_registration_returns_the_other_people_who_match_without_changing_anything() {
+    let repo = Arc::new(FakeRepo::default());
+    // 誰も居ない・読めない記録: 空
+    let alone = repo.add_employee("新人");
+    let (status, v) = put_module(&repo, alone, &template_of_seeds(&[7, 7, 7])).await;
+    assert_eq!((status, &v["near"]), (StatusCode::OK, &json!([])));
+    let other = enrolled_7(&repo);
+    let (_, v) = put_module(&repo, alone, "AAEC").await;
+    assert_eq!(v["near"], json!([]));
+    // 別の人の指 (合わない): 空
+    let (_, v) = put_module(&repo, alone, &template_of_seeds(&[99, 99, 99])).await;
+    assert_eq!(v["near"], json!([]));
+    // 同じ指: 近い人として返る。承認待ちのまま・既存の項目はそのまま
+    let (status, v) = put_module(&repo, alone, &template_of_seeds(&[7, 7, 7])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["employee_id"], alone.to_string());
+    assert!(v["updated_at"].is_string());
+    let near = v["near"].as_array().unwrap();
+    assert_eq!(near.len(), 1, "{v}");
+    assert_eq!(near[0]["employee_id"], other.to_string());
+    assert_eq!(near[0]["scores"].as_array().unwrap().len(), 3);
+    assert!(near[0]["rule"].is_string() && near[0]["coarse"].is_number());
+    assert!(repo.pending.lock().unwrap().contains(&alone));
+    // 自分自身は含めない
+    assert!(!near.iter().any(|n| n["employee_id"] == alone.to_string()));
+}
+
+#[tokio::test]
+async fn near_lists_at_most_three_people_closest_first() {
+    let repo = Arc::new(FakeRepo::default());
+    for name in ["a", "b", "c", "d"] {
+        approved_module(&repo, name, &template_of_seeds(&[7, 7, 7]), None);
+    }
+    let me = repo.add_employee("新人");
+    let (_, v) = put_module(&repo, me, &template_of_seeds(&[7, 7, 7])).await;
+    let near = v["near"].as_array().unwrap();
+    assert_eq!(near.len(), 3);
+    let coarse: Vec<u64> = near.iter().map(|n| n["coarse"].as_u64().unwrap()).collect();
+    assert!(coarse.windows(2).all(|w| w[0] <= w[1]), "{coarse:?}");
+}
+
+#[tokio::test]
+async fn registration_on_a_device_also_returns_near() {
+    let repo = Arc::new(FakeRepo::default());
+    let other = enrolled_7(&repo);
+    let me = approved_module(
+        &repo,
+        "本人",
+        &template_of_seeds(&[5, 5, 5]),
+        Some("kiosk-1"),
+    );
+    // 承認済みの記録がある乗務員の、端末での登録 (register_on_device)
+    let (status, v) = put_module_on_device(&repo, me, &template_of_seeds(&[7, 7, 7])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["device_record"], true);
+    assert_eq!(v["near"][0]["employee_id"], other.to_string(), "{v}");
+    // 端末ごとの登録の口
+    let (status, v) = put_device(&repo, me, Some(b"kiosk-2"), &template_of_seeds(&[7, 7, 7])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["near"][0]["employee_id"], other.to_string(), "{v}");
+    assert_eq!(v["updated_at"].is_string(), true);
+}
+
+async fn verify_shot(repo: &Arc<FakeRepo>, id: Uuid, shot: &str) -> (StatusCode, Value) {
+    call_full(
+        repo,
+        None,
+        &[],
+        "POST",
+        "/vein/verify-shot",
+        json!({ "employee_id": id, "shot": shot }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn verify_shot_matches_only_the_named_person_and_saves_nothing() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let (status, v) = verify_shot(&repo, id, &record_shot(7)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["matched"], true);
+    assert_eq!(v["rule"], "A");
+    assert_eq!(v["scores"].as_array().unwrap().len(), 3);
+    let (_, v) = verify_shot(&repo, id, &chara_shot(7)).await;
+    assert_eq!(v["matched"], true);
+    // 別の指: 不一致でも点数は返す
+    let (_, v) = verify_shot(&repo, id, &chara_shot(99)).await;
+    assert_eq!((&v["matched"], &v["rule"]), (&json!(false), &Value::Null));
+    assert_eq!(v["scores"].as_array().unwrap().len(), 3);
+    // 端末ごとの承認済みの記録でも通る
+    add_device_record(&repo, id, "kiosk-2", &template_of_seeds(&[42, 42, 42]), 5);
+    let (_, v) = verify_shot(&repo, id, &chara_shot(42)).await;
+    assert_eq!(v["matched"], true);
+    // 記録が無い人
+    let (_, v) = verify_shot(&repo, Uuid::new_v4(), &chara_shot(7)).await;
+    assert_eq!(v, json!({ "matched": false, "rule": null, "scores": null }));
+    // 形の違う撮影は 422、DB の失敗は 500
+    let (status, v) = verify_shot(&repo, id, "not base64!").await;
+    assert_eq!(
+        (status, v["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_shot"))
+    );
+    assert!(repo.shots.lock().unwrap().is_empty());
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = verify_shot(&repo, id, &chara_shot(7)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn auth_shot_keeps_the_layer_columns_and_lists_them() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let mut body = shot_body(id, &chara_shot(7));
+    body["module"]["via"] = json!("FP");
+    body["module"]["rule"] = json!("C");
+    body["module"]["fv_slot"] = json!(12);
+    body["module"]["fp_slot"] = json!(34);
+    body["module"]["fv_score"] = json!(41);
+    assert_eq!(post_shot(&repo, body).await.0, StatusCode::OK);
+    // 古い端末 (項目なし) は null
+    assert_eq!(
+        post_shot(&repo, shot_body(id, &chara_shot(7))).await.0,
+        StatusCode::OK
+    );
+    let (_, v) = as_developer(&repo, "GET", "/vein/auth-shots", Value::Null).await;
+    let shots = v["shots"].as_array().unwrap();
+    let with = shots.iter().find(|s| s["module_via"] == "FP").unwrap();
+    assert_eq!(
+        (
+            &with["module_rule"],
+            &with["module_fv_slot"],
+            &with["module_fp_slot"],
+            &with["module_fv_score"]
+        ),
+        (&json!("C"), &json!(12), &json!(34), &json!(41))
+    );
+    let without = shots.iter().find(|s| s["module_via"].is_null()).unwrap();
+    assert!(without["module_rule"].is_null() && without["module_fv_score"].is_null());
 }

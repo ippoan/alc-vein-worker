@@ -234,6 +234,20 @@ fn validate_module_record(record: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// 登録した記録に近い他の人 (警告用の `near`。見比べられなくても登録は止めないので、失敗は空にする)。
+async fn near_of(state: &VeinState, tenant_id: Uuid, employee_id: Uuid, record: &str) -> Value {
+    let others: Vec<(Uuid, String)> = state
+        .templates
+        .list(tenant_id, FORMAT_MODULE)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.employee_id != employee_id)
+        .map(|r| (r.employee_id, r.template))
+        .collect();
+    Value::Array(crate::auth_shots::near_others(record, &others))
+}
+
 /// 端末のモジュールの記録を base64 のまま預かる。検査は base64 として読めることと長さ (1〜[`MAX_MODULE_RECORD_BYTES`]
 /// バイト) だけ。新規の登録 (その乗務員がまだ module の行を持たない) で [`MAX_MODULE_RECORDS`] 人を超えるなら 409。
 async fn upsert_module_record(
@@ -249,6 +263,8 @@ async fn upsert_module_record(
         if let Some(outcome) =
             register_on_device(&state, tenant_id, employee_id, device_id, &body.record).await?
         {
+            let mut outcome = outcome;
+            outcome["near"] = near_of(&state, tenant_id, employee_id, &body.record).await;
             return Ok(Json(outcome));
         }
     }
@@ -276,8 +292,9 @@ async fn upsert_module_record(
         .await
         .map_err(|e| internal_error("vein upsert_module_record", e))?
         .ok_or_else(|| not_found("employee_not_found"))?;
+    let near = near_of(&state, tenant_id, employee_id, &body.record).await;
     Ok(Json(
-        json!({ "employee_id": employee_id, "updated_at": updated_at }),
+        json!({ "employee_id": employee_id, "updated_at": updated_at, "near": near }),
     ))
 }
 
@@ -382,8 +399,9 @@ async fn upsert_device_record(
                 })),
             )
         })?;
+    let near = near_of(&state, tenant_id, employee_id, &body.record).await;
     Ok(Json(
-        json!({ "employee_id": employee_id, "updated_at": updated_at }),
+        json!({ "employee_id": employee_id, "updated_at": updated_at, "near": near }),
     ))
 }
 
