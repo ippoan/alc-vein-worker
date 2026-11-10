@@ -51,9 +51,29 @@ const LIST_MAX: i64 = 200;
 const MAX_FIRMWARE_LEN: usize = 64;
 const MAX_THRESHOLDS: usize = 8;
 
-/// `chara_verify` の下限 (s0, s1, s2。vein-match-search の `chara_verify` が 1:1 の確認に渡すもの)。
-/// 計算か閾値を直したら [`logic_version`] に出る文字列も変わるよう、1 か所にまとめる。
-const CHARA_VERIFY_THRESHOLDS: &str = "55/55/75";
+/// 合格の条件。`chara_verify` の下限 (s0, s1, s2 = 55/55/75。vein-match-search が 1:1 の確認に渡すもの) に、
+/// [`STRICT_COARSE_MAX`] と [`STRICT_S2_MIN`] を足したもの ([`passes`])。
+/// 計算か閾値を直したら [`logic_version`] に出る文字列も変わるよう、1 か所にまとめる
+/// (数字は下の 2 つの定数と揃える。`logic_version_names_the_strict_condition` が確かめる)。
+const CHARA_VERIFY_THRESHOLDS: &str = "55/55/75 strict coarse<=30 s2>=76";
+
+/// 合格にする粗い比較の点数 (`rank_top` と同じ計算。小さいほど近い) の上限。
+/// `chara_verify` の下限だけでは別の人の指もほぼ通る (認証ログの実測) ので、撮影と記録が粗い比較でも近いことを求める。
+/// 実測では別の人の最小が 35、本人の中央値が 29。本人を落とす側に倒して 30 にしてある。
+pub const STRICT_COARSE_MAX: u32 = 30;
+
+/// 合格にする s2 の下限。`chara_verify` の規則 B / C は s2 が 75 に届かなくても通し、別の人の合格は 75 以下に集まる。
+pub const STRICT_S2_MIN: u8 = 76;
+
+/// 合格か。`chara_verify` が通し (規則は問わない)、s2 が [`STRICT_S2_MIN`] 以上で、粗い比較の点数が
+/// [`STRICT_COARSE_MAX`] 以下のときだけ。粗い比較の点数が出ない (`None`) ときは落とす。
+/// 認証ログの判定 (`self` / `top10`)・1:1 の救済 (`POST /vein/verify-shot`)・登録時の見比べ (`near`)・日報が
+/// この 1 つを使う。
+fn passes(verified: &Verified, coarse: Option<u32>) -> bool {
+    verified.verified
+        && verified.scores[2] >= STRICT_S2_MIN
+        && coarse.is_some_and(|c| c <= STRICT_COARSE_MAX)
+}
 
 /// 判定した計算の版 (vein-match-search の版と閾値)。method = `self` の判定の行に残す。
 pub fn logic_version() -> String {
@@ -150,14 +170,16 @@ pub struct Candidate {
     pub matched: bool,
     /// `chara_verify` の info の s0, s1, s2
     pub scores: [u8; 3],
-    /// 粗い比較の点数 (`rank_top`。小さいほど近い)。method = `top10` のときだけ
+    /// 粗い比較の点数 (`rank_top`。小さいほど近い)。method = `self` は撮影と本人の記録の 1:1 の値
+    /// (古い判定の行には無い)。出せなかったときは無い
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse: Option<u32>,
     /// 粗い比較の順位 (1 から)。method = `top10` のときだけ
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
     /// `chara_verify` が通した規則 (`A` / `B` / `C`。vein-match-search の `Rule`)。通らなければ無い。
-    /// A は s0, s1, s2 が全部下限以上、B / C は緩い条件で、`scores` が下限に届かなくても通ることがある
+    /// A は s0, s1, s2 が全部下限以上、B / C は緩い条件で、`scores` が下限に届かなくても通ることがある。
+    /// 規則が在っても `matched` とは限らない (`matched` は足した条件 `passes` も満たしたときだけ)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
     /// 照合側と登録側を入れ替えた 2 周目 (CHANGE) で通ったか
@@ -199,25 +221,27 @@ fn best_shot_shift(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Option<ShotS
         })
 }
 
-/// `chara_verify` の 1 回の結果 (s0, s1, s2・一致したか・通した規則)。
+/// `chara_verify` の 1 回の結果 (s0, s1, s2・`chara_verify` が通したか・通した規則)。
+/// 合格かどうかは、粗い比較の点数と合わせて [`passes`] が決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Verified {
     scores: [u8; 3],
-    matched: bool,
+    /// `chara_verify` が通したか (これだけでは合格にしない)
+    verified: bool,
     pass: Option<Pass>,
 }
 
 impl Verified {
     const NONE: Verified = Verified {
         scores: [0; 3],
-        matched: false,
+        verified: false,
         pass: None,
     };
 
     fn candidate(self, employee_id: Uuid, coarse: Option<u32>, rank: Option<u32>) -> Candidate {
         Candidate {
             employee_id,
-            matched: self.matched,
+            matched: passes(&self, coarse),
             scores: self.scores,
             coarse,
             rank,
@@ -393,13 +417,26 @@ fn validate_module(m: &ModuleBody, firmware: Option<&str>) -> Result<(), ApiErro
     }
 }
 
-/// `chara_verify` で 1:1 に確かめる。返すのは (s0, s1, s2・一致したか・通した規則)。読めなければ理由。
+/// `chara_verify` で 1:1 に確かめる。返すのは (s0, s1, s2・`chara_verify` が通したか・通した規則) と、
+/// 撮影と記録の粗い比較の点数。読めなければ理由。
 /// `chara_verify` は不一致でも読み込みの失敗でも info が全 0 で返るので、先に自分で読めることを確かめて
 /// 区別する (記録は取り込める生のテンプレート、撮影は読み込める特徴量)。
-fn verify(record_b64: &str, shot: &(ShotKind, Vec<u8>)) -> Result<Verified, &'static str> {
+fn verify(
+    record_b64: &str,
+    shot: &(ShotKind, Vec<u8>),
+) -> Result<(Verified, Option<u32>), &'static str> {
     let enroll = decode_record(record_b64).ok_or("unreadable_record")?;
-    let (chara, _) = shot_plane(shot)?;
-    verify_chara(&enroll, &chara)
+    let (chara, plane) = shot_plane(shot)?;
+    Ok((verify_chara(&enroll, &chara)?, coarse_of(&enroll, &plane)))
+}
+
+/// 取り込める記録 `enroll` と撮影の平面の、粗い比較の点数 (1:1)。`rank_top` の点数は利用者ごとに独立
+/// (その人の件だけで決まる) なので、[`judge_top10`] が全員の中で出す値と同じになる。
+/// 使える窓が無い撮影・足切りで全部落ちた記録は `None`。
+fn coarse_of(enroll: &[u8], plane: &[u8; PLANE_LEN]) -> Option<u32> {
+    let mut lib = Library::new(2)?;
+    lib.import_temp(1, enroll);
+    rank_top(&lib, plane, 1).first().map(|&(_, coarse)| coarse)
 }
 
 /// 記録 (base64) を取り込める生のテンプレートにする。取り込めなければ `None`。
@@ -434,20 +471,21 @@ fn verify_chara(enroll: &[u8], chara: &[u8]) -> Result<Verified, &'static str> {
     let info = r.info.pack();
     Ok(Verified {
         scores: [info[6], info[7], info[8]],
-        matched: r.output.is_some(),
+        verified: r.output.is_some(),
         pass: r.pass,
     })
 }
 
 /// 登録した記録 `new_b64` の件 (撮った 1 枚ずつ) のうち、承認済みの記録 `approved_b64` と `chara_verify` で合う件の数と、
-/// 件の総数 (Refs ippoan/alc-app-s3#352、端末ごとの承認の自動承認)。どちらかが読めなければ `None`
+/// 件の総数 (Refs ippoan/alc-app-s3#352、端末ごとの承認の自動承認)。どちらかが読めなければ `None`。
+/// ここは `chara_verify` が通したかだけを数える ([`passes`] の足した条件は使っていない)
 pub fn count_matching_entries(new_b64: &str, approved_b64: &str) -> Option<(usize, usize)> {
     let enroll = decode_record(approved_b64)?;
     let new = STANDARD.decode(new_b64).ok()?;
     let charas = template_to_charas(&new).ok()?;
     let matched = charas
         .iter()
-        .filter(|c| verify_chara(&enroll, &c[..]).is_ok_and(|v| v.matched))
+        .filter(|c| verify_chara(&enroll, &c[..]).is_ok_and(|v| v.verified))
         .count();
     Some((matched, charas.len()))
 }
@@ -467,18 +505,25 @@ pub fn judge_self(
     };
     let elapsed_us = elapsed_us(started, 0);
     let (result, matched_employee_id, candidates, error) = match verified {
-        Ok(v) => (
-            if v.matched { "match" } else { "nomatch" },
-            v.matched.then_some(employee_id),
-            vec![Candidate {
+        Ok((v, coarse)) => {
+            let candidate = Candidate {
                 shift: record_b64
                     .ok()
                     .zip(shot)
                     .and_then(|(r, s)| best_shot_shift(r, s)),
-                ..v.candidate(employee_id, None, None)
-            }],
-            None,
-        ),
+                ..v.candidate(employee_id, coarse, None)
+            };
+            (
+                if candidate.matched {
+                    "match"
+                } else {
+                    "nomatch"
+                },
+                candidate.matched.then_some(employee_id),
+                vec![candidate],
+                None,
+            )
+        }
         Err(reason) => ("error", None, vec![], Some(reason.to_owned())),
     };
     Judgment {
@@ -794,7 +839,8 @@ async fn post_auth_shot(
 }
 
 /// 本人が分かっている 1:1 の照合 (保存しない)。その人の承認済みの記録 (乗務員の記録と、承認済みの端末ごとの記録) と
-/// [`judge_self`] と同じ方法で比べ、どれか 1 つでも通れば `matched`。記録が無い・読めないときは `matched: false`。
+/// [`judge_self`] と同じ方法で比べ、どれか 1 つでも合格 ([`passes`]) なら `matched`。記録が無い・読めないときは `matched: false`。
+/// モジュールが誰にも当てなかった撮影を本人として通す救済に使われるので、迷ったら落とす。
 /// 認証ログの許可テナントには縛らない (auth-worker が決める口の範囲だけ)。
 async fn verify_shot(
     State(state): State<VeinState>,
@@ -831,19 +877,21 @@ async fn verify_shot(
     let best = records
         .iter()
         .filter_map(|r| verify(r, &shot).ok())
-        .max_by_key(|v| {
+        .map(|(v, coarse)| v.candidate(body.employee_id, coarse, None))
+        .max_by_key(|c| {
             (
-                v.matched,
-                v.scores.iter().map(|&s| u32::from(s)).sum::<u32>(),
+                c.matched,
+                c.scores.iter().map(|&s| u32::from(s)).sum::<u32>(),
             )
         });
     Ok(Json(match best {
-        Some(v) => json!({
-            "matched": v.matched,
-            "rule": v.candidate(body.employee_id, None, None).rule,
-            "scores": v.scores.map(i32::from),
+        Some(c) => json!({
+            "matched": c.matched,
+            "rule": c.rule,
+            "scores": c.scores.map(i32::from),
+            "coarse": c.coarse,
         }),
-        None => json!({ "matched": false, "rule": null, "scores": null }),
+        None => json!({ "matched": false, "rule": null, "scores": null, "coarse": null }),
     }))
 }
 
@@ -967,7 +1015,7 @@ mod tests {
             for change in [false, true] {
                 let v = Verified {
                     scores: [50, 51, 78],
-                    matched: true,
+                    verified: true,
                     pass: Some(Pass {
                         rule,
                         change,
@@ -980,5 +1028,80 @@ mod tests {
         }
         let c = Verified::NONE.candidate(id, Some(3), Some(1));
         assert_eq!((c.rule, c.change, c.matched), (None, false, false));
+    }
+
+    /// `chara_verify` が通した 1 回 (s0, s1, s2 と規則) を、粗い比較の点数 `coarse` と合わせて判定する。
+    fn pass_of(scores: [u8; 3], rule: Rule, coarse: Option<u32>) -> bool {
+        let v = Verified {
+            scores,
+            verified: true,
+            pass: Some(Pass {
+                rule,
+                change: false,
+                hits: 13,
+            }),
+        };
+        let c = v.candidate(Uuid::nil(), coarse, None);
+        // 規則は残るが、合格は足した条件しだい
+        assert!(c.rule.is_some());
+        c.matched
+    }
+
+    #[test]
+    fn another_persons_scores_that_chara_verify_passed_are_rejected() {
+        // 認証ログで別の人の記録に通っていた点数 (s0, s1, s2・規則・粗い比較)
+        for (scores, rule, coarse) in [
+            ([63, 51, 75], Rule::C, 53),
+            ([55, 60, 76], Rule::A, 42),
+            ([57, 65, 75], Rule::A, 35),
+            ([70, 49, 75], Rule::B, 55),
+            ([56, 86, 81], Rule::A, 58),
+            ([66, 66, 75], Rule::A, 59),
+            ([67, 50, 77], Rule::C, 50),
+        ] {
+            assert!(!pass_of(scores, rule, Some(coarse)), "{scores:?} {coarse}");
+        }
+    }
+
+    #[test]
+    fn typical_own_scores_pass_and_the_edges_are_inclusive() {
+        // 本人の中央値あたりと、よく合った撮影。規則 B / C でも粗い比較が近ければ通す
+        assert!(pass_of([60, 61, 78], Rule::A, Some(29)));
+        assert!(pass_of([73, 76, 86], Rule::A, Some(7)));
+        assert!(pass_of([52, 78, 81], Rule::C, Some(12)));
+        assert!(pass_of([56, 49, 80], Rule::B, Some(30)));
+        // 境目: 粗い比較は STRICT_COARSE_MAX まで、s2 は STRICT_S2_MIN から
+        assert!(pass_of(
+            [60, 61, STRICT_S2_MIN],
+            Rule::A,
+            Some(STRICT_COARSE_MAX)
+        ));
+        assert!(!pass_of(
+            [60, 61, STRICT_S2_MIN],
+            Rule::A,
+            Some(STRICT_COARSE_MAX + 1)
+        ));
+        assert!(!pass_of(
+            [60, 61, STRICT_S2_MIN - 1],
+            Rule::A,
+            Some(STRICT_COARSE_MAX)
+        ));
+        // 粗い比較の点数が出ないときは落とす。chara_verify が通していなければ点数が良くても落とす
+        assert!(!pass_of([73, 76, 86], Rule::A, None));
+        let unverified = Verified {
+            scores: [73, 76, 86],
+            verified: false,
+            pass: None,
+        };
+        assert!(!passes(&unverified, Some(0)));
+    }
+
+    #[test]
+    fn logic_version_names_the_strict_condition() {
+        let condition = format!("strict coarse<={STRICT_COARSE_MAX} s2>={STRICT_S2_MIN}");
+        for version in [logic_version(), logic_version_top10()] {
+            assert!(version.contains("chara_verify 55/55/75"), "{version}");
+            assert!(version.ends_with(&condition), "{version}");
+        }
     }
 }
