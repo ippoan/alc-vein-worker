@@ -373,17 +373,15 @@ async fn register_on_device(
             match &others {
                 Ok(people) if !people.is_empty() => {
                     let (count, most) = (people.len(), people[0].1);
-                    tracing::warn!(
-                        "vein register_on_device: 他の人の記録に合うので自動承認を止めた ({count} 人、多い人で {most} 件)"
-                    );
+                    // 文は先に組む (warn! が複数行になると、CI の計測で文字列の行が未実行に数えられる)
+                    let why = format!("他の人 {count} 人に合う (最多 {most} 件)");
+                    tracing::warn!("vein 自動承認を止めた: {why}");
                     out["others_people"] = json!(count);
                     out["others_matched"] = json!(most);
                 }
                 Ok(_) => {}
                 Err(reason) => {
-                    tracing::warn!(
-                        "vein register_on_device: 他の人との見比べができず自動承認を止めた ({reason})"
-                    );
+                    tracing::warn!("vein 自動承認を止めた: 他の人と見比べられない ({reason})");
                     out["others_error"] = json!(reason);
                 }
             }
