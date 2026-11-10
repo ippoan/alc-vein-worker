@@ -11,6 +11,8 @@
 //! - `GET /vein/module-templates/pending` → 承認待ちのモジュールの記録の一覧 (端末の token で。中身は返さない)
 //! - `POST /vein/templates/{employee_id}/approve-by-employee` `{"approver_employee_id", "updated_at"}` → 運行管理者
 //!   (社員) による承認 (端末の token で。承認者は端末の照合で決まり、ここで役割・登録・自己承認を検査する)
+//! - `GET /vein/devices/approval-check?since=<RFC3339>` → 自動で承認された端末ごとの記録を、今の合格の線で点検する
+//!   (開発者だけ。数と ID と日時だけを返し、記録は返さない)
 //! - `POST /vein/identify` `{"chara": hex}` → 1:N 照合 + 学習の書き戻し
 //! - `GET /vein/templates` → オフライン照合用の全件 (`logic_version` つき)
 //! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下・承認済みの削除もこれ。管理者だけ)
@@ -98,6 +100,7 @@ pub fn tenant_router() -> Router<VeinState> {
             put(upsert_template).delete(delete_template),
         )
         .route("/vein/identify", post(identify))
+        .route("/vein/devices/approval-check", get(approval_check))
         .merge(crate::auth_shots::router())
         .merge(crate::report::router())
 }
@@ -328,16 +331,9 @@ async fn register_on_device(
         .list_device_records(tenant_id)
         .await
         .map_err(|e| internal_error("vein register_on_device list_device_records", e))?;
-    let approved = std::iter::once(base.template.as_str()).chain(
-        devices
-            .iter()
-            .filter(|d| d.employee_id == employee_id)
-            .map(|d| d.record.as_str()),
-    );
-    let (matched, entries) = approved
-        .filter_map(|a| crate::auth_shots::count_matching_entries(record, a))
-        .max_by_key(|(m, _)| *m)
-        .unwrap_or((0, 0));
+    let approved = approved_records(&base.template, devices.iter(), employee_id);
+    let (matched, entries) =
+        best_match(record, approved, crate::auth_shots::count_matching_entries);
     let approval = if matched >= AUTO_APPROVE_MIN_MATCHES {
         DeviceApproval::AutoApproved
     } else {
@@ -361,6 +357,144 @@ async fn register_on_device(
                 "entries": entries,
             })
         }))
+}
+
+/// 自動承認が見比べる相手: 乗務員の記録 `base` と、`devices` のうちその乗務員の端末ごとの記録。
+/// 登録 ([`register_on_device`]) と点検 ([`approval_check`]) が同じ集め方を使う。
+fn approved_records<'a>(
+    base: &'a str,
+    devices: impl Iterator<Item = &'a DeviceRecordRow>,
+    employee_id: Uuid,
+) -> impl Iterator<Item = &'a str> {
+    std::iter::once(base).chain(
+        devices
+            .filter(move |d| d.employee_id == employee_id)
+            .map(|d| d.record.as_str()),
+    )
+}
+
+/// `record` の件が、相手 `approved` のどれかといちばん多く合った (合った件の数, 件の総数)。数え方は `count`
+/// (自動承認は `count_matching_entries`、点検は加えて `count_passing_entries`)。比べられる相手が無ければ (0, 0)。
+fn best_match<'a>(
+    record: &str,
+    approved: impl Iterator<Item = &'a str>,
+    count: fn(&str, &str) -> Option<(usize, usize)>,
+) -> (usize, usize) {
+    approved
+        .filter_map(|a| count(record, a))
+        .max_by_key(|(m, _)| *m)
+        .unwrap_or((0, 0))
+}
+
+/// 点検の 1 回で見る記録の数の上限。超えたら `more: true` と、続きの `next_since` を返す。
+/// 1 件に、本人の記録との 2 通りの数え (前の線・今の線) と他の人との見比べがかかるので小さめにする。
+pub const APPROVAL_CHECK_LIMIT: usize = 10;
+
+/// 点検の `since` の既定 (今からこの時間だけ前)。
+const APPROVAL_CHECK_DEFAULT_HOURS: i64 = 24;
+
+#[derive(Deserialize)]
+struct ApprovalCheckQuery {
+    since: Option<DateTime<Utc>>,
+}
+
+/// 自動で承認された端末ごとの記録を、今の合格の線で点検する (開発者だけ。Refs ippoan/alc-app-s3#352)。
+/// 自動承認 ([`register_on_device`]) は `chara_verify` が通したかだけで数えていて、合格の条件 (`passes`) を使っていない。
+/// 承認したときの数は保存していないので、`since` (既定は直近 24 時間) 以降に自動で承認された記録ごとに数え直す:
+///
+/// - `verified`: 前の線 (`count_matching_entries` = 自動承認が今使っている数え方) で合った件の数と、件の総数
+/// - `passes`: 今の合格の線 (`count_passing_entries`) で合った件の数と、件の総数
+/// - `auto_approve_now`: 今の合格の線でも [`AUTO_APPROVE_MIN_MATCHES`] 件以上か
+/// - `others`: 同じ記録が、他の人の承認済みの記録と今の合格の線で合った件の数 (人ごと。合う人だけ)
+///
+/// 相手は自動承認と同じ集め方 ([`approved_records`]) で、乗務員の記録と承認済みの端末ごとの記録。ただし今の DB の
+/// 中身で数える: 点検する記録そのものと、その承認より後に預かった端末ごとの記録は外す。承認の後に登録し直された
+/// 乗務員の記録・差し替えられた端末ごとの記録は、当時のものに戻せない。記録そのものは返さない。
+async fn approval_check(
+    State(state): State<VeinState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    headers: HeaderMap,
+    Query(query): Query<ApprovalCheckQuery>,
+) -> Result<Json<Value>, ApiError> {
+    crate::auth_shots::require_developer(&headers)?;
+    let since = query
+        .since
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(APPROVAL_CHECK_DEFAULT_HOURS));
+    let mut rows = state
+        .templates
+        .list_auto_approved_device_records(tenant_id, since, APPROVAL_CHECK_LIMIT as i64 + 1)
+        .await
+        .map_err(|e| internal_error("vein approval_check list_auto_approved", e))?;
+    let next_since = rows.get(APPROVAL_CHECK_LIMIT).map(|r| r.approved_at);
+    rows.truncate(APPROVAL_CHECK_LIMIT);
+    let bases = state
+        .templates
+        .list(tenant_id, FORMAT_MODULE)
+        .await
+        .map_err(|e| internal_error("vein approval_check list", e))?;
+    let devices = state
+        .templates
+        .list_device_records(tenant_id)
+        .await
+        .map_err(|e| internal_error("vein approval_check list_device_records", e))?;
+    let records: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut out = json!({
+                "employee_id": row.employee_id,
+                "device_id": row.device_id,
+                "approved_at": row.approved_at,
+            });
+            let others: Vec<(Uuid, String)> = bases
+                .iter()
+                .map(|b| (b.employee_id, b.template.clone()))
+                .chain(devices.iter().map(|d| (d.employee_id, d.record.clone())))
+                .filter(|(id, _)| *id != row.employee_id)
+                .collect();
+            out["others"] = crate::auth_shots::passing_others(&row.record, &others)
+                .into_iter()
+                .map(|(id, matched)| json!({ "employee_id": id, "matched": matched }))
+                .collect();
+            let Some(base) = bases.iter().find(|b| b.employee_id == row.employee_id) else {
+                out["error"] = json!("no_approved_record");
+                return out;
+            };
+            let approved: Vec<&str> = approved_records(
+                &base.template,
+                devices
+                    .iter()
+                    .filter(|d| d.device_id != row.device_id && d.updated_at < row.approved_at),
+                row.employee_id,
+            )
+            .collect();
+            let (verified, entries) = best_match(
+                &row.record,
+                approved.iter().copied(),
+                crate::auth_shots::count_matching_entries,
+            );
+            let (passed, passed_entries) = best_match(
+                &row.record,
+                approved.iter().copied(),
+                crate::auth_shots::count_passing_entries,
+            );
+            out["compared"] = json!(approved.len());
+            out["verified"] = json!({ "matched": verified, "entries": entries });
+            out["passes"] = json!({ "matched": passed, "entries": passed_entries });
+            out["auto_approve_now"] = json!(passed >= AUTO_APPROVE_MIN_MATCHES);
+            out
+        })
+        .collect();
+    let mut out = json!({
+        "since": since,
+        "min_matches": AUTO_APPROVE_MIN_MATCHES,
+        "logic_version": crate::auth_shots::logic_version(),
+        "records": records,
+    });
+    if next_since.is_some() {
+        out["more"] = json!(true);
+        out["next_since"] = json!(next_since);
+    }
+    Ok(Json(out))
 }
 
 /// 追加の端末で撮った記録を、端末ごとに 1 行預かる (同じ端末なら差し替え)。`X-Device-Id` 必須 (422 `device_id_required`)。

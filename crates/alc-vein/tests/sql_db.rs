@@ -1727,6 +1727,29 @@ async fn device_registration_auto_approves_or_waits_per_device() {
     );
     assert_eq!(v["matched"], 6);
     assert!(pending_modules(r, a).await.is_empty());
+    // 自動で承認された行だけが、承認の時刻つきで点検の一覧に出る (since より前・件数の上限 0・別テナントには出ない)
+    let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    let auto = r
+        .list_auto_approved_device_records(a, epoch, 10)
+        .await
+        .unwrap();
+    assert_eq!(auto.len(), 1);
+    assert_eq!(
+        (
+            auto[0].employee_id,
+            auto[0].device_id.as_str(),
+            &auto[0].record
+        ),
+        (yamada, "bp-1", &same)
+    );
+    let later = auto[0].approved_at + chrono::Duration::seconds(1);
+    for (tenant, since, limit) in [(a, later, 10), (a, epoch, 0), (manager, epoch, 10)] {
+        let rows = r
+            .list_auto_approved_device_records(tenant, since, limit)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![]);
+    }
 
     // 3 件しか合わない → その端末だけ承認待ち
     let other = matcher::enroll_template(&[7, 7, 7, 8, 9, 10].map(synth::chara)).unwrap();
