@@ -23,8 +23,8 @@ use crate::auth_shots::{
 };
 use crate::matcher::{self, synth, MAX_TEMPLATES};
 use crate::repo::{
-    ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, PendingModuleItem,
-    VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE,
+    ApprovalItem, ApproveByEmployee, AutoApprovedRow, DeviceApproval, DeviceRecordRow,
+    PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE,
 };
 use crate::VeinState;
 
@@ -421,6 +421,32 @@ impl VeinTemplatesRepository for FakeRepo {
             .filter(|d| self.device_approval(d) != DeviceApproval::Pending)
             .cloned()
             .collect())
+    }
+
+    async fn list_auto_approved_device_records(
+        &self,
+        _tenant_id: Uuid,
+        since: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<AutoApprovedRow>, DbError> {
+        self.check()?;
+        let mut rows: Vec<AutoApprovedRow> = self
+            .device_records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| self.device_approval(d) == DeviceApproval::AutoApproved)
+            .filter(|d| d.updated_at >= since)
+            .map(|d| AutoApprovedRow {
+                employee_id: d.employee_id,
+                device_id: d.device_id.clone(),
+                record: d.record.clone(),
+                approved_at: d.updated_at,
+            })
+            .collect();
+        rows.sort_by_key(|r| r.approved_at);
+        rows.truncate(limit as usize);
+        Ok(rows)
     }
 
     async fn insert_auth_shot(
@@ -2088,6 +2114,11 @@ fn chara_shot(seed: u64) -> String {
 /// 130 だと種 7 の記録に `chara_verify` は規則 A で通すが、粗い比較の点数が上限を超える
 /// (足した条件で落ちる撮影の代わり。実機の撮影は public のこの repo に置けない)。
 fn noisy_chara_shot(seed: u64, per_mille: u64) -> String {
+    STANDARD.encode(noisy_chara(seed, per_mille))
+}
+
+/// [`noisy_chara_shot`] の特徴量そのもの (記録に組むとき用)。
+fn noisy_chara(seed: u64, per_mille: u64) -> Vec<u8> {
     let mut rec = synth::chara(seed);
     let mut s = 0x9e37_79b9_7f4a_7c15u64 | 1;
     for i in 0..usize::from(vein_match::WIDTH) * usize::from(vein_match::HEIGHT) {
@@ -2099,7 +2130,7 @@ fn noisy_chara_shot(seed: u64, per_mille: u64) -> String {
         }
     }
     rec[2] = rec[4..].iter().fold(0u8, |a, &v| a.wrapping_add(v));
-    STANDARD.encode(rec)
+    rec
 }
 
 fn shot_body(employee_id: Uuid, shot: &str) -> Value {
@@ -3417,5 +3448,186 @@ async fn report_test_send_is_admin_only_and_marks_the_subject() {
         sent[0].subject.starts_with("[テスト] 指静脈の日報 ("),
         "{}",
         sent[0].subject
+    );
+}
+
+// --- 自動承認の点検 (GET /vein/devices/approval-check) ---
+
+const CHECK_URI: &str = "/vein/devices/approval-check";
+
+/// 自動で承認された端末ごとの記録を、時刻を指定して直接置く。
+fn add_auto_approved(repo: &FakeRepo, id: Uuid, device: &str, record: &str, at: i64) {
+    add_device_record(repo, id, device, record, at);
+    repo.set_device_approval(id, device, DeviceApproval::AutoApproved);
+}
+
+/// 種 7 に `chara_verify` は通すが、粗い比較が上限を超える 6 件の記録。
+fn noisy_record_of_7() -> String {
+    matcher::enroll_template(&vec![noisy_chara(7, 130); 6]).unwrap()
+}
+
+#[tokio::test]
+async fn approval_check_is_developer_only_and_db_error_is_500() {
+    let repo = Arc::new(FakeRepo::default());
+    let (status, v) = call_as(&repo, Some("admin"), "GET", CHECK_URI, Value::Null).await;
+    assert_eq!(
+        (status, &v["error"]),
+        (StatusCode::FORBIDDEN, &json!("developer_only"))
+    );
+    // 誰も自動承認されていない: 空
+    let (status, v) = as_developer(&repo, "GET", CHECK_URI, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["records"], json!([]));
+    assert_eq!(v["min_matches"], 4);
+    assert_eq!(v["logic_version"], auth_shots::logic_version());
+    assert!(v["since"].is_string());
+    assert_eq!(v.get("more"), None);
+    // 読めない since は 400
+    let uri = format!("{CHECK_URI}?since=yesterday");
+    let (status, _) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    repo.fail_device_list.store(true, Ordering::SeqCst);
+    let (status, _) = as_developer(&repo, "GET", CHECK_URI, Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    repo.fail.store(true, Ordering::SeqCst);
+    let (status, _) = as_developer(&repo, "GET", CHECK_URI, Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn approval_check_recounts_auto_approved_records_with_the_strict_line() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+
+    // 同じ指の 6 件: 前の線でも今の線でも 6 件合う
+    let (_, v) = register_from(&repo, id, b"bp-1", &template_of_seeds(&[7, 7, 7, 7, 7, 7])).await;
+    assert_eq!(v["auto_approved"], true, "{v}");
+    // chara_verify は通すが粗い比較が遠い 6 件: 自動承認はされるが、今の線では 1 件も合わない
+    let (_, v) = register_from(&repo, id, b"bp-2", &noisy_record_of_7()).await;
+    assert_eq!(
+        (&v["auto_approved"], &v["matched"]),
+        (&json!(true), &json!(6)),
+        "{v}"
+    );
+    // 合わなかった登録 (承認待ち) は点検に出ない
+    let (_, v) = register_from(&repo, id, b"bp-3", &template_of_seeds(&[8, 9, 10, 11])).await;
+    assert_eq!(v["auto_approved"], false, "{v}");
+
+    // since を付けない (直近 24 時間)
+    let (status, v) = as_developer(&repo, "GET", CHECK_URI, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let rows = v["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{v}");
+    let (clean, noisy) = (&rows[0], &rows[1]);
+    assert_eq!(clean["employee_id"], id.to_string());
+    assert_eq!(clean["device_id"], "bp-1");
+    assert!(clean["approved_at"].is_string());
+    // 相手は乗務員の記録だけ (自分自身と、後から預かった bp-2 は外す)
+    assert_eq!(clean["compared"], 1);
+    assert_eq!(clean["verified"], json!({ "matched": 6, "entries": 6 }));
+    assert_eq!(clean["passes"], json!({ "matched": 6, "entries": 6 }));
+    assert_eq!(clean["auto_approve_now"], true);
+    assert_eq!(clean["others"], json!([]));
+    // bp-2 の相手は乗務員の記録と、先に預かった bp-1
+    assert_eq!(noisy["device_id"], "bp-2");
+    assert_eq!(noisy["compared"], 2);
+    assert_eq!(noisy["verified"], json!({ "matched": 6, "entries": 6 }));
+    assert_eq!(noisy["passes"], json!({ "matched": 0, "entries": 6 }));
+    assert_eq!(noisy["auto_approve_now"], false);
+    // 記録そのものは返さない
+    assert!(!v.to_string().contains(&noisy_record_of_7()));
+    assert_eq!(clean.get("record"), None);
+
+    // 先の since には出ない
+    let uri = format!("{CHECK_URI}?since=2999-01-01T00:00:00Z");
+    let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    assert_eq!(v["records"], json!([]));
+    assert_eq!(v["since"], "2999-01-01T00:00:00Z");
+}
+
+#[tokio::test]
+async fn approval_check_lists_other_people_the_record_passes_against() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    // 他の人 (種 8)。端末ごとの記録も持つ (同じ件を 2 回数えない)
+    let other = approved_module(&repo, "佐藤", &template_of_seeds(&[8, 8, 8]), None);
+    add_device_record(&repo, other, "kiosk-2", &template_of_seeds(&[8, 8, 8]), 150);
+    // 種 7 が 2 件・種 8 が 4 件の記録が、山田の端末ごとの記録として自動承認されている
+    let mixed = template_of_seeds(&[7, 7, 8, 8, 8, 8]);
+    add_auto_approved(&repo, id, "bp-1", &mixed, 200);
+    // 乗務員の記録が無い (消えた) 人の行は、他の人との見比べだけ返す (誰とも合わない指)
+    let gone = repo.add_employee("退職");
+    add_auto_approved(&repo, gone, "bp-9", &template_of_seeds(&[9, 9, 9, 9]), 300);
+
+    let uri = format!("{CHECK_URI}?since=2020-01-01T00:00:00Z");
+    let (status, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let rows = v["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{v}");
+    assert_eq!(rows[0]["verified"], json!({ "matched": 2, "entries": 6 }));
+    assert_eq!(rows[0]["passes"], json!({ "matched": 2, "entries": 6 }));
+    assert_eq!(rows[0]["auto_approve_now"], false);
+    assert_eq!(
+        rows[0]["others"],
+        json!([{ "employee_id": other, "matched": 4 }])
+    );
+    assert_eq!(rows[1]["employee_id"], gone.to_string());
+    assert_eq!(rows[1]["error"], "no_approved_record");
+    assert_eq!(rows[1].get("passes"), None);
+    assert_eq!(rows[1]["others"], json!([]));
+}
+
+#[tokio::test]
+async fn approval_check_stops_at_the_limit_and_says_where_to_continue() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let record = template_of_seeds(&[7]);
+    for n in 0..=super::APPROVAL_CHECK_LIMIT as i64 {
+        add_auto_approved(&repo, id, &format!("bp-{n}"), &record, 200 + n);
+    }
+    let uri = format!("{CHECK_URI}?since=2020-01-01T00:00:00Z");
+    let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    assert_eq!(
+        v["records"].as_array().unwrap().len(),
+        super::APPROVAL_CHECK_LIMIT
+    );
+    assert_eq!(v["more"], true);
+    let next = v["next_since"].as_str().unwrap();
+    // 続きは残りの 1 件
+    let uri = format!("{CHECK_URI}?since={next}");
+    let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    let rows = v["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{v}");
+    assert_eq!(
+        rows[0]["device_id"],
+        format!("bp-{}", super::APPROVAL_CHECK_LIMIT)
+    );
+    assert_eq!(v.get("more"), None);
+}
+
+#[test]
+fn counting_entries_needs_readable_records() {
+    let good = template_of_seeds(&[7, 7, 7]);
+    assert_eq!(
+        auth_shots::count_passing_entries(&good, &good),
+        Some((3, 3))
+    );
+    // 相手が読めない・記録が base64 でない・テンプレートでない
+    assert_eq!(auth_shots::count_passing_entries(&good, "AAEC"), None);
+    assert_eq!(auth_shots::count_passing_entries("***", &good), None);
+    assert_eq!(auth_shots::count_passing_entries("AAEC", &good), None);
+    let others = vec![(Uuid::new_v4(), good.clone())];
+    assert_eq!(auth_shots::passing_others("AAEC", &others), vec![]);
+    assert_eq!(auth_shots::passing_others(&good, &[]), vec![]);
+    // 多い順
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let others = vec![
+        (a, template_of_seeds(&[8, 8, 8])),
+        (b, template_of_seeds(&[7, 7, 7])),
+    ];
+    assert_eq!(
+        auth_shots::passing_others(&template_of_seeds(&[7, 7, 8]), &others),
+        vec![(b, 2), (a, 1)]
     );
 }

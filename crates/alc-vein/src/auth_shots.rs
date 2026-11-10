@@ -9,7 +9,7 @@
 //! 撮影は生体データなので、worker が Secrets Store の鍵で暗号化してから DB に書く (DB は暗号文だけを持つ)。
 //! 鍵は [`VeinState::auth_shot_key`] で、worker が [`needs_key`] の口のときだけ取る。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     extract::{Query, State},
@@ -377,7 +377,7 @@ struct ListQuery {
 }
 
 /// 開発者のログインだけを通す。無ければ 403 `developer_only`。
-fn require_developer(headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn require_developer(headers: &HeaderMap) -> Result<(), ApiError> {
     if headers.get(DEVELOPER_HEADER).is_some_and(|v| v == "1") {
         Ok(())
     } else {
@@ -488,6 +488,54 @@ pub fn count_matching_entries(new_b64: &str, approved_b64: &str) -> Option<(usiz
         .filter(|c| verify_chara(&enroll, &c[..]).is_ok_and(|v| v.verified))
         .count();
     Some((matched, charas.len()))
+}
+
+/// [`count_matching_entries`] と同じ数え方を、合格の条件 [`passes`] (粗い比較の上限と s2 の下限を足したもの) で数える。
+/// 自動承認の判定には使っていない: 自動で承認された記録を今の合格の線で点検する口
+/// (`GET /vein/devices/approval-check`) が、前の線 ([`count_matching_entries`]) と並べて出す。
+pub fn count_passing_entries(new_b64: &str, approved_b64: &str) -> Option<(usize, usize)> {
+    decode_record(approved_b64)?;
+    let new = STANDARD.decode(new_b64).ok()?;
+    let charas = template_to_charas(&new).ok()?;
+    let passed = charas
+        .iter()
+        .filter(|c| {
+            verify(approved_b64, &(ShotKind::Chara, c.to_vec()))
+                .is_ok_and(|(v, coarse)| passes(&v, coarse))
+        })
+        .count();
+    Some((passed, charas.len()))
+}
+
+/// 記録 `new_b64` の件のうち、他の人の承認済みの記録 `others` と合格 ([`passes`]) で合った件の数を、人ごとに返す
+/// (多い順。点検用で、判定・承認・保存には使わない)。方法は [`near_others`] と同じ (件ごとに [`judge_top10`] =
+/// 粗い比較の上位 + `chara_verify`)。`others` に同じ人の記録が複数在っても、1 件は 1 回だけ数える。
+/// 比べられない・誰も合わないときは空。
+pub fn passing_others(new_b64: &str, others: &[(Uuid, String)]) -> Vec<(Uuid, usize)> {
+    let gallery = build_gallery(others);
+    let Some(charas) = STANDARD
+        .decode(new_b64)
+        .ok()
+        .and_then(|b| template_to_charas(&b).ok())
+    else {
+        return vec![];
+    };
+    let mut counts: HashMap<Uuid, usize> = HashMap::new();
+    for chara in &charas {
+        let shot = (ShotKind::Chara, chara.to_vec());
+        let hits: HashSet<Uuid> = judge_top10(&gallery, Some(&shot), false)
+            .candidates
+            .into_iter()
+            .filter(|c| c.matched)
+            .map(|c| c.employee_id)
+            .collect();
+        for id in hits {
+            *counts.entry(id).or_default() += 1;
+        }
+    }
+    let mut out: Vec<(Uuid, usize)> = counts.into_iter().collect();
+    out.sort_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
+    out
 }
 
 /// 本人の記録 (その端末へ配る 1 件) との 1:1 の判定 (method = `self`)。記録が無い・読めない場合は `error`
