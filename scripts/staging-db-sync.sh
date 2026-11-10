@@ -100,7 +100,9 @@ fi
 wait_ready() { # $1 = コンテナ名。PgBouncer 越しに alc_api_app で 1 文通れば migration と種まで済んでいる
   local deadline=$(($(date +%s) + READY_TIMEOUT_S))
   until docker exec "$1" psql -h 127.0.0.1 -p 6432 -U alc_api_app -d postgres -Atqc 'SELECT 1' >/dev/null 2>&1; do
-    if [ "$(docker inspect "$1" --format '{{.State.Running}}' 2>/dev/null)" != true ]; then
+    # まだ作られていない (restart 直後) 間は待つ。作られて止まった・unit が failed になったら諦める
+    if [ "$(docker inspect "$1" --format '{{.State.Running}}' 2>/dev/null)" = false ] ||
+      { [ "$1" = "$IMAGE" ] && systemctl --user is-failed -q "$UNIT"; }; then
       log "$1 が起動中に止まった"; return 1
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
