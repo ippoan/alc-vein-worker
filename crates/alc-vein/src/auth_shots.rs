@@ -491,8 +491,8 @@ pub fn count_matching_entries(new_b64: &str, approved_b64: &str) -> Option<(usiz
 }
 
 /// [`count_matching_entries`] と同じ数え方を、合格の条件 [`passes`] (粗い比較の上限と s2 の下限を足したもの) で数える。
-/// 自動承認の判定には使っていない: 自動で承認された記録を今の合格の線で点検する口
-/// (`GET /vein/devices/approval-check`) が、前の線 ([`count_matching_entries`]) と並べて出す。
+/// 自動承認の「本人に合うか」には使っていない (本人の正しい登録も落ちるため。他の人の側は [`passing_others`]):
+/// 自動で承認された記録を点検する口 (`GET /vein/devices/approval-check`) が、前の線 ([`count_matching_entries`]) と並べて出す。
 pub fn count_passing_entries(new_b64: &str, approved_b64: &str) -> Option<(usize, usize)> {
     decode_record(approved_b64)?;
     let new = STANDARD.decode(new_b64).ok()?;
@@ -508,22 +508,35 @@ pub fn count_passing_entries(new_b64: &str, approved_b64: &str) -> Option<(usize
 }
 
 /// 記録 `new_b64` の件のうち、他の人の承認済みの記録 `others` と合格 ([`passes`]) で合った件の数を、人ごとに返す
-/// (多い順。点検用で、判定・承認・保存には使わない)。方法は [`near_others`] と同じ (件ごとに [`judge_top10`] =
+/// (多い順)。端末ごとの記録の自動承認が「他の人に 1 件でも合えば止める」に使い、点検の口
+/// (`GET /vein/devices/approval-check`) も同じ関数で数える。方法は [`near_others`] と同じ (件ごとに [`judge_top10`] =
 /// 粗い比較の上位 + `chara_verify`)。`others` に同じ人の記録が複数在っても、1 件は 1 回だけ数える。
-/// 比べられない・誰も合わないときは空。
-pub fn passing_others(new_b64: &str, others: &[(Uuid, String)]) -> Vec<(Uuid, usize)> {
+///
+/// 他の人が居ない・誰も合わないときは `Ok` の空。確かめられなかったとき (記録が読めない・相手を組めない・件を
+/// 判定できない) は `Err` に理由を返す: 呼び手が「合う人は居ない」と取り違えないようにする。
+pub fn passing_others(
+    new_b64: &str,
+    others: &[(Uuid, String)],
+) -> Result<Vec<(Uuid, usize)>, &'static str> {
+    if others.is_empty() {
+        return Ok(vec![]);
+    }
     let gallery = build_gallery(others);
-    let Some(charas) = STANDARD
+    if let Err(reason) = &gallery {
+        return Err(reason);
+    }
+    let charas = STANDARD
         .decode(new_b64)
         .ok()
         .and_then(|b| template_to_charas(&b).ok())
-    else {
-        return vec![];
-    };
+        .ok_or("unreadable_record")?;
     let mut counts: HashMap<Uuid, usize> = HashMap::new();
+    let mut judged = true;
     for chara in &charas {
         let shot = (ShotKind::Chara, chara.to_vec());
-        let hits: HashSet<Uuid> = judge_top10(&gallery, Some(&shot), false)
+        let judgment = judge_top10(&gallery, Some(&shot), false);
+        judged &= judgment.error.is_none();
+        let hits: HashSet<Uuid> = judgment
             .candidates
             .into_iter()
             .filter(|c| c.matched)
@@ -535,7 +548,7 @@ pub fn passing_others(new_b64: &str, others: &[(Uuid, String)]) -> Vec<(Uuid, us
     }
     let mut out: Vec<(Uuid, usize)> = counts.into_iter().collect();
     out.sort_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
-    out
+    judged.then_some(out).ok_or("unreadable_entry")
 }
 
 /// 本人の記録 (その端末へ配る 1 件) との 1:1 の判定 (method = `self`)。記録が無い・読めない場合は `error`
