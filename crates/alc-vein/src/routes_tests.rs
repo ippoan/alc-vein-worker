@@ -3453,6 +3453,89 @@ async fn report_test_send_is_admin_only_and_marks_the_subject() {
 
 // --- 自動承認の点検 (GET /vein/devices/approval-check) ---
 
+#[tokio::test]
+async fn register_on_device_that_also_matches_another_person_waits_for_approval() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    let other = approved_module(&repo, "佐藤", &template_of_seeds(&[8, 8, 8]), None);
+    // 佐藤は端末ごとの記録も持つ (同じ件を 2 回数えない)
+    add_device_record(&repo, other, "kiosk-2", &template_of_seeds(&[8, 8, 8]), 150);
+
+    // 本人 (種 7) に 4 件合うが、2 件が他の人 (種 8) に合う → 自動承認せず、その端末の記録だけ承認待ち
+    let mixed = template_of_seeds(&[7, 7, 7, 7, 8, 8]);
+    let (status, v) = register_from(&repo, id, b"bp-1", &mixed).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["device_record"], true);
+    assert_eq!(v["approved"], false);
+    assert_eq!(v["auto_approved"], false);
+    assert_eq!(v["matched"], 4);
+    assert_eq!(v["auto_approve_blocked"], "near_other");
+    assert_eq!(v["others_people"], 1);
+    assert_eq!(v["others_matched"], 2);
+    assert_eq!(v.get("others_error"), None);
+    // 誰に合ったかは、今までどおり near に出る
+    assert_eq!(v["near"][0]["employee_id"], other.to_string());
+    let (_, pending) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    let rows = pending["templates"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{pending}");
+    assert_eq!(rows[0]["device_id"], "bp-1");
+    // 乗務員の記録は承認済みのまま
+    assert!(!repo.pending.lock().unwrap().contains(&id));
+
+    // 他の人に 1 件だけ合っても止める
+    let one = template_of_seeds(&[7, 7, 7, 7, 7, 8]);
+    let (_, v) = register_from(&repo, id, b"bp-2", &one).await;
+    assert_eq!(
+        (
+            &v["auto_approved"],
+            &v["auto_approve_blocked"],
+            &v["others_matched"]
+        ),
+        (&json!(false), &json!("near_other"), &json!(1)),
+        "{v}"
+    );
+
+    // 本人だけに合う登録は、他の人が居ても今までどおり自動承認 (足したフィールドは付かない)
+    let (_, v) = register_from(&repo, id, b"bp-3", &template_of_seeds(&[7, 7, 7, 7, 7, 7])).await;
+    assert_eq!(v["auto_approved"], true, "{v}");
+    assert_eq!(v.get("auto_approve_blocked"), None);
+    assert_eq!(v.get("others_people"), None);
+    assert_eq!(v.get("others_matched"), None);
+
+    // 本人の側が届かない登録は、他の人と見比べずに承認待ち (他の人に合う件が在っても数は付かない)
+    let (_, v) = register_from(&repo, id, b"bp-4", &template_of_seeds(&[7, 7, 7, 8, 8, 8])).await;
+    assert_eq!(
+        (&v["auto_approved"], &v["auto_approve_blocked"]),
+        (&json!(false), &json!("too_few_matches")),
+        "{v}"
+    );
+    assert_eq!(v.get("others_people"), None);
+}
+
+#[tokio::test]
+async fn register_on_device_waits_for_approval_when_others_cannot_be_checked() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    // 他の人の承認済みの記録が 1 件も読めない → 見比べられない → 止める側に倒す
+    approved_module(&repo, "佐藤", "AAEC", None);
+
+    let (status, v) =
+        register_from(&repo, id, b"bp-1", &template_of_seeds(&[7, 7, 7, 7, 7, 7])).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["matched"], 6);
+    assert_eq!(v["approved"], false);
+    assert_eq!(v["auto_approved"], false);
+    assert_eq!(v["auto_approve_blocked"], "others_check_failed");
+    assert_eq!(v["others_error"], "no_approved_record");
+    assert_eq!(v.get("others_people"), None);
+    let (_, pending) = call(&repo, "GET", "/vein/module-templates/pending", Value::Null).await;
+    assert_eq!(
+        pending["templates"].as_array().unwrap().len(),
+        1,
+        "{pending}"
+    );
+}
+
 const CHECK_URI: &str = "/vein/devices/approval-check";
 
 /// 自動で承認された端末ごとの記録を、時刻を指定して直接置く。
@@ -3534,7 +3617,9 @@ async fn approval_check_recounts_auto_approved_records_with_the_strict_line() {
     assert_eq!(noisy["compared"], 2);
     assert_eq!(noisy["verified"], json!({ "matched": 6, "entries": 6 }));
     assert_eq!(noisy["passes"], json!({ "matched": 0, "entries": 6 }));
-    assert_eq!(noisy["auto_approve_now"], false);
+    // 本人の側は前の線で数える (今の線の 0 件では止めない)。他の人は居ない
+    assert_eq!(noisy["auto_approve_now"], true);
+    assert_eq!(noisy.get("others_error"), None);
     // 記録そのものは返さない
     assert!(!v.to_string().contains(&noisy_record_of_7()));
     assert_eq!(clean.get("record"), None);
@@ -3572,10 +3657,48 @@ async fn approval_check_lists_other_people_the_record_passes_against() {
         rows[0]["others"],
         json!([{ "employee_id": other, "matched": 4 }])
     );
+    assert_eq!(rows[0].get("others_error"), None);
     assert_eq!(rows[1]["employee_id"], gone.to_string());
     assert_eq!(rows[1]["error"], "no_approved_record");
     assert_eq!(rows[1].get("passes"), None);
     assert_eq!(rows[1]["others"], json!([]));
+}
+
+#[tokio::test]
+async fn approval_check_uses_the_same_rule_as_registration() {
+    let repo = Arc::new(FakeRepo::default());
+    let id = enrolled_7(&repo);
+    // 前に自動で承認された記録: 本人に 4 件合うが、2 件は後から承認された他の人 (種 8) にも合う
+    add_auto_approved(
+        &repo,
+        id,
+        "bp-1",
+        &template_of_seeds(&[7, 7, 7, 7, 8, 8]),
+        200,
+    );
+    let other = approved_module(&repo, "佐藤", &template_of_seeds(&[8, 8, 8]), None);
+    let uri = format!("{CHECK_URI}?since=2020-01-01T00:00:00Z");
+    let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    let row = &v["records"][0];
+    assert_eq!(
+        row["verified"],
+        json!({ "matched": 4, "entries": 6 }),
+        "{v}"
+    );
+    assert_eq!(
+        row["others"],
+        json!([{ "employee_id": other, "matched": 2 }])
+    );
+    assert_eq!(row["auto_approve_now"], false);
+
+    // 他の人の記録が読めないときは、見比べられなかった理由を出して止める側
+    repo.rows.lock().unwrap().retain(|r| r.employee_id != other);
+    approved_module(&repo, "鈴木", "AAEC", None);
+    let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
+    let row = &v["records"][0];
+    assert_eq!(row["others"], json!([]), "{v}");
+    assert_eq!(row["others_error"], "no_approved_record");
+    assert_eq!(row["auto_approve_now"], false);
 }
 
 #[tokio::test]
@@ -3618,8 +3741,24 @@ fn counting_entries_needs_readable_records() {
     assert_eq!(auth_shots::count_passing_entries("***", &good), None);
     assert_eq!(auth_shots::count_passing_entries("AAEC", &good), None);
     let others = vec![(Uuid::new_v4(), good.clone())];
-    assert_eq!(auth_shots::passing_others("AAEC", &others), vec![]);
-    assert_eq!(auth_shots::passing_others(&good, &[]), vec![]);
+    // 他の人が居なければ、記録が読めなくても「合う人は居ない」
+    assert_eq!(auth_shots::passing_others(&good, &[]), Ok(vec![]));
+    assert_eq!(auth_shots::passing_others("AAEC", &[]), Ok(vec![]));
+    // 確かめられないときは理由: 記録が読めない・相手が 1 件も読めない・相手が多すぎる
+    assert_eq!(
+        auth_shots::passing_others("AAEC", &others),
+        Err("unreadable_record")
+    );
+    let broken = vec![(Uuid::new_v4(), "AAEC".to_owned())];
+    assert_eq!(
+        auth_shots::passing_others(&good, &broken),
+        Err("no_approved_record")
+    );
+    let crowd = vec![(Uuid::new_v4(), String::new()); matcher::MAX_TEMPLATES + 1];
+    assert_eq!(
+        auth_shots::passing_others(&good, &crowd),
+        Err("too_many_templates")
+    );
     // 多い順
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     let others = vec![
@@ -3628,6 +3767,6 @@ fn counting_entries_needs_readable_records() {
     ];
     assert_eq!(
         auth_shots::passing_others(&template_of_seeds(&[7, 7, 8]), &others),
-        vec![(b, 2), (a, 1)]
+        Ok(vec![(b, 2), (a, 1)])
     );
 }

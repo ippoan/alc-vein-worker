@@ -303,9 +303,16 @@ async fn upsert_module_record(
 }
 
 /// 承認済みの module の記録が在る乗務員の、端末での登録 (Refs ippoan/alc-app-s3#352、migration 210)。乗務員の記録
-/// (vein_templates、1 人 1 件) には上書きせず、その端末の記録として預かる。登録した記録の件のうち
-/// [`AUTO_APPROVE_MIN_MATCHES`] 件以上が、承認済みの記録 (乗務員の記録か、承認済みの端末ごとの記録のどれか) と
-/// `chara_verify` で合えば自動で承認し、合わなければその端末の記録だけ承認待ちにする。
+/// (vein_templates、1 人 1 件) には上書きせず、その端末の記録として預かる。自動で承認するのは次の両方のとき
+/// ([`auto_approve_blocked`])。どちらかを欠けば、その端末の記録だけ承認待ちにする:
+///
+/// - 本人: 登録した記録の件のうち [`AUTO_APPROVE_MIN_MATCHES`] 件以上が、承認済みの記録 (乗務員の記録か、承認済みの
+///   端末ごとの記録のどれか) と `chara_verify` で合う
+/// - 他の人: 登録した記録の件が、他の人の承認済みの記録と合格の線 (`passes`) で 1 件も合わない ([`others_passing`])。
+///   確かめられなかったときも承認待ちにする
+///
+/// 承認待ちにしたときは、応答の `auto_approve_blocked` に理由を返す (`too_few_matches` / `near_other` /
+/// `others_check_failed`)。他の人の確かめは本人の側が届いたときだけ、登録 1 回につき 1 回。
 ///
 /// 乗務員の記録を上書きすると全端末で承認待ちになり、端末の同期がモジュールの記録を消して指紋互換の部分を失う
 /// (2026-11-06)。承認済みの記録が無い乗務員は `Ok(None)` (今までどおり乗務員の記録として承認待ちで登録する)
@@ -316,14 +323,12 @@ async fn register_on_device(
     device_id: &str,
     record: &str,
 ) -> Result<Option<Value>, ApiError> {
-    let Some(base) = state
+    let bases = state
         .templates
         .list(tenant_id, FORMAT_MODULE)
         .await
-        .map_err(|e| internal_error("vein register_on_device list", e))?
-        .into_iter()
-        .find(|r| r.employee_id == employee_id)
-    else {
+        .map_err(|e| internal_error("vein register_on_device list", e))?;
+    let Some(base) = bases.iter().find(|r| r.employee_id == employee_id) else {
         return Ok(None);
     };
     let devices = state
@@ -334,10 +339,16 @@ async fn register_on_device(
     let approved = approved_records(&base.template, devices.iter(), employee_id);
     let (matched, entries) =
         best_match(record, approved, crate::auth_shots::count_matching_entries);
-    let approval = if matched >= AUTO_APPROVE_MIN_MATCHES {
-        DeviceApproval::AutoApproved
+    // 本人の側が届かなければ承認待ちと決まるので、他の人とは見比べない
+    let others = if matched >= AUTO_APPROVE_MIN_MATCHES {
+        others_passing(record, &bases, &devices, employee_id)
     } else {
-        DeviceApproval::Pending
+        Ok(vec![])
+    };
+    let blocked = auto_approve_blocked(matched, &others);
+    let approval = match blocked {
+        None => DeviceApproval::AutoApproved,
+        Some(_) => DeviceApproval::Pending,
     };
     let auto = approval == DeviceApproval::AutoApproved;
     // 照合の間に乗務員の記録が承認待ち・削除になった (書けなかった) なら None: 今までどおりの登録に任せる
@@ -347,7 +358,7 @@ async fn register_on_device(
         .await
         .map_err(|e| internal_error("vein register_on_device upsert_device_record", e))?
         .map(|updated_at| {
-            json!({
+            let mut out = json!({
                 "employee_id": employee_id,
                 "updated_at": updated_at,
                 "device_record": true,
@@ -355,8 +366,59 @@ async fn register_on_device(
                 "auto_approved": auto,
                 "matched": matched,
                 "entries": entries,
-            })
+            });
+            if let Some(reason) = blocked {
+                out["auto_approve_blocked"] = json!(reason);
+            }
+            match &others {
+                Ok(people) if !people.is_empty() => {
+                    let (count, most) = (people.len(), people[0].1);
+                    // 文は先に組む (warn! が複数行になると、CI の計測で文字列の行が未実行に数えられる)
+                    let why = format!("他の人 {count} 人に合う (最多 {most} 件)");
+                    tracing::warn!("vein 自動承認を止めた: {why}");
+                    out["others_people"] = json!(count);
+                    out["others_matched"] = json!(most);
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::warn!("vein 自動承認を止めた: 他の人と見比べられない ({reason})");
+                    out["others_error"] = json!(reason);
+                }
+            }
+            out
         }))
+}
+
+/// 自動承認を止める理由。`None` なら自動で承認する。`matched` は本人の承認済みの記録と前の線
+/// (`count_matching_entries`) で合った件の数、`others` は他の人との見比べ ([`others_passing`])。
+/// 登録 ([`register_on_device`]) と点検 ([`approval_check`]) が同じ判定を使う。
+fn auto_approve_blocked(
+    matched: usize,
+    others: &Result<Vec<(Uuid, usize)>, &'static str>,
+) -> Option<&'static str> {
+    match others {
+        _ if matched < AUTO_APPROVE_MIN_MATCHES => Some("too_few_matches"),
+        Err(_) => Some("others_check_failed"),
+        Ok(people) if !people.is_empty() => Some("near_other"),
+        Ok(_) => None,
+    }
+}
+
+/// `record` の件が、他の人の承認済みの記録 (乗務員の記録 `bases` と端末ごとの記録 `devices` のうち `employee_id`
+/// 以外) と合格の線で合った件の数 (人ごと)。確かめられなければ `Err` ([`crate::auth_shots::passing_others`])。
+fn others_passing(
+    record: &str,
+    bases: &[VeinTemplateRow],
+    devices: &[DeviceRecordRow],
+    employee_id: Uuid,
+) -> Result<Vec<(Uuid, usize)>, &'static str> {
+    let others: Vec<(Uuid, String)> = bases
+        .iter()
+        .map(|b| (b.employee_id, b.template.clone()))
+        .chain(devices.iter().map(|d| (d.employee_id, d.record.clone())))
+        .filter(|(id, _)| *id != employee_id)
+        .collect();
+    crate::auth_shots::passing_others(record, &others)
 }
 
 /// 自動承認が見比べる相手: 乗務員の記録 `base` と、`devices` のうちその乗務員の端末ごとの記録。
@@ -399,13 +461,15 @@ struct ApprovalCheckQuery {
 }
 
 /// 自動で承認された端末ごとの記録を、今の合格の線で点検する (開発者だけ。Refs ippoan/alc-app-s3#352)。
-/// 自動承認 ([`register_on_device`]) は `chara_verify` が通したかだけで数えていて、合格の条件 (`passes`) を使っていない。
+/// 自動承認 ([`register_on_device`]) の本人の側は `chara_verify` が通したかだけで数え、合格の条件 (`passes`) は他の人の側に使う。
 /// 承認したときの数は保存していないので、`since` (既定は直近 24 時間) 以降に自動で承認された記録ごとに数え直す:
 ///
 /// - `verified`: 前の線 (`count_matching_entries` = 自動承認が今使っている数え方) で合った件の数と、件の総数
-/// - `passes`: 今の合格の線 (`count_passing_entries`) で合った件の数と、件の総数
-/// - `auto_approve_now`: 今の合格の線でも [`AUTO_APPROVE_MIN_MATCHES`] 件以上か
-/// - `others`: 同じ記録が、他の人の承認済みの記録と今の合格の線で合った件の数 (人ごと。合う人だけ)
+/// - `passes`: 参考。本人の側を今の合格の線 (`count_passing_entries`) で数えた件の数と、件の総数 (自動承認の判定には使わない)
+/// - `others`: 同じ記録が、他の人の承認済みの記録と今の合格の線で合った件の数 (人ごと。合う人だけ)。
+///   確かめられなかったときは空で、`others_error` に理由
+/// - `auto_approve_now`: 今 登録し直したら自動で承認されるか ([`auto_approve_blocked`] = 登録と同じ判定:
+///   `verified` が [`AUTO_APPROVE_MIN_MATCHES`] 件以上で、`others` が空)
 ///
 /// 相手は自動承認と同じ集め方 ([`approved_records`]) で、乗務員の記録と承認済みの端末ごとの記録。ただし今の DB の
 /// 中身で数える: 点検する記録そのものと、その承認より後に預かった端末ごとの記録は外す。承認の後に登録し直された
@@ -445,16 +509,15 @@ async fn approval_check(
                 "device_id": row.device_id,
                 "approved_at": row.approved_at,
             });
-            let others: Vec<(Uuid, String)> = bases
+            let others = others_passing(&row.record, &bases, &devices, row.employee_id);
+            out["others"] = others
                 .iter()
-                .map(|b| (b.employee_id, b.template.clone()))
-                .chain(devices.iter().map(|d| (d.employee_id, d.record.clone())))
-                .filter(|(id, _)| *id != row.employee_id)
-                .collect();
-            out["others"] = crate::auth_shots::passing_others(&row.record, &others)
-                .into_iter()
+                .flatten()
                 .map(|(id, matched)| json!({ "employee_id": id, "matched": matched }))
                 .collect();
+            if let Err(reason) = &others {
+                out["others_error"] = json!(reason);
+            }
             let Some(base) = bases.iter().find(|b| b.employee_id == row.employee_id) else {
                 out["error"] = json!("no_approved_record");
                 return out;
@@ -480,7 +543,7 @@ async fn approval_check(
             out["compared"] = json!(approved.len());
             out["verified"] = json!({ "matched": verified, "entries": entries });
             out["passes"] = json!({ "matched": passed, "entries": passed_entries });
-            out["auto_approve_now"] = json!(passed >= AUTO_APPROVE_MIN_MATCHES);
+            out["auto_approve_now"] = json!(auto_approve_blocked(verified, &others).is_none());
             out
         })
         .collect();
