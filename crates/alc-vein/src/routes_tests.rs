@@ -23,7 +23,7 @@ use crate::auth_shots::{
 };
 use crate::matcher::{self, synth, MAX_TEMPLATES};
 use crate::repo::{
-    ApprovalItem, ApproveByEmployee, AutoApprovedRow, DeviceApproval, DeviceRecordRow,
+    ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, DeviceRecordStateRow,
     PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE,
 };
 use crate::VeinState;
@@ -423,28 +423,32 @@ impl VeinTemplatesRepository for FakeRepo {
             .collect())
     }
 
-    async fn list_auto_approved_device_records(
+    async fn list_device_records_since(
         &self,
         _tenant_id: Uuid,
         since: DateTime<Utc>,
         limit: i64,
-    ) -> Result<Vec<AutoApprovedRow>, DbError> {
+    ) -> Result<Vec<DeviceRecordStateRow>, DbError> {
         self.check()?;
-        let mut rows: Vec<AutoApprovedRow> = self
+        let mut rows: Vec<DeviceRecordStateRow> = self
             .device_records
             .lock()
             .unwrap()
             .iter()
-            .filter(|d| self.device_approval(d) == DeviceApproval::AutoApproved)
             .filter(|d| d.updated_at >= since)
-            .map(|d| AutoApprovedRow {
-                employee_id: d.employee_id,
-                device_id: d.device_id.clone(),
-                record: d.record.clone(),
-                approved_at: d.updated_at,
+            .map(|d| {
+                let (approved, auto_approved) = self.device_approval(d).flags();
+                DeviceRecordStateRow {
+                    employee_id: d.employee_id,
+                    device_id: d.device_id.clone(),
+                    record: d.record.clone(),
+                    updated_at: d.updated_at,
+                    approved_at: approved.then_some(d.updated_at),
+                    auto_approved,
+                }
             })
             .collect();
-        rows.sort_by_key(|r| r.approved_at);
+        rows.sort_by_key(|r| r.updated_at);
         rows.truncate(limit as usize);
         Ok(rows)
     }
@@ -3544,6 +3548,12 @@ fn add_auto_approved(repo: &FakeRepo, id: Uuid, device: &str, record: &str, at: 
     repo.set_device_approval(id, device, DeviceApproval::AutoApproved);
 }
 
+/// 承認待ちの端末ごとの記録を、時刻を指定して直接置く。
+fn add_pending(repo: &FakeRepo, id: Uuid, device: &str, record: &str, at: i64) {
+    add_device_record(repo, id, device, record, at);
+    repo.set_device_approval(id, device, DeviceApproval::Pending);
+}
+
 /// 種 7 に `chara_verify` は通すが、粗い比較が上限を超える 6 件の記録。
 fn noisy_record_of_7() -> String {
     matcher::enroll_template(&vec![noisy_chara(7, 130); 6]).unwrap()
@@ -3557,7 +3567,7 @@ async fn approval_check_is_developer_only_and_db_error_is_500() {
         (status, &v["error"]),
         (StatusCode::FORBIDDEN, &json!("developer_only"))
     );
-    // 誰も自動承認されていない: 空
+    // 端末ごとの記録が 1 件も無い: 空
     let (status, v) = as_developer(&repo, "GET", CHECK_URI, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["records"], json!([]));
@@ -3593,7 +3603,7 @@ async fn approval_check_recounts_auto_approved_records_with_the_strict_line() {
         (&json!(true), &json!(6)),
         "{v}"
     );
-    // 合わなかった登録 (承認待ち) は点検に出ない
+    // 合わなかった登録 (承認待ち) も点検に出る
     let (_, v) = register_from(&repo, id, b"bp-3", &template_of_seeds(&[8, 9, 10, 11])).await;
     assert_eq!(v["auto_approved"], false, "{v}");
 
@@ -3601,11 +3611,15 @@ async fn approval_check_recounts_auto_approved_records_with_the_strict_line() {
     let (status, v) = as_developer(&repo, "GET", CHECK_URI, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{v}");
     let rows = v["records"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{v}");
-    let (clean, noisy) = (&rows[0], &rows[1]);
+    assert_eq!(rows.len(), 3, "{v}");
+    let (clean, noisy, waiting) = (&rows[0], &rows[1], &rows[2]);
     assert_eq!(clean["employee_id"], id.to_string());
     assert_eq!(clean["device_id"], "bp-1");
+    assert_eq!(clean["status"], "auto_approved");
     assert!(clean["approved_at"].is_string());
+    assert_eq!(clean["approved_at"], clean["updated_at"]);
+    // 自動承認の行には、止まる理由は付けない
+    assert_eq!(clean.get("auto_approve_blocked"), None);
     // 相手は乗務員の記録だけ (自分自身と、後から預かった bp-2 は外す)
     assert_eq!(clean["compared"], 1);
     assert_eq!(clean["verified"], json!({ "matched": 6, "entries": 6 }));
@@ -3620,6 +3634,16 @@ async fn approval_check_recounts_auto_approved_records_with_the_strict_line() {
     // 本人の側は前の線で数える (今の線の 0 件では止めない)。他の人は居ない
     assert_eq!(noisy["auto_approve_now"], true);
     assert_eq!(noisy.get("others_error"), None);
+    // 承認待ちの行: 承認の時刻は無く、今の判定で止まる理由が付く。相手は乗務員の記録と、先に預かった bp-1・bp-2
+    assert_eq!(waiting["device_id"], "bp-3");
+    assert_eq!(waiting["status"], "pending");
+    assert!(waiting["updated_at"].is_string());
+    assert_eq!(waiting["approved_at"], Value::Null);
+    assert_eq!(waiting["compared"], 3);
+    assert_eq!(waiting["verified"], json!({ "matched": 0, "entries": 4 }));
+    assert_eq!(waiting["auto_approve_now"], false);
+    assert_eq!(waiting["auto_approve_blocked"], "too_few_matches");
+    assert_eq!(waiting["others"], json!([]));
     // 記録そのものは返さない
     assert!(!v.to_string().contains(&noisy_record_of_7()));
     assert_eq!(clean.get("record"), None);
@@ -3649,7 +3673,18 @@ async fn approval_check_lists_other_people_the_record_passes_against() {
     let (status, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{v}");
     let rows = v["records"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{v}");
+    assert_eq!(rows.len(), 3, "{v}");
+    // 佐藤の端末ごとの記録 (自動承認でない承認済み) も、預かった時刻の順で先頭に載る
+    let (manual, rows) = (&rows[0], &rows[1..]);
+    assert_eq!(
+        (&manual["employee_id"], &manual["device_id"]),
+        (&json!(other), &json!("kiosk-2"))
+    );
+    assert_eq!(manual["status"], "manual");
+    assert!(manual["approved_at"].is_string());
+    assert_eq!(manual["verified"], json!({ "matched": 3, "entries": 3 }));
+    assert_eq!(manual.get("auto_approve_blocked"), None);
+    assert_eq!(rows[0]["status"], "auto_approved");
     assert_eq!(rows[0]["verified"], json!({ "matched": 2, "entries": 6 }));
     assert_eq!(rows[0]["passes"], json!({ "matched": 2, "entries": 6 }));
     assert_eq!(rows[0]["auto_approve_now"], false);
@@ -3658,6 +3693,8 @@ async fn approval_check_lists_other_people_the_record_passes_against() {
         json!([{ "employee_id": other, "matched": 4 }])
     );
     assert_eq!(rows[0].get("others_error"), None);
+    // 承認済みの行には、今の判定で止まるとしても理由は付けない (付けるのは承認待ちの行だけ)
+    assert_eq!(rows[0].get("auto_approve_blocked"), None);
     assert_eq!(rows[1]["employee_id"], gone.to_string());
     assert_eq!(rows[1]["error"], "no_approved_record");
     assert_eq!(rows[1].get("passes"), None);
@@ -3676,6 +3713,15 @@ async fn approval_check_uses_the_same_rule_as_registration() {
         &template_of_seeds(&[7, 7, 7, 7, 8, 8]),
         200,
     );
+    // 同じ記録が別の端末では承認待ち、同じ指だけの 6 件も承認待ち (運行管理者がまだ承認していない)
+    add_pending(
+        &repo,
+        id,
+        "seat-1",
+        &template_of_seeds(&[7, 7, 7, 7, 8, 8]),
+        210,
+    );
+    add_pending(&repo, id, "seat-2", &template_of_seeds(&[7; 6]), 220);
     let other = approved_module(&repo, "佐藤", &template_of_seeds(&[8, 8, 8]), None);
     let uri = format!("{CHECK_URI}?since=2020-01-01T00:00:00Z");
     let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
@@ -3690,6 +3736,27 @@ async fn approval_check_uses_the_same_rule_as_registration() {
         json!([{ "employee_id": other, "matched": 2 }])
     );
     assert_eq!(row["auto_approve_now"], false);
+    assert_eq!(row.get("auto_approve_blocked"), None);
+    // 承認待ちの行には、登録と同じ判定の理由が付く: 他の人に合う
+    let near = &v["records"][1];
+    assert_eq!(
+        (&near["device_id"], &near["status"], &near["approved_at"]),
+        (&json!("seat-1"), &json!("pending"), &Value::Null),
+        "{v}"
+    );
+    assert_eq!(near["auto_approve_now"], false);
+    assert_eq!(near["auto_approve_blocked"], "near_other");
+    assert_eq!(near["others"], row["others"]);
+    // 今の判定なら通る承認待ちには、理由を付けない (相手は乗務員の記録と bp-1。承認待ちの seat-1 は相手にしない)
+    let fine = &v["records"][2];
+    assert_eq!(
+        (&fine["device_id"], &fine["status"], &fine["compared"]),
+        (&json!("seat-2"), &json!("pending"), &json!(2)),
+        "{v}"
+    );
+    assert_eq!(fine["verified"], json!({ "matched": 6, "entries": 6 }));
+    assert_eq!(fine["auto_approve_now"], true);
+    assert_eq!(fine.get("auto_approve_blocked"), None);
 
     // 他の人の記録が読めないときは、見比べられなかった理由を出して止める側
     repo.rows.lock().unwrap().retain(|r| r.employee_id != other);
@@ -3699,6 +3766,11 @@ async fn approval_check_uses_the_same_rule_as_registration() {
     assert_eq!(row["others"], json!([]), "{v}");
     assert_eq!(row["others_error"], "no_approved_record");
     assert_eq!(row["auto_approve_now"], false);
+    for n in [1, 2] {
+        let waiting = &v["records"][n];
+        assert_eq!(waiting["auto_approve_blocked"], "others_check_failed");
+        assert_eq!(waiting["others_error"], "no_approved_record");
+    }
 }
 
 #[tokio::test]
@@ -3706,8 +3778,10 @@ async fn approval_check_stops_at_the_limit_and_says_where_to_continue() {
     let repo = Arc::new(FakeRepo::default());
     let id = enrolled_7(&repo);
     let record = template_of_seeds(&[7]);
+    // 自動承認・承認待ち・それ以外の承認済みを混ぜても、預かった時刻の順に 1 本の列で送る
     for n in 0..=super::APPROVAL_CHECK_LIMIT as i64 {
-        add_auto_approved(&repo, id, &format!("bp-{n}"), &record, 200 + n);
+        let add = [add_auto_approved, add_pending, add_device_record][n as usize % 3];
+        add(&repo, id, &format!("bp-{n}"), &record, 200 + n);
     }
     let uri = format!("{CHECK_URI}?since=2020-01-01T00:00:00Z");
     let (_, v) = as_developer(&repo, "GET", &uri, Value::Null).await;
@@ -3716,6 +3790,13 @@ async fn approval_check_stops_at_the_limit_and_says_where_to_continue() {
         super::APPROVAL_CHECK_LIMIT
     );
     assert_eq!(v["more"], true);
+    let statuses: Vec<&str> = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses[..3], ["auto_approved", "pending", "manual"]);
     let next = v["next_since"].as_str().unwrap();
     // 続きは残りの 1 件
     let uri = format!("{CHECK_URI}?since={next}");

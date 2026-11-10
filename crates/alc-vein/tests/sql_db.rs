@@ -1727,25 +1727,24 @@ async fn device_registration_auto_approves_or_waits_per_device() {
     );
     assert_eq!(v["matched"], 6);
     assert!(pending_modules(r, a).await.is_empty());
-    // 自動で承認された行だけが、承認の時刻つきで点検の一覧に出る (since より前・件数の上限 0・別テナントには出ない)
+    // 自動で承認された行が、預かった時刻と承認の時刻つきで点検の一覧に出る (since より前・件数の上限 0・別テナントには出ない)
     let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
-    let auto = r
-        .list_auto_approved_device_records(a, epoch, 10)
-        .await
-        .unwrap();
+    let auto = r.list_device_records_since(a, epoch, 10).await.unwrap();
     assert_eq!(auto.len(), 1);
     assert_eq!(
         (
             auto[0].employee_id,
             auto[0].device_id.as_str(),
-            &auto[0].record
+            &auto[0].record,
+            auto[0].status()
         ),
-        (yamada, "bp-1", &same)
+        (yamada, "bp-1", &same, "auto_approved")
     );
-    let later = auto[0].approved_at + chrono::Duration::seconds(1);
+    assert_eq!(auto[0].approved_at, Some(auto[0].updated_at));
+    let later = auto[0].updated_at + chrono::Duration::seconds(1);
     for (tenant, since, limit) in [(a, later, 10), (a, epoch, 0), (manager, epoch, 10)] {
         let rows = r
-            .list_auto_approved_device_records(tenant, since, limit)
+            .list_device_records_since(tenant, since, limit)
             .await
             .unwrap();
         assert_eq!(rows, vec![]);
@@ -1763,6 +1762,29 @@ async fn device_registration_auto_approves_or_waits_per_device() {
     assert_eq!(waiting.len(), 1, "{waiting:?}");
     assert_eq!(waiting[0]["employee_id"], yamada.to_string());
     assert_eq!(waiting[0]["device_id"], "seat-1");
+    // 承認待ちの行も点検の一覧に出る (承認の時刻は無い。預かった時刻の順で bp-1 の後)。件数の上限も効く
+    let listed = r.list_device_records_since(a, epoch, 10).await.unwrap();
+    let states: Vec<_> = listed
+        .iter()
+        .map(|d| (d.device_id.as_str(), d.status(), d.approved_at.is_some()))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            ("bp-1", "auto_approved", true),
+            ("seat-1", "pending", false)
+        ]
+    );
+    assert_eq!(listed[1].record, other);
+    let seat_registered_at = listed[1].updated_at;
+    let first = r.list_device_records_since(a, epoch, 1).await.unwrap();
+    assert_eq!(first, listed[..1]);
+    // since は預かった時刻で絞る (承認待ちの行もその時刻で拾える)
+    let from_seat = r
+        .list_device_records_since(a, seat_registered_at, 10)
+        .await
+        .unwrap();
+    assert_eq!(from_seat, listed[1..]);
     // その端末へは承認済みの記録 (乗務員の記録) を配り、自動承認の端末へはその端末の記録を配る
     let served = |device: &'static str| async move {
         let (status, v) =
@@ -1795,6 +1817,17 @@ async fn device_registration_auto_approves_or_waits_per_device() {
     assert_eq!(approve_device("seat-1").await, StatusCode::NO_CONTENT);
     assert!(pending_modules(r, a).await.is_empty());
     assert_eq!(served("seat-1").await, json!(other));
+    // 運行管理者が承認した行は manual。承認しても預かった時刻は動かない (一覧の位置が変わらない)
+    let listed = r.list_device_records_since(a, epoch, 10).await.unwrap();
+    assert_eq!(
+        (
+            listed[1].device_id.as_str(),
+            listed[1].status(),
+            listed[1].updated_at
+        ),
+        ("seat-1", "manual", seat_registered_at)
+    );
+    assert!(listed[1].approved_at.is_some());
     repo.close().await;
 
     let mut prep = db.client(APP_ROLE).await;

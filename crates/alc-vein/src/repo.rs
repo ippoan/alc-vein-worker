@@ -104,13 +104,29 @@ pub struct DeviceRecordRow {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 自動で承認された端末ごとの記録 1 行 (`GET /vein/devices/approval-check` の点検の相手。Refs ippoan/alc-app-s3#352)。
+/// 端末ごとの記録 1 行と、その承認の状態 (`GET /vein/devices/approval-check` の点検の相手。Refs ippoan/alc-app-s3#352)。
+/// 承認待ちの行も含む (`approved_at` が `None`)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AutoApprovedRow {
+pub struct DeviceRecordStateRow {
     pub employee_id: Uuid,
     pub device_id: String,
     pub record: String,
-    pub approved_at: DateTime<Utc>,
+    /// 預かった (登録・登録し直しの) 時刻。承認では変わらない。
+    pub updated_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub auto_approved: bool,
+}
+
+impl DeviceRecordStateRow {
+    /// 点検の口が返す状態: `pending` (承認待ち) / `auto_approved` (自動承認) / `manual` (それ以外の承認済み =
+    /// 運行管理者の承認と、承認済みの本人が足した「この端末の指」)。
+    pub fn status(&self) -> &'static str {
+        match (self.approved_at, self.auto_approved) {
+            (None, _) => "pending",
+            (Some(_), true) => "auto_approved",
+            (Some(_), false) => "manual",
+        }
+    }
 }
 
 /// `GET /vein/module-templates` の 1 件。`record` は端末のモジュールの記録を base64 のまま (中身は解釈しない)。
@@ -271,13 +287,15 @@ pub mod sql {
         AND d.approved_at IS NOT NULL
     ORDER BY d.updated_at, d.id"#;
 
-    /// テナントの、自動で承認された端末ごとの記録 (生きている乗務員の分。承認の古い順)。
-    /// $1 tenant_id / $2 since (承認がこの時刻以降) / $3 件数の上限 → employee_id, device_id, record, approved_at。
-    pub const LIST_AUTO_APPROVED_DEVICE_RECORDS: &str = r#"SELECT d.employee_id, d.device_id, d.record, d.approved_at
+    /// テナントの、`since` 以降に預かった端末ごとの記録 (生きている乗務員の分。承認待ち・自動承認・それ以外の承認済みの
+    /// どれも。預かった時刻の古い順)。承認待ちは `approved_at` が無いので、絞るのも並べるのも `updated_at`。
+    /// $1 tenant_id / $2 since (預かったのがこの時刻以降) / $3 件数の上限
+    /// → employee_id, device_id, record, updated_at, approved_at, auto_approved。
+    pub const LIST_DEVICE_RECORDS_SINCE: &str = r#"SELECT d.employee_id, d.device_id, d.record, d.updated_at, d.approved_at, d.auto_approved
     FROM vein_device_records d
     JOIN employees e ON e.id = d.employee_id AND e.tenant_id = d.tenant_id
-    WHERE d.tenant_id = $1 AND e.deleted_at IS NULL AND d.auto_approved AND d.approved_at >= $2
-    ORDER BY d.approved_at, d.id
+    WHERE d.tenant_id = $1 AND e.deleted_at IS NULL AND d.updated_at >= $2
+    ORDER BY d.updated_at, d.id
     LIMIT $3"#;
 
     /// 乗務員の端末ごとの記録を消す ([`DELETE`] と同じ transaction で)。$1 tenant_id / $2 employee_id。
@@ -422,13 +440,13 @@ pub trait VeinTemplatesRepository: Send + Sync {
     /// テナントの端末ごとの記録 (承認済みの module の行が在る乗務員の、承認済みの分。古い順)。
     async fn list_device_records(&self, tenant_id: Uuid) -> Result<Vec<DeviceRecordRow>, DbError>;
 
-    /// テナントの、`since` 以降に自動で承認された端末ごとの記録 (承認の古い順に最大 `limit` 件)。
-    async fn list_auto_approved_device_records(
+    /// テナントの、`since` 以降に預かった端末ごとの記録 (承認待ちも含む。預かった時刻の古い順に最大 `limit` 件)。
+    async fn list_device_records_since(
         &self,
         tenant_id: Uuid,
         since: DateTime<Utc>,
         limit: i64,
-    ) -> Result<Vec<AutoApprovedRow>, DbError>;
+    ) -> Result<Vec<DeviceRecordStateRow>, DbError>;
 
     /// 乗務員のテンプレート (と端末ごとの記録) を消す。`Ok(false)` = 登録が無い。
     async fn delete(&self, tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError>;

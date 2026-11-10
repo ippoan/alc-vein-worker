@@ -492,7 +492,7 @@ pub fn count_matching_entries(new_b64: &str, approved_b64: &str) -> Option<(usiz
 
 /// [`count_matching_entries`] と同じ数え方を、合格の条件 [`passes`] (粗い比較の上限と s2 の下限を足したもの) で数える。
 /// 自動承認の「本人に合うか」には使っていない (本人の正しい登録も落ちるため。他の人の側は [`passing_others`]):
-/// 自動で承認された記録を点検する口 (`GET /vein/devices/approval-check`) が、前の線 ([`count_matching_entries`]) と並べて出す。
+/// 端末ごとの記録を点検する口 (`GET /vein/devices/approval-check`) が、前の線 ([`count_matching_entries`]) と並べて出す。
 pub fn count_passing_entries(new_b64: &str, approved_b64: &str) -> Option<(usize, usize)> {
     decode_record(approved_b64)?;
     let new = STANDARD.decode(new_b64).ok()?;
