@@ -33,7 +33,7 @@ use alc_core_wasm::DbError;
 use alc_vein::auth_shots::{AuthShotStatus, Judgment, NewAuthShot, StoredShot};
 use alc_vein::pg::PgVeinTemplates;
 use alc_vein::repo::{
-    ApprovalItem, ApproveByEmployee, AutoApprovedRow, DeviceApproval, DeviceRecordRow,
+    ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, DeviceRecordStateRow,
     PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository,
 };
 use alc_vein::report::Facts;
@@ -214,15 +214,15 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
         self.timed(self.inner.list_device_records(tenant_id)).await
     }
 
-    async fn list_auto_approved_device_records(
+    async fn list_device_records_since(
         &self,
         tenant_id: Uuid,
         since: DateTime<Utc>,
         limit: i64,
-    ) -> Result<Vec<AutoApprovedRow>, DbError> {
+    ) -> Result<Vec<DeviceRecordStateRow>, DbError> {
         self.timed(
             self.inner
-                .list_auto_approved_device_records(tenant_id, since, limit),
+                .list_device_records_since(tenant_id, since, limit),
         )
         .await
     }

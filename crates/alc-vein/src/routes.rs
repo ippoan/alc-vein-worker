@@ -11,8 +11,8 @@
 //! - `GET /vein/module-templates/pending` → 承認待ちのモジュールの記録の一覧 (端末の token で。中身は返さない)
 //! - `POST /vein/templates/{employee_id}/approve-by-employee` `{"approver_employee_id", "updated_at"}` → 運行管理者
 //!   (社員) による承認 (端末の token で。承認者は端末の照合で決まり、ここで役割・登録・自己承認を検査する)
-//! - `GET /vein/devices/approval-check?since=<RFC3339>` → 自動で承認された端末ごとの記録を、今の合格の線で点検する
-//!   (開発者だけ。数と ID と日時だけを返し、記録は返さない)
+//! - `GET /vein/devices/approval-check?since=<RFC3339>` → `since` 以降に預かった端末ごとの記録 (自動承認・承認待ち・
+//!   それ以外の承認済み) を、今の合格の線で点検する (開発者だけ。数と ID と日時だけを返し、記録は返さない)
 //! - `POST /vein/identify` `{"chara": hex}` → 1:N 照合 + 学習の書き戻し
 //! - `GET /vein/templates` → オフライン照合用の全件 (`logic_version` つき)
 //! - `DELETE /vein/templates/{employee_id}` → 登録の削除 (承認待ちの却下・承認済みの削除もこれ。管理者だけ)
@@ -460,19 +460,26 @@ struct ApprovalCheckQuery {
     since: Option<DateTime<Utc>>,
 }
 
-/// 自動で承認された端末ごとの記録を、今の合格の線で点検する (開発者だけ。Refs ippoan/alc-app-s3#352)。
+/// 端末ごとの記録を、今の合格の線で点検する (開発者だけ。Refs ippoan/alc-app-s3#352)。
 /// 自動承認 ([`register_on_device`]) の本人の側は `chara_verify` が通したかだけで数え、合格の条件 (`passes`) は他の人の側に使う。
-/// 承認したときの数は保存していないので、`since` (既定は直近 24 時間) 以降に自動で承認された記録ごとに数え直す:
+/// 登録のときの数は保存していないので、`since` (既定は直近 24 時間) 以降に預かった記録ごとに数え直す。自動で承認
+/// された記録だけでなく、承認待ちで止めた記録も載せる (止めた登録が見えないと、線が厳しすぎるのか正しく止めたのかを
+/// 後から確かめられない)。絞るのも並べるのも預かった時刻 `updated_at` (承認待ちには `approved_at` が無い。承認では
+/// `updated_at` は変わらないので、後から手で承認された記録も登録の時刻の位置に出る):
 ///
+/// - `status`: `auto_approved` (自動承認) / `pending` (承認待ち) / `manual` (それ以外の承認済み = 運行管理者の承認と、
+///   承認済みの本人が足した「この端末の指」)。`approved_at` は承認待ちなら null
 /// - `verified`: 前の線 (`count_matching_entries` = 自動承認が今使っている数え方) で合った件の数と、件の総数
 /// - `passes`: 参考。本人の側を今の合格の線 (`count_passing_entries`) で数えた件の数と、件の総数 (自動承認の判定には使わない)
 /// - `others`: 同じ記録が、他の人の承認済みの記録と今の合格の線で合った件の数 (人ごと。合う人だけ)。
 ///   確かめられなかったときは空で、`others_error` に理由
 /// - `auto_approve_now`: 今 登録し直したら自動で承認されるか ([`auto_approve_blocked`] = 登録と同じ判定:
 ///   `verified` が [`AUTO_APPROVE_MIN_MATCHES`] 件以上で、`others` が空)
+/// - `auto_approve_blocked`: 承認待ちの行だけ。今の判定で止まる理由 (`too_few_matches` / `near_other` /
+///   `others_check_failed`)。今の判定なら通る (`auto_approve_now` が true) ときは付けない
 ///
 /// 相手は自動承認と同じ集め方 ([`approved_records`]) で、乗務員の記録と承認済みの端末ごとの記録。ただし今の DB の
-/// 中身で数える: 点検する記録そのものと、その承認より後に預かった端末ごとの記録は外す。承認の後に登録し直された
+/// 中身で数える: 点検する記録そのものと、それより後に預かった端末ごとの記録は外す。その後に登録し直された
 /// 乗務員の記録・差し替えられた端末ごとの記録は、当時のものに戻せない。記録そのものは返さない。
 async fn approval_check(
     State(state): State<VeinState>,
@@ -486,10 +493,10 @@ async fn approval_check(
         .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(APPROVAL_CHECK_DEFAULT_HOURS));
     let mut rows = state
         .templates
-        .list_auto_approved_device_records(tenant_id, since, APPROVAL_CHECK_LIMIT as i64 + 1)
+        .list_device_records_since(tenant_id, since, APPROVAL_CHECK_LIMIT as i64 + 1)
         .await
-        .map_err(|e| internal_error("vein approval_check list_auto_approved", e))?;
-    let next_since = rows.get(APPROVAL_CHECK_LIMIT).map(|r| r.approved_at);
+        .map_err(|e| internal_error("vein approval_check list_device_records_since", e))?;
+    let next_since = rows.get(APPROVAL_CHECK_LIMIT).map(|r| r.updated_at);
     rows.truncate(APPROVAL_CHECK_LIMIT);
     let bases = state
         .templates
@@ -507,6 +514,8 @@ async fn approval_check(
             let mut out = json!({
                 "employee_id": row.employee_id,
                 "device_id": row.device_id,
+                "status": row.status(),
+                "updated_at": row.updated_at,
                 "approved_at": row.approved_at,
             });
             let others = others_passing(&row.record, &bases, &devices, row.employee_id);
@@ -526,7 +535,7 @@ async fn approval_check(
                 &base.template,
                 devices
                     .iter()
-                    .filter(|d| d.device_id != row.device_id && d.updated_at < row.approved_at),
+                    .filter(|d| d.device_id != row.device_id && d.updated_at < row.updated_at),
                 row.employee_id,
             )
             .collect();
@@ -543,7 +552,11 @@ async fn approval_check(
             out["compared"] = json!(approved.len());
             out["verified"] = json!({ "matched": verified, "entries": entries });
             out["passes"] = json!({ "matched": passed, "entries": passed_entries });
-            out["auto_approve_now"] = json!(auto_approve_blocked(verified, &others).is_none());
+            let blocked = auto_approve_blocked(verified, &others);
+            out["auto_approve_now"] = json!(blocked.is_none());
+            if let (None, Some(reason)) = (row.approved_at, blocked) {
+                out["auto_approve_blocked"] = json!(reason);
+            }
             out
         })
         .collect();

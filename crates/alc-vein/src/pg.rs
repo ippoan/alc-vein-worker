@@ -26,7 +26,7 @@ use crate::auth_shots::{
     AuthShotStatus, Candidate, Judgment, NewAuthShot, StoredJudgment, StoredShot,
 };
 use crate::repo::{
-    sql, ApprovalItem, ApproveByEmployee, AutoApprovedRow, DeviceApproval, DeviceRecordRow,
+    sql, ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, DeviceRecordStateRow,
     PendingModuleItem, VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE,
 };
 use crate::report::{self, Enrolled, Facts, Mismatch, Other, REPORT_GROUP};
@@ -36,7 +36,7 @@ impl TxOutput for ApprovalItem {}
 impl TxOutput for PendingModuleItem {}
 impl TxOutput for ApproveByEmployee {}
 impl TxOutput for DeviceRecordRow {}
-impl TxOutput for AutoApprovedRow {}
+impl TxOutput for DeviceRecordStateRow {}
 impl TxOutput for StoredShot {}
 impl TxOutput for AuthShotStatus {}
 
@@ -330,16 +330,16 @@ pub async fn list_device_records(
         .collect())
 }
 
-/// [`sql::LIST_AUTO_APPROVED_DEVICE_RECORDS`]。
-pub async fn list_auto_approved_device_records(
+/// [`sql::LIST_DEVICE_RECORDS_SINCE`]。
+pub async fn list_device_records_since(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
     since: DateTime<Utc>,
     limit: i64,
-) -> Result<Vec<AutoApprovedRow>, tokio_postgres::Error> {
+) -> Result<Vec<DeviceRecordStateRow>, tokio_postgres::Error> {
     let rows = tx
         .query_typed(
-            sql::LIST_AUTO_APPROVED_DEVICE_RECORDS,
+            sql::LIST_DEVICE_RECORDS_SINCE,
             &[
                 (&tenant_id, Type::UUID),
                 (&since, Type::TIMESTAMPTZ),
@@ -349,11 +349,13 @@ pub async fn list_auto_approved_device_records(
         .await?;
     Ok(rows
         .into_iter()
-        .map(|r| AutoApprovedRow {
+        .map(|r| DeviceRecordStateRow {
             employee_id: r.get(0),
             device_id: r.get(1),
             record: r.get(2),
-            approved_at: r.get(3),
+            updated_at: r.get(3),
+            approved_at: r.get(4),
+            auto_approved: r.get(5),
         })
         .collect())
 }
@@ -854,18 +856,18 @@ impl VeinTemplatesRepository for PgVeinTemplates {
             .map_err(db_err)
     }
 
-    async fn list_auto_approved_device_records(
+    async fn list_device_records_since(
         &self,
         tenant_id: Uuid,
         since: DateTime<Utc>,
         limit: i64,
-    ) -> Result<Vec<AutoApprovedRow>, DbError> {
+    ) -> Result<Vec<DeviceRecordStateRow>, DbError> {
         let mut client = self.client.lock().await;
         client
             .tenant_tx(tenant_id, move |tx| {
-                Box::pin(async move {
-                    list_auto_approved_device_records(tx, tenant_id, since, limit).await
-                })
+                Box::pin(
+                    async move { list_device_records_since(tx, tenant_id, since, limit).await },
+                )
             })
             .await
             .map_err(db_err)
