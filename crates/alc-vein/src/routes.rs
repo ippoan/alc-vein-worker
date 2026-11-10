@@ -99,6 +99,7 @@ pub fn tenant_router() -> Router<VeinState> {
         )
         .route("/vein/identify", post(identify))
         .merge(crate::auth_shots::router())
+        .merge(crate::report::router())
 }
 
 #[derive(Deserialize)]
@@ -144,7 +145,7 @@ fn chara_error(e: CharaError) -> ApiError {
 
 /// 管理者だけの口 (承認・一覧・削除) の認可。`AuthUser` が無い (端末の鍵など) か `role != "admin"` なら 403。
 /// 返すのは承認した管理者の user_id。
-fn require_admin(user: Option<Extension<AuthUser>>) -> Result<Uuid, ApiError> {
+pub(crate) fn require_admin(user: Option<Extension<AuthUser>>) -> Result<Uuid, ApiError> {
     match user {
         Some(Extension(u)) if u.role == "admin" => Ok(u.user_id),
         _ => Err((

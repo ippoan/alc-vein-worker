@@ -12,11 +12,13 @@
 //! - [`pg`]: その tokio-postgres 実装 (共通 crate `alc-worker-db` のテナントの transaction に載せる。接続は持たない)
 //! - [`routes`]: 4 本の口
 //! - [`auth_shots`]: 認証ログ (撮影と判定) の口
+//! - 日報メール ([`report`]): 毎朝の「指静脈の日報」(定時実行とテスト送信の口)
 
 pub mod auth_shots;
 pub mod matcher;
 pub mod pg;
 pub mod repo;
+pub mod report;
 pub mod routes;
 
 use std::sync::Arc;
@@ -31,4 +33,6 @@ pub struct VeinState {
     /// 認証ログの撮影を暗号化・復号する鍵 (Secrets Store の `SSO_ENCRYPTION_KEY`)。worker が
     /// [`auth_shots::needs_key`] の口のときだけ取る。取れなければ `None` (その口は 500 `encryption_key_missing`)
     pub auth_shot_key: Option<String>,
+    /// 日報のテスト送信の送り手 (Worker では `send_email` の binding)。無ければ `POST /vein/daily-report-test` は 503
+    pub mailer: Option<report::SharedMailer>,
 }

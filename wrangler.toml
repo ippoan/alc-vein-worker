@@ -45,10 +45,23 @@ binding = "SSO_ENCRYPTION_KEY"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "sso-encryption-key"
 
-# 定時実行: 毎日 18:00 UTC (= 日本時間 3:00) に 90 日より古い認証ログの撮影を消す (src/lib.rs の scheduled)。
-# triggers は env に継承されるので、staging / local は下で空に上書きする (本番の DB を掃除するのは本番だけ)
+# 定時実行 (src/lib.rs の scheduled。cron の文字列で分ける):
+#   - 毎日 18:00 UTC (= 日本時間 3:00): 90 日より古い認証ログの撮影を消す
+#   - 毎日 22:00 UTC (= 日本時間 7:00): 「指静脈の日報」メールをテナントの notify グループへ送る (alc_vein::report の DAILY_CRON と同じ文字列)
+# triggers は env に継承されるので、staging / local は下で空に上書きする (本番の DB を掃除し、メールを送るのは本番だけ)
 [triggers]
-crons = ["0 18 * * *"]
+crons = ["0 18 * * *", "0 22 * * *"]
+
+# 日報メール (alc_vein::report、binding の包みは src/mail.rs。ippoan/alc-measurements-worker の血圧の日報と同じ binding と差出人)。
+# 送れるのは Cloudflare アカウントで確認済みの送り先だけ。**destination_address は書かない** (書くと 1 人にしか送れない)。
+# binding と vars は env に継承されないので、staging / local には無い (そこではメールは送らず、テスト送信の口は 503)
+# ★ この表は [build] より後に置く (scripts/check-exposure-test.sh の陰性対照)
+[[send_email]]
+name = "ALERT_EMAIL"
+
+# 差出人 (送信ドメインは Cloudflare の Email Routing が有効なもの。measurements と同じ値)
+[vars]
+NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
 
 # staging: DB は一時的に (ippoan/rust-alc-api#695) 運用者の Linux 機の docker (container/ の image、127.0.0.1:6432) に置き、
 # Workers VPC の binding VEIN_DB_VPC (VPC Service 型) から既存の Tunnel 経由で繋ぐ (src/db.rs)。

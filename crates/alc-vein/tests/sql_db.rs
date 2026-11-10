@@ -74,6 +74,7 @@ async fn send_with_device(
     let state = VeinState {
         templates: repo.clone(),
         auth_shot_key: None,
+        mailer: None,
     };
     let app = tenant_router()
         .with_state(state)
@@ -108,6 +109,7 @@ async fn send_as(
     let state = VeinState {
         templates: repo.clone(),
         auth_shot_key: None,
+        mailer: None,
     };
     let mut app = tenant_router()
         .with_state(state)
@@ -698,6 +700,7 @@ async fn send_from(
     let state = VeinState {
         templates: repo.clone(),
         auth_shot_key: None,
+        mailer: None,
     };
     let app = tenant_router()
         .with_state(state)
@@ -1555,6 +1558,7 @@ async fn auth_shot_route_stores_the_encrypted_shot_and_a_judgment() {
     let state = VeinState {
         templates: repo.inner.clone(),
         auth_shot_key: Some("route-test-key".to_string()),
+        mailer: None,
     };
     let call = |method: &'static str,
                 uri: &'static str,
@@ -1792,4 +1796,212 @@ async fn device_registration_auto_approves_or_waits_per_device() {
     );
     prep.close().await;
     db.shutdown();
+}
+
+// ---- 日報メール (report。Refs ippoan/alc-app-s3#352) ----
+
+/// 日報の SQL: 宛先 (グループのメンバーのうち使える email だけ・重複なし・別のグループは入らない)、前日の窓に
+/// 入る登録 (初回の記録と端末ごとの記録。承認待ちも)、見比べる相手 (承認済みだけ)、認証ログの件数と食い違い
+/// (両方 0 でなく違う回だけ)、テナントの分離。宛先の無いテナントは記録を引かない。
+#[tokio::test(flavor = "multi_thread")]
+async fn report_facts_read_recipients_enrollments_and_layer_mismatches() {
+    use alc_vein::report::{self, Enrolled};
+    let db = Embedded::start().await;
+    let mut prep = db.client(APP_ROLE).await;
+    let a = tenant(&mut prep.inner, "Report A").await;
+    let no_group = tenant(&mut prep.inner, "Report No Group").await;
+    let no_member = tenant(&mut prep.inner, "Report No Member").await;
+    let quiet = tenant(&mut prep.inner, "Report Quiet").await;
+    let yamada = employee(&mut prep.inner, a, "山田").await;
+    let suzuki = employee(&mut prep.inner, a, "鈴木").await;
+    let sato = employee(&mut prep.inner, a, "佐藤").await;
+    let gone = employee(&mut prep.inner, a, "退職").await;
+    soft_delete_employee(&mut prep.inner, a, gone).await;
+    prep.close().await;
+
+    let near = template3(7);
+    let su = db.superuser().await;
+    let c = &su.inner;
+    // 窓は 2026-11-08 15:00Z〜11-09 15:00Z (日本時間の 11/9)。窓の中は 11-09 01:00Z
+    let inside = "2026-11-09T01:00:00Z";
+    let before = "2026-11-08T14:00:00Z";
+    for (emp, tpl, approved, at) in [
+        (suzuki, near.clone(), true, before),
+        (yamada, template3(5), true, before),
+        // 前日に初回の登録 (承認待ち)
+        (sato, near.clone(), false, inside),
+        // 削除済みの乗務員は載せない
+        (gone, near.clone(), false, inside),
+    ] {
+        let approved_at = if approved { "now()" } else { "NULL" };
+        c.execute(
+            &format!(
+                "INSERT INTO alc_api.vein_templates (tenant_id, employee_id, template, template_format, approved_at, updated_at) \
+                 VALUES ($1, $2, $3, 'module', {approved_at}, '{at}')"
+            ),
+            &[&a, &emp, &tpl],
+        )
+        .await
+        .unwrap();
+    }
+    // yamada の端末ごとの記録 (前日)。窓の外の古い端末の記録は載せない
+    for (device, at) in [("kiosk-2", inside), ("kiosk-old", before)] {
+        c.execute(
+            &format!(
+                "INSERT INTO alc_api.vein_device_records (tenant_id, employee_id, device_id, record, approved_at, updated_at) \
+                 VALUES ($1, $2, '{device}', $3, now(), '{at}')"
+            ),
+            &[&a, &yamada, &near],
+        )
+        .await
+        .unwrap();
+    }
+    // 認証ログ: 食い違い (12/34)・同じ枠・片方 0・片方 NULL・窓の外の食い違い
+    for (fv, fp, at) in [
+        (Some(12), Some(34), inside),
+        (Some(12), Some(12), inside),
+        (Some(12), Some(0), inside),
+        (None, Some(5), inside),
+        (Some(1), Some(2), before),
+    ] {
+        c.execute(
+            &format!(
+                "INSERT INTO alc_api.vein_auth_shots (tenant_id, employee_id, device_id, module_result, module_hit, shot_kind, \
+                 shot_encrypted, captured_at, created_at, module_fv_slot, module_fp_slot, module_fv_score, module_via, module_rule) \
+                 VALUES ($1, $2, 'kiosk-1', 'IDENTIFIED', 'other', 'chara', 'x', '{at}', '{at}', $3, $4, 41, 'FP', 'C')"
+            ),
+            &[&a, &yamada, &fv, &fp],
+        )
+        .await
+        .unwrap();
+    }
+    // 宛先: 使える 2 通 (重複した email は 1 通) + 使えない 3 つ (無効・email 無し・空) + 別のグループ
+    let mut recipients = vec![];
+    for (name, email, enabled, line) in [
+        ("m1", Some("a@example.com"), true, "lw1"),
+        ("m2", Some("a@example.com"), true, "lw2"),
+        ("m3", Some("b@example.com"), true, "lw3"),
+        ("m4", Some("off@example.com"), false, "lw4"),
+        ("m5", None, true, "lw5"),
+        ("m6", Some("  "), true, "lw6"),
+        ("m7", Some("other@example.com"), true, "lw7"),
+    ] {
+        let row = c
+            .query_one(
+                "INSERT INTO alc_api.notify_recipients (tenant_id, name, provider, lineworks_user_id, email, enabled) \
+                 VALUES ($1, $2, 'lineworks', $3, $4, $5) RETURNING id",
+                &[&a, &name, &line, &email, &enabled],
+            )
+            .await
+            .unwrap();
+        recipients.push(row.get::<_, Uuid>(0));
+    }
+    for (tenant_id, group, members) in [
+        (a, report::REPORT_GROUP, &recipients[..6]),
+        (a, "別のグループ", &recipients[6..]),
+        (no_member, report::REPORT_GROUP, &recipients[..0]),
+    ] {
+        let g: Uuid = c
+            .query_one(
+                "INSERT INTO alc_api.notify_groups (tenant_id, name) VALUES ($1, $2) RETURNING id",
+                &[&tenant_id, &group],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        for r in members {
+            c.execute(
+                "INSERT INTO alc_api.notify_recipient_groups (group_id, recipient_id) VALUES ($1, $2)",
+                &[&g, r],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    // 宛先のあるテナントがもう 1 つ (記録も認証ログも無い)
+    let q: Uuid = c
+        .query_one(
+            "INSERT INTO alc_api.notify_recipients (tenant_id, name, provider, lineworks_user_id, email) \
+             VALUES ($1, 'q', 'lineworks', 'lwq', 'q@example.com') RETURNING id",
+            &[&quiet],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let qg: Uuid = c
+        .query_one(
+            "INSERT INTO alc_api.notify_groups (tenant_id, name) VALUES ($1, $2) RETURNING id",
+            &[&quiet, &report::REPORT_GROUP],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    c.execute(
+        "INSERT INTO alc_api.notify_recipient_groups (group_id, recipient_id) VALUES ($1, $2)",
+        &[&qg, &q],
+    )
+    .await
+    .unwrap();
+    su.close().await;
+
+    let repo = db.repo(APP_ROLE).await;
+    let r = &repo.inner;
+    let (from, to, _) = report::yesterday("2026-11-09T22:00:00Z".parse().unwrap());
+    assert_eq!(from.to_rfc3339(), "2026-11-08T15:00:00+00:00");
+
+    // テナントの一覧は全テナント
+    let tenants = r.report_tenants().await.unwrap();
+    for t in [a, no_group, no_member, quiet] {
+        assert!(tenants.contains(&t));
+    }
+
+    let facts = r.report_facts(a, from, to).await.unwrap();
+    assert_eq!(facts.emails, vec!["a@example.com", "b@example.com"]);
+    // 窓の中の登録: 佐藤の初回 (承認待ち) と、山田の端末ごとの記録 (古い端末と削除済みは入らない)
+    let got: Vec<(&str, bool)> = facts
+        .enrolled
+        .iter()
+        .map(|e: &Enrolled| (e.name.as_str(), e.per_device))
+        .collect();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got.contains(&("佐藤", false)) && got.contains(&("山田", true)));
+    // 見比べる相手は承認済みだけ (佐藤の承認待ちと、削除済みは入らない)
+    let mut others: Vec<&str> = facts.others.iter().map(|o| o.name.as_str()).collect();
+    others.sort();
+    assert_eq!(others, vec!["山田", "鈴木"]);
+    // 認証ログ: 窓の中の 4 件のうち、食い違いは 1 件
+    assert_eq!(facts.shots, 4);
+    assert_eq!(facts.mismatches.len(), 1);
+    let m = &facts.mismatches[0];
+    assert_eq!((m.fv_slot, m.fp_slot, m.fv_score), (12, 34, Some(41)));
+    assert_eq!((m.name.as_str(), m.hit.as_str()), ("山田", "other"));
+    assert_eq!(
+        (m.via.as_deref(), m.rule.as_deref()),
+        (Some("FP"), Some("C"))
+    );
+    // 同じ指の鈴木に、佐藤の初回と山田の端末ごとの記録が近い
+    let analysis = report::analyze(&facts);
+    assert_eq!(analysis.compared, 2);
+    let pairs: Vec<(&str, &str)> = analysis
+        .hits
+        .iter()
+        .map(|h| (h.name.as_str(), h.near_name.as_str()))
+        .collect();
+    assert!(pairs.contains(&("佐藤", "鈴木")), "{pairs:?}");
+    assert!(pairs.contains(&("山田", "鈴木")), "{pairs:?}");
+    assert!(!pairs.contains(&("山田", "山田")), "{pairs:?}");
+
+    // 宛先が無いテナント (グループが無い・メンバーが 0・使える宛先が 0) は空の材料
+    for t in [no_group, no_member] {
+        assert_eq!(
+            r.report_facts(t, from, to).await.unwrap(),
+            report::Facts::default()
+        );
+    }
+    // 宛先はあるが記録も認証ログも無い日: 宛先だけ
+    let facts = r.report_facts(quiet, from, to).await.unwrap();
+    assert_eq!(facts.emails, vec!["q@example.com"]);
+    assert!(facts.enrolled.is_empty() && facts.others.is_empty() && facts.mismatches.is_empty());
+    assert_eq!(facts.shots, 0);
+    repo.close().await;
 }
