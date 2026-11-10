@@ -27,8 +27,9 @@ use crate::auth_shots::{
 };
 use crate::repo::{
     sql, ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, PendingModuleItem,
-    VeinTemplateRow, VeinTemplatesRepository,
+    VeinTemplateRow, VeinTemplatesRepository, FORMAT_MODULE,
 };
+use crate::report::{self, Enrolled, Facts, Mismatch, Other, REPORT_GROUP};
 
 impl TxOutput for VeinTemplateRow {}
 impl TxOutput for ApprovalItem {}
@@ -518,6 +519,97 @@ pub async fn purge_auth_shots(tx: &TenantTx<'_>) -> Result<i64, tokio_postgres::
     Ok(row.get(0))
 }
 
+/// [`report::sql::TENANTS`]。
+pub async fn report_tenants(tx: &TenantTx<'_>) -> Result<Vec<Uuid>, tokio_postgres::Error> {
+    let rows = tx.query_typed(report::sql::TENANTS, &[]).await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+/// 日報の材料 ([`Facts`])。宛先 ([`report::sql::RECIPIENTS`]) が無ければ、記録は引かずに空の材料を返す。
+/// 見比べる相手は承認済みの module の記録 ([`list`])。記録を引くのは、見比べる記録が在るときだけ。
+pub async fn report_facts(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Facts, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(
+            report::sql::RECIPIENTS,
+            &[(&REPORT_GROUP, Type::TEXT), (&tenant_id, Type::UUID)],
+        )
+        .await?;
+    let mut emails: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get::<_, Option<String>>(0))
+        .filter(|e| !e.trim().is_empty())
+        .collect();
+    // 同じ email の宛先が 2 つ在っても 1 通
+    emails.sort();
+    emails.dedup();
+    if emails.is_empty() {
+        return Ok(Facts::default());
+    }
+    let window = [
+        (
+            &tenant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+            Type::UUID,
+        ),
+        (&from, Type::TIMESTAMPTZ),
+        (&to, Type::TIMESTAMPTZ),
+    ];
+    let enrolled: Vec<Enrolled> = tx
+        .query_typed(report::sql::ENROLLED, &window)
+        .await?
+        .iter()
+        .map(|r| Enrolled {
+            employee_id: r.get(0),
+            name: r.get(1),
+            record: r.get(2),
+            per_device: r.get(3),
+        })
+        .collect();
+    let others = if enrolled.is_empty() {
+        Vec::new()
+    } else {
+        list(tx, tenant_id, FORMAT_MODULE)
+            .await?
+            .into_iter()
+            .map(|r| Other {
+                employee_id: r.employee_id,
+                name: r.name,
+                record: r.template,
+            })
+            .collect()
+    };
+    let shots: i64 = tx
+        .query_typed_one(report::sql::SHOT_COUNT, &window)
+        .await?
+        .get(0);
+    let mismatches = tx
+        .query_typed(report::sql::MISMATCHES, &window)
+        .await?
+        .iter()
+        .map(|r| Mismatch {
+            at: r.get(0),
+            name: r.get(1),
+            fv_slot: r.get(2),
+            fp_slot: r.get(3),
+            fv_score: r.get(4),
+            via: r.get(5),
+            rule: r.get(6),
+            hit: r.get(7),
+        })
+        .collect();
+    Ok(Facts {
+        emails,
+        enrolled,
+        others,
+        shots,
+        mismatches,
+    })
+}
+
 /// ログは出さない (出すのは呼び手 = worker)。
 fn db_err(e: tokio_postgres::Error) -> DbError {
     // tokio_postgres::Error の Display は "db error" だけなので、DB の message も載せる
@@ -814,6 +906,32 @@ impl VeinTemplatesRepository for PgVeinTemplates {
         client
             .tenant_tx(Uuid::nil(), |tx| {
                 Box::pin(async move { purge_auth_shots(tx).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    /// テナントの一覧は nil のテナントで読む (`tenants` は RLS が無い)
+    async fn report_tenants(&self) -> Result<Vec<Uuid>, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(Uuid::nil(), |tx| {
+                Box::pin(async move { report_tenants(tx).await })
+            })
+            .await
+            .map_err(db_err)
+    }
+
+    async fn report_facts(
+        &self,
+        tenant_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Facts, DbError> {
+        let mut client = self.client.lock().await;
+        client
+            .tenant_tx(tenant_id, move |tx| {
+                Box::pin(async move { report_facts(tx, tenant_id, from, to).await })
             })
             .await
             .map_err(db_err)

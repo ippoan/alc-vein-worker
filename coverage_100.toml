@@ -29,3 +29,7 @@ path = "crates/alc-vein/src/pg.rs"
 # 認証ログの口 (撮影の分類・chara_verify の判定・暗号化して保存・判定し直し・開発者だけの一覧。Refs ippoan/alc-app-s3#352)
 [[files]]
 path = "crates/alc-vein/src/auth_shots.rs"
+
+# 毎朝の「指静脈の日報」メール (前日の登録の見比べ・照合の食い違い・宛先・文面・送信のループ・テスト送信の口。Refs ippoan/alc-app-s3#352)
+[[files]]
+path = "crates/alc-vein/src/report.rs"

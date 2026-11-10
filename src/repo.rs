@@ -36,6 +36,7 @@ use alc_vein::repo::{
     ApprovalItem, ApproveByEmployee, DeviceApproval, DeviceRecordRow, PendingModuleItem,
     VeinTemplateRow, VeinTemplatesRepository,
 };
+use alc_vein::report::Facts;
 use alc_worker_db::PgClient;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -257,5 +258,19 @@ impl VeinTemplatesRepository for WorkerVeinTemplatesRepository {
 
     async fn purge_auth_shots(&self) -> Result<i64, DbError> {
         self.timed(self.inner.purge_auth_shots()).await
+    }
+
+    async fn report_tenants(&self) -> Result<Vec<Uuid>, DbError> {
+        self.timed(self.inner.report_tenants()).await
+    }
+
+    async fn report_facts(
+        &self,
+        tenant_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Facts, DbError> {
+        self.timed(self.inner.report_facts(tenant_id, from, to))
+            .await
     }
 }

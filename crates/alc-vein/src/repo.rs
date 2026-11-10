@@ -11,6 +11,7 @@ use uuid::Uuid;
 use alc_core_wasm::DbError;
 
 use crate::auth_shots::{AuthShotStatus, Judgment, NewAuthShot, StoredShot};
+use crate::report::Facts;
 
 /// 照合に使う 1 行 (乗務員名つき。削除済みの乗務員は含めない)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,4 +440,15 @@ pub trait VeinTemplatesRepository: Send + Sync {
 
     /// 90 日より古い撮影を、テナントをまたいで消す (定時実行)。消した行数を返す。
     async fn purge_auth_shots(&self) -> Result<i64, DbError>;
+
+    /// 日報の対象のテナントの一覧 (`tenants`。RLS が無い)。
+    async fn report_tenants(&self) -> Result<Vec<Uuid>, DbError>;
+
+    /// 日報の材料を 1 transaction で引く ([`Facts`])。`from` 以上 `to` 未満が前日。宛先が 0 なら記録は引かない。
+    async fn report_facts(
+        &self,
+        tenant_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Facts, DbError>;
 }

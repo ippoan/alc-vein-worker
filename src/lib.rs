@@ -14,6 +14,7 @@
 
 mod db;
 mod db_role;
+mod mail;
 mod repo;
 mod tcp;
 mod vein_db;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 
 use alc_core_wasm::require_tenant_header;
 use alc_vein::repo::VeinTemplatesRepository;
+use alc_vein::report;
 use alc_vein::{auth_shots, routes::tenant_router, VeinState};
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
@@ -32,6 +34,7 @@ use worker::{
     ScheduledEvent, WorkerVersionMetadata,
 };
 
+use crate::mail::EmailSender;
 use crate::repo::WorkerVeinTemplatesRepository;
 
 pub use crate::vein_db::VeinDb;
@@ -70,6 +73,21 @@ async fn auth_shot_key(env: &Env) -> Option<String> {
     }
 }
 
+/// 日報メールの `send_email` の binding (wrangler.toml の `[[send_email]]`。本番だけ) と、差出人の変数。
+/// どちらかが無ければメールは送らない (ほかの口は動く)
+const REPORT_EMAIL_BINDING: &str = "ALERT_EMAIL";
+const NOTIFY_EMAIL_FROM_VAR: &str = "NOTIFY_EMAIL_FROM";
+
+/// 送り手を作る。binding が無い・差出人が未設定なら `None`
+fn report_mailer(env: &Env) -> Option<report::SharedMailer> {
+    let binding = env.send_email(REPORT_EMAIL_BINDING).ok()?;
+    let from = env.var(NOTIFY_EMAIL_FROM_VAR).ok()?.to_string();
+    if from.is_empty() {
+        return None;
+    }
+    Some(Arc::new(EmailSender::new(binding, from)))
+}
+
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Body>> {
     // 鍵が要る口 (撮影を書く・判定し直す) のときだけ取る。他の口の待ち時間を増やさない
@@ -101,6 +119,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     let state = VeinState {
         templates: repo.clone(),
         auth_shot_key,
+        mailer: report_mailer(&env),
     };
     let internal = db_role::internal_router(repo.clone());
     let mut resp = match router(state, internal).call(req).await {
@@ -131,10 +150,12 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     Ok(resp)
 }
 
-/// 定時実行 (wrangler.toml の `[triggers]`、1 日 1 回): 90 日より古い認証ログの撮影を消す
-/// (`vein_auth_shots_purge`。判定は CASCADE で消える)。ログは消した件数だけ。DB の経路は fetch と同じ [`db::connect`]
+/// 定時実行 (wrangler.toml の `[triggers]`、本番だけ)。cron の文字列で分ける。DB の経路は fetch と同じ [`db::connect`]
+/// - [`report::DAILY_CRON`] (毎朝 7:00 日本時間): 「指静脈の日報」メールを、宛先のあるテナントへ送る。ログは件数だけ
+/// - それ以外 (毎日 3:00 日本時間): 90 日より古い認証ログの撮影を消す (`vein_auth_shots_purge`。判定は CASCADE で消える)。
+///   ログは消した件数だけ
 #[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let client = match db::connect(&env).await {
         Ok(c) => c,
         Err(e) => {
@@ -143,6 +164,17 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
     };
     let repo = WorkerVeinTemplatesRepository::new(client);
+    if event.cron() == report::DAILY_CRON {
+        let Some(now) = report::from_millis(event.schedule()) else {
+            console_error!("vein: report skipped: no time");
+            return;
+        };
+        let log = |m: &str| console_error!("{m}");
+        if let Some(summary) = report::run(&repo, report_mailer(&env), &log, now).await {
+            console_log!("{}", summary.line());
+        }
+        return;
+    }
     // 失敗は repo がログに残す
     if let Ok(purged) = repo.purge_auth_shots().await {
         console_log!("vein: purged {purged} auth shots");

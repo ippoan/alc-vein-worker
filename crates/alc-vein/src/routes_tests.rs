@@ -66,6 +66,14 @@ struct FakeRepo {
     fail_shot_methods: Mutex<Vec<&'static str>>,
     /// 撮影の鍵が取れていない。
     no_key: AtomicBool,
+    /// 日報のテスト送信の送り手
+    mailer: Mutex<Option<crate::report::SharedMailer>>,
+    /// 日報の対象のテナント
+    report_tenants: Mutex<Vec<Uuid>>,
+    /// 日報の材料 (テナントごと。無ければ空の材料 = 宛先なし)
+    report_facts: Mutex<Vec<(Uuid, crate::report::Facts)>>,
+    /// 日報の引きを DB エラーにする (`tenants` / `facts`)
+    fail_report: Mutex<Vec<&'static str>>,
 }
 
 impl FakeRepo {
@@ -97,6 +105,14 @@ impl FakeRepo {
 
     fn check(&self) -> Result<(), DbError> {
         if self.fail.load(Ordering::SeqCst) {
+            return Err(DbError::Other("pool timed out".into()));
+        }
+        Ok(())
+    }
+
+    fn check_report(&self, what: &'static str) -> Result<(), DbError> {
+        self.check()?;
+        if self.fail_report.lock().unwrap().contains(&what) {
             return Err(DbError::Other("pool timed out".into()));
         }
         Ok(())
@@ -514,6 +530,27 @@ impl VeinTemplatesRepository for FakeRepo {
         Ok(0)
     }
 
+    async fn report_tenants(&self) -> Result<Vec<Uuid>, DbError> {
+        self.check_report("tenants")?;
+        Ok(self.report_tenants.lock().unwrap().clone())
+    }
+
+    async fn report_facts(
+        &self,
+        tenant_id: Uuid,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> Result<crate::report::Facts, DbError> {
+        // 失敗させるのは材料の名前 (テナント一覧は別)
+        self.check_report("facts")?;
+        let facts = self.report_facts.lock().unwrap();
+        Ok(facts
+            .iter()
+            .find(|(t, _)| *t == tenant_id)
+            .map(|(_, f)| f.clone())
+            .unwrap_or_default())
+    }
+
     async fn delete(&self, _tenant_id: Uuid, employee_id: Uuid) -> Result<bool, DbError> {
         self.check()?;
         self.device_records
@@ -577,6 +614,7 @@ async fn call_full(
     let state = VeinState {
         templates: repo.clone(),
         auth_shot_key: (!repo.no_key.load(Ordering::SeqCst)).then(|| TEST_KEY.to_string()),
+        mailer: repo.mailer.lock().unwrap().clone(),
     };
     let mut app = tenant_router()
         .with_state(state)
@@ -3178,4 +3216,162 @@ async fn auth_shot_keeps_the_layer_columns_and_lists_them() {
     );
     let without = shots.iter().find(|s| s["module_via"].is_null()).unwrap();
     assert!(without["module_rule"].is_null() && without["module_fv_score"].is_null());
+}
+
+// ---- 日報メール (report) ----
+
+use crate::report::{self, Facts, Mail, MailError, Mailer, SharedMailer};
+
+/// 送ったメールを覚える偽の送り手。`fail_to` の宛先だけ失敗する。
+#[derive(Default)]
+struct FakeMailer {
+    sent: Mutex<Vec<Mail>>,
+    fail_to: Option<&'static str>,
+}
+
+impl Mailer for FakeMailer {
+    fn send<'a>(
+        &'a self,
+        mail: &'a Mail,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), MailError>> {
+        Box::pin(async move {
+            if self.fail_to == Some(mail.to.as_str()) {
+                return Err(MailError("send"));
+            }
+            self.sent.lock().unwrap().push(mail.clone());
+            Ok(())
+        })
+    }
+}
+
+fn facts_for(emails: &[&str]) -> Facts {
+    Facts {
+        emails: emails.iter().map(|e| (*e).to_owned()).collect(),
+        ..Default::default()
+    }
+}
+
+fn logger() -> (Arc<Mutex<Vec<String>>>, impl Fn(&str) + Send + Sync) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    (lines, move |m: &str| {
+        sink.lock().unwrap().push(m.to_owned())
+    })
+}
+
+fn now() -> DateTime<Utc> {
+    "2026-11-09T22:00:00Z".parse().unwrap()
+}
+
+#[tokio::test]
+async fn report_run_sends_one_mail_per_recipient_and_skips_tenants_without() {
+    let repo = FakeRepo::default();
+    let (with, without, broken) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    *repo.report_tenants.lock().unwrap() = vec![with, without];
+    repo.report_facts
+        .lock()
+        .unwrap()
+        .push((with, facts_for(&["a@example.com", "b@example.com"])));
+    let mailer = Arc::new(FakeMailer {
+        fail_to: Some("b@example.com"),
+        ..Default::default()
+    });
+    let (lines, log) = logger();
+    let shared: SharedMailer = mailer.clone();
+    let summary = report::run(&repo, Some(shared), &log, now()).await.unwrap();
+    assert_eq!(
+        summary,
+        report::ReportSummary {
+            tenants: 2,
+            skipped: 1,
+            lookup_failed: 0,
+            sent: 1,
+            failed: 1
+        }
+    );
+    // 警告が無い日も送る。件名は前日 (11/9) の日付
+    {
+        let sent = mailer.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].subject, "指静脈の日報 (11/9)");
+        assert!(sent[0].body.contains("警告はありません"));
+    }
+    // ログは固定の語だけ (宛先を出さない)
+    let lines = lines.lock().unwrap().join("\n");
+    assert!(lines.contains("report send failed: send"), "{lines}");
+    assert!(!lines.contains("example.com"), "{lines}");
+
+    // 引きの失敗は数えて続ける
+    repo.fail_report.lock().unwrap().push("facts");
+    *repo.report_tenants.lock().unwrap() = vec![broken];
+    let shared: SharedMailer = mailer.clone();
+    let summary = report::run(&repo, Some(shared), &log, now()).await.unwrap();
+    assert_eq!(
+        (summary.tenants, summary.lookup_failed, summary.sent),
+        (1, 1, 0)
+    );
+}
+
+#[tokio::test]
+async fn report_run_stops_without_a_mailer_or_a_tenant_list() {
+    let repo = FakeRepo::default();
+    let (lines, log) = logger();
+    assert!(report::run(&repo, None, &log, now()).await.is_none());
+    repo.fail_report.lock().unwrap().push("tenants");
+    let shared: SharedMailer = Arc::new(FakeMailer::default());
+    assert!(report::run(&repo, Some(shared), &log, now())
+        .await
+        .is_none());
+    let lines = lines.lock().unwrap().join("\n");
+    assert!(
+        lines.contains("no mailer") && lines.contains("list failed"),
+        "{lines}"
+    );
+}
+
+#[tokio::test]
+async fn report_test_send_is_admin_only_and_marks_the_subject() {
+    let repo = Arc::new(FakeRepo::default());
+    let uri = "/vein/daily-report-test";
+    // admin 以外 403 (AuthUser 無しも)
+    let (status, _) = call_as(&repo, None, "POST", uri, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call_as(&repo, Some("user"), "POST", uri, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // 送り手が無い 503
+    let (status, v) = call_as(&repo, Some("admin"), "POST", uri, json!({})).await;
+    assert_eq!(
+        (status, &v["error"]),
+        (StatusCode::SERVICE_UNAVAILABLE, &json!("mail_unavailable"))
+    );
+    // 宛先が 0 (グループが無いも) 409
+    let mailer = Arc::new(FakeMailer::default());
+    let shared: SharedMailer = mailer.clone();
+    *repo.mailer.lock().unwrap() = Some(shared);
+    let (status, v) = call_as(&repo, Some("admin"), "POST", uri, json!({})).await;
+    assert_eq!(
+        (status, &v["error"]),
+        (StatusCode::CONFLICT, &json!("no_recipients"))
+    );
+    // 引きの失敗 500
+    repo.fail_report.lock().unwrap().push("facts");
+    let (status, _) = call_as(&repo, Some("admin"), "POST", uri, json!({})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    repo.fail_report.lock().unwrap().clear();
+    // 送った 200: 件名に [テスト] が付く
+    repo.report_facts
+        .lock()
+        .unwrap()
+        .push((Uuid::nil(), facts_for(&["a@example.com"])));
+    let (status, v) = call_as(&repo, Some("admin"), "POST", uri, json!({})).await;
+    assert_eq!(
+        (status, v),
+        (StatusCode::OK, json!({ "sent": 1, "failed": 0 }))
+    );
+    let sent = mailer.sent.lock().unwrap();
+    assert!(
+        sent[0].subject.starts_with("[テスト] 指静脈の日報 ("),
+        "{}",
+        sent[0].subject
+    );
 }
