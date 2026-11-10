@@ -1,0 +1,10 @@
+# vein-db-695 の image を alc-vein-worker の main の container/ (ALC_MIGRATIONS_REV を含む) に追従させる
+# (Refs ippoan/ci-dashboard#520)。入力が変わったときだけ build と restart をする。vein-db-695-sync.timer が呼ぶ。
+[Unit]
+Description=Sync vein-db-695 image with alc-vein-worker main (container/ALC_MIGRATIONS_REV)
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/.local/libexec/vein-db-695-sync.sh
+TimeoutStartSec=900

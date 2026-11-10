@@ -1,0 +1,15 @@
+# staging の DB (手元の docker + Workers VPC、README「staging の DB (手元の docker + Workers VPC)」)。
+# 毎回 `docker rm -f` → `docker run --rm` で空から作り直す (start.sh は既存の PGDATA があると落ちる)。
+# ポートは必ず 127.0.0.1 に bind する (PgBouncer は trust 認証)。image は vein-db-695-sync が作る。
+# 置き方: bash scripts/staging-db-sync.sh --install
+[Unit]
+Description=vein staging DB (postgres + PgBouncer) for alc-vein-staging via Workers VPC (ippoan/rust-alc-api#695, temporary)
+After=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f vein-db-695
+ExecStart=/usr/bin/docker run --rm --name vein-db-695 -p 127.0.0.1:6432:6432 vein-db-695
+ExecStop=/usr/bin/docker stop vein-db-695
+
+[Install]
+WantedBy=default.target

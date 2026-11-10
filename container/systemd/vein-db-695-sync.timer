@@ -1,0 +1,12 @@
+# vein-db-695-sync を 10 分ごとに回す (Refs ippoan/ci-dashboard#520)。
+# main への merge (ALC_MIGRATIONS_REV の bump) から最長 10 分 + build・起動の時間で staging の DB が追従する。
+[Unit]
+Description=Periodically sync vein-db-695 image with alc-vein-worker main
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -164,6 +164,23 @@ staging は Hyperdrive を通さない (本番だけ。ippoan/rust-alc-api#680 /
   `docker rm -f` → `docker run --rm -p 127.0.0.1:6432:6432` で毎回作り直す (start.sh は既存の PGDATA があると
   落ちるので restart policy・volume は使わない)。**ポートは必ず `127.0.0.1` に bind する** (PgBouncer は
   trust 認証で、届けば全テナントを読める)
+- **image は手で build しない。** systemd --user の timer `vein-db-695-sync.timer` (10 分ごと) が
+  `scripts/staging-db-sync.sh` を呼び、main の `container/` (`ALC_MIGRATIONS_REV` を含む) と `tests/seed.sql` から作った鍵を
+  image の label `org.ippoan.vein-db.inputs` と比べ、違えば main の中身で fetch-migrations → `docker build` → restart する
+  (Refs ippoan/ci-dashboard#520)。**`ALC_MIGRATIONS_REV` を上げた PR を merge すれば、最長 10 分 + 起動の時間で追従する。**
+  restart で DB は空から作り直され、この DB を共有する staging の worker (vein / lineworks / trouble / measurements 等) の
+  データも消えるので、入力が変わらない限り作り直さない。build が落ちたら restart せず前の image のまま動かす。
+  unit 3 つ (`container/systemd/`) の置き方と見方:
+
+  ```bash
+  bash scripts/staging-db-sync.sh --install   # script を ~/.local/libexec に、unit を ~/.config/systemd/user に置き timer を有効にする
+  bash scripts/staging-db-sync.sh --check     # 追従済みなら exit 0、ずれていれば exit 10
+  journalctl --user -u vein-db-695-sync -n 20 # 直近の同期
+  ```
+
+  script や unit を変えたら `--install` をし直す (timer が呼ぶのは `~/.local/libexec` の写し)
+- 起動のたびに、テナント漏れテストの種 (leak-a / leak-b) と、CI の dev token (auth-worker の `POST /api/ci/staging-token`) の
+  会社 `11111111-…` と利用者 `22222222-…` を入れる (`container/start.sh`。値は auth-worker の `CI_TOKEN_*` と揃える)
 - Worker からの到達口は **VPC Service (TCP 型、宛先 = そのホストの `127.0.0.1:6432` だけ)** の binding だけ。
   既存の Tunnel の ingress・public hostname・CIDR route には出さない (VPC Service は ingress 不要)。
   宛先は Service 側で固定なので、`connect()` に渡すアドレスは名目だけ
