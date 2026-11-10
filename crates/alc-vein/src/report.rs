@@ -525,6 +525,11 @@ mod tests {
         }
     }
 
+    /// 本文に含まれるか (assert のメッセージ引数を別の行に持たない形にする。CI の llvm-cov はその行を未実行に数える)
+    fn has(body: &str, needle: &str) -> bool {
+        body.contains(needle)
+    }
+
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 11, 9).unwrap()
     }
@@ -580,17 +585,12 @@ mod tests {
         let analysis = analyze(&facts);
         assert_eq!((analysis.compared, analysis.omitted), (1, 0));
         let (_, body) = compose(day(), &facts, &analysis);
-        assert!(body.contains("警告はありません"), "{body}");
-        assert!(
-            body.contains(
-                "記録 1 件を、他の人の承認済みの記録と見比べました。\n近い人はいません\n"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains("食い違いはありません (認証ログ 7 件)"),
-            "{body}"
-        );
+        assert!(has(&body, "警告はありません"));
+        assert!(has(
+            &body,
+            "記録 1 件を、他の人の承認済みの記録と見比べました。\n近い人はいません\n"
+        ));
+        assert!(has(&body, "食い違いはありません (認証ログ 7 件)"));
     }
 
     #[test]
@@ -614,11 +614,11 @@ mod tests {
         assert_eq!(hit.near_name, "鈴木 花子");
         assert!(hit.per_device);
         let (_, body) = compose(day(), &facts, &analysis);
-        assert!(body.contains("警告 1 件"), "{body}");
-        assert!(
-            body.contains("・山田 太郎さんの登録 (端末ごとの記録) が 鈴木 花子さん に近い (規則 "),
-            "{body}"
-        );
+        assert!(has(&body, "警告 1 件"));
+        assert!(has(
+            &body,
+            "・山田 太郎さんの登録 (端末ごとの記録) が 鈴木 花子さん に近い (規則 "
+        ));
         // 初回の記録の言い方
         me.per_device = false;
         let facts = Facts {
@@ -627,7 +627,7 @@ mod tests {
             ..Default::default()
         };
         let (_, body) = compose(day(), &facts, &analyze(&facts));
-        assert!(body.contains("(初回の記録)"), "{body}");
+        assert!(has(&body, "(初回の記録)"));
     }
 
     #[test]
@@ -641,10 +641,10 @@ mod tests {
         let analysis = analyze(&facts);
         assert_eq!((analysis.compared, analysis.omitted), (COMPARE_MAX, 3));
         let (_, body) = compose(day(), &facts, &analysis);
-        assert!(
-            body.contains("(記録が多いので、ほかの 3 件は見比べていません)"),
-            "{body}"
-        );
+        assert!(has(
+            &body,
+            "(記録が多いので、ほかの 3 件は見比べていません)"
+        ));
     }
 
     #[test]
@@ -687,17 +687,14 @@ mod tests {
             ..Default::default()
         };
         let (_, body) = compose(day(), &facts, &analyze(&facts));
-        assert!(body.contains("警告 3 件"), "{body}");
-        assert!(
-            body.contains("別の枠を当てた回が 3 件ありました (認証ログ 30 件中)"),
-            "{body}"
-        );
-        assert!(
-            body.contains("・09:12 山田 太郎さん: 静脈の層は枠 12、指紋互換の層は枠 34 (モジュールの判定: 本人の枠)、静脈の点数 800、通した層 fp・規則 C\n"),
-            "{body}"
-        );
-        assert!(body.contains("(モジュールの判定: 他人の枠)\n"), "{body}");
-        assert!(body.contains("(モジュールの判定: 不一致)\n"), "{body}");
+        assert!(has(&body, "警告 3 件"));
+        assert!(has(
+            &body,
+            "別の枠を当てた回が 3 件ありました (認証ログ 30 件中)"
+        ));
+        assert!(has(&body, "・09:12 山田 太郎さん: 静脈の層は枠 12、指紋互換の層は枠 34 (モジュールの判定: 本人の枠)、静脈の点数 800、通した層 fp・規則 C\n"));
+        assert!(has(&body, "(モジュールの判定: 他人の枠)\n"));
+        assert!(has(&body, "(モジュールの判定: 不一致)\n"));
     }
 
     #[test]
