@@ -46,11 +46,12 @@ psql -v tenant=0b000000-0000-4000-8000-00000000000b -v name=leak-b -v employees=
 # alc-app の staging e2e が使う CI の dev token (auth-worker の `POST /api/ci/staging-token`) の会社と利用者。
 # 値は auth-worker の wrangler.toml `[env.staging.vars]` の CI_TOKEN_TENANT_ID / CI_TOKEN_SUBJECT / CI_TOKEN_EMAIL /
 # CI_TOKEN_ROLE と同じ (片方だけ変えない)。無いと作成系の e2e が tenants / users への外部キーで落ちる
-# (Refs ippoan/ci-dashboard#520)。DB は起動のたびに空なので、ここで毎回入れる
+# (Refs ippoan/ci-dashboard#520)。DB は起動のたびに空なので、ここで毎回入れる。google_sub は CHECK user_has_provider
+# (google_sub / lineworks_id / line_user_id のどれかが要る) を満たすための名目の値で、Google のログインには使われない
 psql <<'SQL'
 INSERT INTO alc_api.tenants (id, name) VALUES ('11111111-1111-1111-1111-111111111111', 'ci-staging') ON CONFLICT (id) DO NOTHING;
-INSERT INTO alc_api.users (id, tenant_id, email, name, role)
-VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 'admin@example.com', 'CI staging', 'admin')
+INSERT INTO alc_api.users (id, tenant_id, google_sub, email, name, role)
+VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 'ci-staging-token', 'admin@example.com', 'CI staging', 'admin')
 ON CONFLICT (id) DO NOTHING;
 SQL
 log "grants + seed applied"

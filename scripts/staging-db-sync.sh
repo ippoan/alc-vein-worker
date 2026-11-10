@@ -5,11 +5,12 @@
 #
 #   1. main の先頭を取り、image の入力 (`container/` の tree と `tests/seed.sql` の blob) から鍵を作る
 #   2. 鍵が image の label `org.ippoan.vein-db.inputs` と同じで、動いているコンテナがその image なら何もしない
-#   3. 違えば、main の中身を一時ディレクトリに取り出し、fetch-migrations.sh → docker build (label 付き) →
-#      `systemctl --user restart vein-db-695` → PgBouncer が応答するまで待つ
+#   3. 違えば、main の中身を一時ディレクトリに取り出し、fetch-migrations.sh → docker build (label 付き、tag は :candidate) →
+#      候補を別名のコンテナで起こして DB が立つか確かめる → 立てば tag を付け替えて `systemctl --user restart vein-db-695`
+#      → PgBouncer 越しに応答するまで待つ
 #
 # **restart で DB は空から作り直される** (ディスクは揮発)。staging の vein / lineworks / trouble / measurements 等が
-# この DB を共有しているので、作り直すのは入力が変わったときだけにする。build が落ちたら restart せず、前の image のまま動かす。
+# この DB を共有しているので、作り直すのは入力が変わったときだけにする。build や候補の起動が落ちたら restart せず、前の image のまま動かす。
 #
 #   bash scripts/staging-db-sync.sh            # 追従する (要れば build と restart)
 #   bash scripts/staging-db-sync.sh --check    # 見るだけ。追従済みなら exit 0、ずれていれば exit 10
@@ -24,7 +25,7 @@ STATE="${VEIN_DB_SYNC_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/vein-db-695-sync}"
 LABEL_INPUTS="org.ippoan.vein-db.inputs"
 LABEL_REV="org.ippoan.vein-db.alc-migrations-rev"
 LABEL_COMMIT="org.ippoan.vein-db.source-commit"
-READY_TIMEOUT_S=300
+READY_TIMEOUT_S=180
 
 log() { echo "[vein-db-sync] $*"; }
 
@@ -89,22 +90,44 @@ if [ "$need_build" = 1 ]; then
   git -C "$STATE/repo" archive FETCH_HEAD container scripts/fetch-migrations.sh tests/seed.sql | tar -x -C "$work"
   log "build: main ${commit:0:7}、alc-migrations ${rev:0:7}、inputs ${image_inputs:-なし} → ${inputs}"
   bash "$work/scripts/fetch-migrations.sh"
-  docker build -q -f "$work/container/Dockerfile" -t "$IMAGE" \
+  docker build -q -f "$work/container/Dockerfile" -t "$IMAGE:candidate" \
     --label "$LABEL_INPUTS=$inputs" --label "$LABEL_REV=$rev" --label "$LABEL_COMMIT=$commit" \
     "$work" >/dev/null
 fi
 
-log "restart: ${UNIT} (DB は空から作り直される)"
-systemctl --user restart "$UNIT"
+# 候補の image を別名のコンテナで起こし (ポートは出さない)、DB が立つことを先に確かめる。
+# start.sh や migration が落ちる image で本物を restart すると、共有の staging DB が止まったままになるため
+wait_ready() { # $1 = コンテナ名。PgBouncer 越しに alc_api_app で 1 文通れば migration と種まで済んでいる
+  local deadline=$(($(date +%s) + READY_TIMEOUT_S))
+  until docker exec "$1" psql -h 127.0.0.1 -p 6432 -U alc_api_app -d postgres -Atqc 'SELECT 1' >/dev/null 2>&1; do
+    if [ "$(docker inspect "$1" --format '{{.State.Running}}' 2>/dev/null)" != true ]; then
+      log "$1 が起動中に止まった"; return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "$1 が ${READY_TIMEOUT_S} 秒で応答しない"; return 1
+    fi
+    sleep 2
+  done
+}
 
-# PgBouncer 越しに alc_api_app で 1 文通れば migration と種まで済んでいる (start.sh は最後に PgBouncer を起動する)
-deadline=$(($(date +%s) + READY_TIMEOUT_S))
-until docker exec "$IMAGE" psql -h 127.0.0.1 -p 6432 -U alc_api_app -d postgres -Atqc 'SELECT 1' >/dev/null 2>&1; do
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    log "PgBouncer が ${READY_TIMEOUT_S} 秒で応答しない (journalctl --user -u ${UNIT} を見る)"
+if [ "$need_build" = 1 ]; then
+  probe="${IMAGE}-probe"
+  docker rm -f "$probe" >/dev/null 2>&1 || true
+  # --rm を付けない (落ちたときにログを残す)
+  docker run -d --name "$probe" "$IMAGE:candidate" >/dev/null
+  if ! wait_ready "$probe"; then
+    docker logs --tail 30 "$probe" >&2 || true
+    docker rm -f "$probe" >/dev/null 2>&1 || true
+    log "候補の image が立たないので restart しない (動いている DB は前の image のまま)"
     exit 1
   fi
-  sleep 2
-done
+  docker rm -f "$probe" >/dev/null
+  docker tag "$IMAGE:candidate" "$IMAGE"
+  log "候補の image が立つことを確かめた"
+fi
+
+log "restart: ${UNIT} (DB は空から作り直される)"
+systemctl --user restart "$UNIT"
+wait_ready "$IMAGE"
 latest="$(docker exec "$IMAGE" sh -c 'ls /vein/migrations | tail -1')"
 log "ready: main ${commit:0:7}、alc-migrations ${rev:0:7} (最後の migration ${latest})"
