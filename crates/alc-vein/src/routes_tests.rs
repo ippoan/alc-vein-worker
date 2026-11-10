@@ -2084,6 +2084,24 @@ fn chara_shot(seed: u64) -> String {
     STANDARD.encode(synth::chara(seed))
 }
 
+/// 種 `seed` の特徴量の平面を、千分率 `per_mille` で画素ごとに反転したもの (base64)。
+/// 130 だと種 7 の記録に `chara_verify` は規則 A で通すが、粗い比較の点数が上限を超える
+/// (足した条件で落ちる撮影の代わり。実機の撮影は public のこの repo に置けない)。
+fn noisy_chara_shot(seed: u64, per_mille: u64) -> String {
+    let mut rec = synth::chara(seed);
+    let mut s = 0x9e37_79b9_7f4a_7c15u64 | 1;
+    for i in 0..usize::from(vein_match::WIDTH) * usize::from(vein_match::HEIGHT) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        if s % 1000 < per_mille {
+            rec[0x10 + i / 8] ^= 1 << (7 - i % 8);
+        }
+    }
+    rec[2] = rec[4..].iter().fold(0u8, |a, &v| a.wrapping_add(v));
+    STANDARD.encode(rec)
+}
+
 fn shot_body(employee_id: Uuid, shot: &str) -> Value {
     json!({
         "employee_id": employee_id,
@@ -3162,18 +3180,44 @@ async fn verify_shot_matches_only_the_named_person_and_saves_nothing() {
     assert_eq!(v["rule"], "A");
     assert_eq!(v["scores"].as_array().unwrap().len(), 3);
     let (_, v) = verify_shot(&repo, id, &chara_shot(7)).await;
-    assert_eq!(v["matched"], true);
+    assert_eq!((&v["matched"], &v["coarse"]), (&json!(true), &json!(0)));
     // 別の指: 不一致でも点数は返す
     let (_, v) = verify_shot(&repo, id, &chara_shot(99)).await;
     assert_eq!((&v["matched"], &v["rule"]), (&json!(false), &Value::Null));
     assert_eq!(v["scores"].as_array().unwrap().len(), 3);
+    // chara_verify は通すが粗い比較が遠い撮影: 規則と点数は返すが、通さない
+    let (_, v) = verify_shot(&repo, id, &noisy_chara_shot(7, 130)).await;
+    assert_eq!((&v["matched"], &v["rule"]), (&json!(false), &json!("A")));
+    assert!(v["scores"][2].as_u64().unwrap() >= u64::from(auth_shots::STRICT_S2_MIN));
+    assert!(v["coarse"].as_u64().unwrap() > u64::from(auth_shots::STRICT_COARSE_MAX));
+    // 認証ログの判定 (self と top10) も同じ条件で不一致にする
+    let (status, v) = post_shot(&repo, shot_body(id, &noisy_chara_shot(7, 130))).await;
+    assert_eq!(status, StatusCode::OK);
+    for j in [&v["judgment"], &v["judgment_top10"]] {
+        assert_eq!(
+            (&j["result"], &j["matched_employee_id"]),
+            (&json!("nomatch"), &Value::Null)
+        );
+        assert_eq!(
+            (&j["candidates"][0]["matched"], &j["candidates"][0]["rule"]),
+            (&json!(false), &json!("A"))
+        );
+        assert_eq!(
+            j["candidates"][0]["coarse"],
+            v["judgment"]["candidates"][0]["coarse"]
+        );
+    }
+    repo.shots.lock().unwrap().clear();
     // 端末ごとの承認済みの記録でも通る
     add_device_record(&repo, id, "kiosk-2", &template_of_seeds(&[42, 42, 42]), 5);
     let (_, v) = verify_shot(&repo, id, &chara_shot(42)).await;
     assert_eq!(v["matched"], true);
     // 記録が無い人
     let (_, v) = verify_shot(&repo, Uuid::new_v4(), &chara_shot(7)).await;
-    assert_eq!(v, json!({ "matched": false, "rule": null, "scores": null }));
+    assert_eq!(
+        v,
+        json!({ "matched": false, "rule": null, "scores": null, "coarse": null })
+    );
     // 形の違う撮影は 422、DB の失敗は 500
     let (status, v) = verify_shot(&repo, id, "not base64!").await;
     assert_eq!(
